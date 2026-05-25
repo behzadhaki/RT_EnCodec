@@ -56,27 +56,12 @@ def get_extra_padding_for_conv1d(x: torch.Tensor, kernel_size: int, stride: int,
     """See `pad_for_conv1d`.
     """
     length = x.shape[-1]
-    # Compute ceiling division using integer arithmetic: ceil(a/b) = (a + b - 1) // b
-    n_frames_ceil = (length - kernel_size + padding_total + stride) // stride
+    # ceil(n_frames) = ceil(a/stride) + 1 = (a + stride - 1) // stride + 1
+    # where a = length - kernel_size + padding_total
+    n_frames_ceil = (length - kernel_size + padding_total + stride - 1) // stride + 1
     ideal_length = (n_frames_ceil - 1) * stride + (kernel_size - padding_total)
     return ideal_length - length
 
-
-def pad_for_conv1d(x: torch.Tensor, kernel_size: int, stride: int, padding_total: int = 0):
-    """Pad for a convolution to make sure that the last window is full.
-    Extra padding is added at the end. This is required to ensure that we can rebuild
-    an output of the same length, as otherwise, even with padding, some time steps
-    might get removed.
-    For instance, with total padding = 4, kernel size = 4, stride = 2:
-        0 0 1 2 3 4 5 0 0   # (0s are padding)
-        1   2   3           # (output frames of a convolution, last 0 is never used)
-        0 0 1 2 3 4 5 0     # (output of tr. conv., but pos. 5 is going to get removed as padding)
-            1 2 3 4         # once you removed padding, we are missing one time step !
-    """
-    length = x.shape[-1]
-    n_frames = (length - kernel_size + padding_total) / stride + 1
-    ideal_length = (torch.ceil(torch.tensor(n_frames)).int().item() - 1) * stride + (kernel_size - padding_total)
-    return ideal_length - length
 
 
 @torch.jit.script
