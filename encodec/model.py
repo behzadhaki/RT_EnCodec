@@ -88,7 +88,8 @@ class EncodecModel(nn.Module):
                  normalize: bool = False,
                  segment: tp.Optional[float] = None,
                  overlap: float = 0.01,
-                 name: str = 'unset'):
+                 name: str = 'unset',
+                 exporting_to_onnx: bool = False):
         super().__init__()
         self.bandwidth: tp.Optional[float] = None
         self.target_bandwidths = target_bandwidths
@@ -103,8 +104,11 @@ class EncodecModel(nn.Module):
         self.frame_rate = math.ceil(self.sample_rate / np.prod(self.encoder.ratios))
         self.name = name
         self.bits_per_codebook = int(math.log2(self.quantizer.bins))
-        assert 2 ** self.bits_per_codebook == self.quantizer.bins, \
-            "quantizer bins must be a power of 2."
+        self.exporting_to_onnx = exporting_to_onnx
+
+        if not self.exporting_to_onnx:
+            assert 2 ** self.bits_per_codebook == self.quantizer.bins, \
+                "quantizer bins must be a power of 2."
 
     @property
     def segment_length(self) -> tp.Optional[int]:
@@ -127,16 +131,20 @@ class EncodecModel(nn.Module):
         Each frames is a tuple `(codebook, scale)`, with `codebook` of
         shape `[B, K, T]`, with `K` the number of codebooks.
         """
-        assert x.dim() == 3
+        if not self.exporting_to_onnx:
+            assert x.dim() == 3
         _, channels, length = x.shape
-        assert channels > 0 and channels <= 2
+        if not self.exporting_to_onnx:
+            assert channels > 0 and channels <= 2
         segment_length = self.segment_length
+        print("segment_length: ", segment_length)
         if segment_length is None:
             segment_length = length
             stride = length
         else:
             stride = self.segment_stride  # type: ignore
-            assert stride is not None
+            if not self.exporting_to_onnx:
+                assert stride is not None
 
         encoded_frames: tp.List[EncodedFrame] = []
         for offset in range(0, length, stride):
@@ -147,7 +155,8 @@ class EncodecModel(nn.Module):
     def _encode_frame(self, x: torch.Tensor) -> EncodedFrame:
         length = x.shape[-1]
         duration = length / self.sample_rate
-        assert self.segment is None or duration <= 1e-5 + self.segment
+        if not self.exporting_to_onnx:
+            assert self.segment is None or duration <= 1e-5 + self.segment
 
         if self.normalize:
             mono = x.mean(dim=1, keepdim=True)
@@ -171,7 +180,8 @@ class EncodecModel(nn.Module):
         """
         segment_length = self.segment_length
         if segment_length is None:
-            assert len(encoded_frames) == 1
+            if not self.exporting_to_onnx:
+                assert len(encoded_frames) == 1
             return self._decode_frame(encoded_frames[0])
 
         frames = [self._decode_frame(frame) for frame in encoded_frames]
