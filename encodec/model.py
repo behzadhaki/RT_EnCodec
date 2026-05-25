@@ -137,7 +137,6 @@ class EncodecModel(nn.Module):
         if not self.exporting_to_onnx:
             assert channels > 0 and channels <= 2
         segment_length = self.segment_length
-        print("segment_length: ", segment_length)
         if segment_length is None:
             segment_length = length
             stride = length
