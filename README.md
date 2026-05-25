@@ -10,8 +10,8 @@ This repository is a fork of [Meta's EnCodec](https://github.com/facebookresearc
 .
 ├── encodec/              # Original Meta EnCodec source code (unmodified)
 ├── rt_encodec/           # Modified package with ONNX-compatible changes (see below)
-├── serialization/        # ONNX export scripts and notebook
-│   ├── serialization.ipynb          # Step-by-step ONNX export walkthrough
+├── serialization/        # ONNX export scripts
+│   ├── export_onnx.py               # Exports encoder and decoder to ONNX
 │   └── test_serialization_traced.py # JIT tracing / state-dict serialization tests
 ├── tests/                # Numerical equivalence tests (encodec vs rt_encodec)
 │   └── test_equivalence.py          # Comprehensive bit-exact comparison across all configs
@@ -104,14 +104,17 @@ Commented out the `assert sum_weight.min() > 0` guard in `_linear_overlap_add` �
 
 Scripts in `serialization/` add the repo root to `sys.path` automatically, so no install step is required.
 
-**Notebook** (`serialization/serialization.ipynb`): walks through loading a pretrained model, running encode/decode, and exporting the encoder and decoder to ONNX via `torch.onnx.export`.
+**`serialization/export_onnx.py`** — main export script. Three sections:
+1. Sanity-check: loads the 24 kHz model, runs `encode` / `decode` / `forward` on a real audio clip and prints shapes.
+2. Encoder export: wraps the 48 kHz encoder so it accepts `[n_channels, n_samples]` and returns `[n_codebooks, n_frames]`, then exports to `encodec_encoder.onnx`.
+3. Decoder export: wraps the 48 kHz decoder and exports to `encodec_decoder.onnx`.
 
-**Test script** (`serialization/test_serialization_traced.py`): verifies three serialization approaches — state-dict round-trip, full-model pickle, and JIT tracing.
+**`serialization/test_serialization_traced.py`** — verifies three serialization approaches: state-dict round-trip, full-model pickle, and JIT tracing.
 
-Run from the repo root or from inside `serialization/`:
+Run from the repo root:
 
 ```bash
-python serialization/test_serialization_traced.py
+python serialization/export_onnx.py
 ```
 
 ---
