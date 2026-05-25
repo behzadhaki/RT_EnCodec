@@ -10,9 +10,11 @@ This repository is a fork of [Meta's EnCodec](https://github.com/facebookresearc
 .
 ├── encodec/              # Original Meta EnCodec source code (unmodified)
 ├── rt_encodec/           # Modified package with ONNX-compatible changes (see below)
-├── Serialization/        # ONNX export scripts and notebook
+├── serialization/        # ONNX export scripts and notebook
 │   ├── serialization.ipynb          # Step-by-step ONNX export walkthrough
 │   └── test_serialization_traced.py # JIT tracing / state-dict serialization tests
+├── tests/                # Numerical equivalence tests (encodec vs rt_encodec)
+│   └── test_equivalence.py          # Comprehensive bit-exact comparison across all configs
 ├── encodec_readme.md     # Original Meta README
 └── README.md             # This file
 ```
@@ -100,16 +102,43 @@ Commented out the `assert sum_weight.min() > 0` guard in `_linear_overlap_add` �
 
 ## Serialization Usage
 
-Scripts in `Serialization/` add the repo root to `sys.path` automatically, so no install step is required.
+Scripts in `serialization/` add the repo root to `sys.path` automatically, so no install step is required.
 
-**Notebook** (`Serialization/serialization.ipynb`): walks through loading a pretrained model, running encode/decode, and exporting the encoder and decoder to ONNX via `torch.onnx.export`.
+**Notebook** (`serialization/serialization.ipynb`): walks through loading a pretrained model, running encode/decode, and exporting the encoder and decoder to ONNX via `torch.onnx.export`.
 
-**Test script** (`Serialization/test_serialization_traced.py`): verifies three serialization approaches — state-dict round-trip, full-model pickle, and JIT tracing.
+**Test script** (`serialization/test_serialization_traced.py`): verifies three serialization approaches — state-dict round-trip, full-model pickle, and JIT tracing.
 
-Run from the repo root or from inside `Serialization/`:
+Run from the repo root or from inside `serialization/`:
 
 ```bash
-python Serialization/test_serialization_traced.py
+python serialization/test_serialization_traced.py
+```
+
+---
+
+## Tests
+
+`tests/test_equivalence.py` verifies that `rt_encodec` produces bit-exact output
+compared to the original `encodec` for every combination of model, bandwidth, and
+input length. It uses random weights (no pretrained download required) and covers:
+
+| Test class | What is checked |
+|---|---|
+| `TestEncode` | `encode()` codebook indices and scale factors are identical |
+| `TestDecode` | `decode()` reconstructed audio is identical given the same frames |
+| `TestForward` | Full encode+decode roundtrip output is identical |
+| `TestExportingFlagNeutral` | `exporting_to_onnx=True` does not alter any computed values |
+| `TestBatchEquivalence` | Results agree at batch size > 1 |
+| `TestPaddingRegression` | Targeted regression for inputs where `length % stride != 0` — the cases most sensitive to the ceiling-arithmetic fix in `get_extra_padding_for_conv1d` |
+
+Both 24 kHz (bandwidths 1.5 / 3 / 6 / 12 / 24 kbps) and 48 kHz (3 / 6 / 12 / 24 kbps)
+models are covered, with input lengths chosen to hit clean multiples, off-by-one edges,
+and multi-segment inputs that exercise the overlap-add decoder path.
+
+Run from the repo root:
+
+```bash
+pytest tests/test_equivalence.py -v
 ```
 
 ---
