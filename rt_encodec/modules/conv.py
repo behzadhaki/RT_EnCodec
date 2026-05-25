@@ -56,39 +56,29 @@ def get_extra_padding_for_conv1d(x: torch.Tensor, kernel_size: int, stride: int,
     """See `pad_for_conv1d`.
     """
     length = x.shape[-1]
-    n_frames = (length - kernel_size + padding_total) / stride + 1
-    ideal_length = (math.ceil(n_frames) - 1) * stride + (kernel_size - padding_total)
+    # ceil(n_frames) = ceil(a/stride) + 1 = (a + stride - 1) // stride + 1
+    # where a = length - kernel_size + padding_total
+    n_frames_ceil = (length - kernel_size + padding_total + stride - 1) // stride + 1
+    ideal_length = (n_frames_ceil - 1) * stride + (kernel_size - padding_total)
     return ideal_length - length
 
 
-def pad_for_conv1d(x: torch.Tensor, kernel_size: int, stride: int, padding_total: int = 0):
-    """Pad for a convolution to make sure that the last window is full.
-    Extra padding is added at the end. This is required to ensure that we can rebuild
-    an output of the same length, as otherwise, even with padding, some time steps
-    might get removed.
-    For instance, with total padding = 4, kernel size = 4, stride = 2:
-        0 0 1 2 3 4 5 0 0   # (0s are padding)
-        1   2   3           # (output frames of a convolution, last 0 is never used)
-        0 0 1 2 3 4 5 0     # (output of tr. conv., but pos. 5 is going to get removed as padding)
-            1 2 3 4         # once you removed padding, we are missing one time step !
-    """
-    extra_padding = get_extra_padding_for_conv1d(x, kernel_size, stride, padding_total)
-    return F.pad(x, (0, extra_padding))
 
-
+@torch.jit.script
 def pad1d(x: torch.Tensor, paddings: tp.Tuple[int, int], mode: str = 'zero', value: float = 0.):
     """Tiny wrapper around F.pad, just to allow for reflect padding on small input.
     If this is the case, we insert extra 0 padding to the right before the reflection happen.
     """
     length = x.shape[-1]
     padding_left, padding_right = paddings
-    assert padding_left >= 0 and padding_right >= 0, (padding_left, padding_right)
+
     if mode == 'reflect':
         max_pad = max(padding_left, padding_right)
-        extra_pad = 0
-        if length <= max_pad:
-            extra_pad = max_pad - length + 1
-            x = F.pad(x, (0, extra_pad))
+        # Always compute extra_pad, will be 0 if not needed
+        extra_pad = max(0, max_pad - length + 1)
+
+        # Pad if needed (0 padding does nothing)
+        x = F.pad(x, (0, extra_pad))
         padded = F.pad(x, paddings, mode, value)
         end = padded.shape[-1] - extra_pad
         return padded[..., :end]
@@ -99,8 +89,8 @@ def pad1d(x: torch.Tensor, paddings: tp.Tuple[int, int], mode: str = 'zero', val
 def unpad1d(x: torch.Tensor, paddings: tp.Tuple[int, int]):
     """Remove padding from x, handling properly zero padding. Only for 1d!"""
     padding_left, padding_right = paddings
-    assert padding_left >= 0 and padding_right >= 0, (padding_left, padding_right)
-    assert (padding_left + padding_right) <= x.shape[-1]
+    #assert padding_left >= 0 and padding_right >= 0, (padding_left, padding_right)
+    #assert (padding_left + padding_right) <= x.shape[-1]
     end = x.shape[-1] - padding_right
     return x[..., padding_left: end]
 

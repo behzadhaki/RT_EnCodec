@@ -359,9 +359,13 @@ class ResidualVectorQuantization(nn.Module):
         return out_indices
 
     def decode(self, q_indices: torch.Tensor) -> torch.Tensor:
-        quantized_out = torch.tensor(0.0, device=q_indices.device)
-        for i, indices in enumerate(q_indices):
+        quantized_out = None
+        # unbind creates a tuple, which ONNX can trace properly
+        for i, indices in enumerate(torch.unbind(q_indices, dim=0)):
             layer = self.layers[i]
             quantized = layer.decode(indices)
-            quantized_out = quantized_out + quantized
+            if quantized_out is None:
+                quantized_out = quantized
+            else:
+                quantized_out = quantized_out + quantized
         return quantized_out
