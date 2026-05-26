@@ -16,6 +16,7 @@ from torch import nn
 
 from . import quantization as qt
 from . import modules as m
+from .modules import LSTMState
 from .utils import _check_checksum, _linear_overlap_add, _get_checkpoint_url
 
 
@@ -123,13 +124,20 @@ class EncodecModel(nn.Module):
             return None
         return max(1, int((1 - self.overlap) * segment_length))
 
-    def encode(self, x: torch.Tensor) -> tp.List[EncodedFrame]:
+    def encode(
+        self,
+        x: torch.Tensor,
+        lstm_state: tp.Optional[LSTMState] = None,
+    ) -> tp.Tuple[tp.List[EncodedFrame], tp.Optional[LSTMState]]:
         """Given a tensor `x`, returns a list of frames containing
         the discrete encoded codes for `x`, along with rescaling factors
         for each segment, when `self.normalize` is True.
 
-        Each frames is a tuple `(codebook, scale)`, with `codebook` of
+        Each frame is a tuple `(codebook, scale)`, with `codebook` of
         shape `[B, K, T]`, with `K` the number of codebooks.
+
+        `lstm_state` is carried across segments for streaming use; pass `None`
+        to reset to zeros (default, equivalent to previous behaviour).
         """
         if not self.exporting_to_onnx:
             assert x.dim() == 3
@@ -146,12 +154,18 @@ class EncodecModel(nn.Module):
                 assert stride is not None
 
         encoded_frames: tp.List[EncodedFrame] = []
+        last_lstm_state = lstm_state
         for offset in range(0, length, stride):
             frame = x[:, :, offset: offset + segment_length]
-            encoded_frames.append(self._encode_frame(frame))
-        return encoded_frames
+            encoded_frame, last_lstm_state = self._encode_frame(frame, lstm_state)
+            encoded_frames.append(encoded_frame)
+        return encoded_frames, last_lstm_state
 
-    def _encode_frame(self, x: torch.Tensor) -> EncodedFrame:
+    def _encode_frame(
+        self,
+        x: torch.Tensor,
+        lstm_state: tp.Optional[LSTMState] = None,
+    ) -> tp.Tuple[EncodedFrame, tp.Optional[LSTMState]]:
         length = x.shape[-1]
         duration = length / self.sample_rate
         if not self.exporting_to_onnx:
@@ -166,38 +180,70 @@ class EncodecModel(nn.Module):
         else:
             scale = None
 
-        emb = self.encoder(x)
+        emb, lstm_state = self.encoder(x, lstm_state)
         codes = self.quantizer.encode(emb, self.frame_rate, self.bandwidth)
         codes = codes.transpose(0, 1)
         # codes is [B, K, T], with T frames, K nb of codebooks.
-        return codes, scale
+        return (codes, scale), lstm_state
 
-    def decode(self, encoded_frames: tp.List[EncodedFrame]) -> torch.Tensor:
+    def decode(
+        self,
+        encoded_frames: tp.List[EncodedFrame],
+        lstm_state: tp.Optional[LSTMState] = None,
+    ) -> tp.Tuple[torch.Tensor, tp.Optional[LSTMState]]:
         """Decode the given frames into a waveform.
         Note that the output might be a bit bigger than the input. In that case,
         any extra steps at the end can be trimmed.
+
+        `lstm_state` is carried across segments for streaming use; pass `None`
+        to reset to zeros (default, equivalent to previous behaviour).
         """
         segment_length = self.segment_length
         if segment_length is None:
             if not self.exporting_to_onnx:
                 assert len(encoded_frames) == 1
-            return self._decode_frame(encoded_frames[0])
+            return self._decode_frame(encoded_frames[0], lstm_state)
 
-        frames = [self._decode_frame(frame) for frame in encoded_frames]
-        return _linear_overlap_add(frames, self.segment_stride or 1)
+        frames = []
+        last_lstm_state = lstm_state
+        for encoded_frame in encoded_frames:
+            frame, last_lstm_state = self._decode_frame(encoded_frame, lstm_state)
+            frames.append(frame)
+        return _linear_overlap_add(frames, self.segment_stride or 1), last_lstm_state
 
-    def _decode_frame(self, encoded_frame: EncodedFrame) -> torch.Tensor:
+    def _decode_frame(
+        self,
+        encoded_frame: EncodedFrame,
+        lstm_state: tp.Optional[LSTMState] = None,
+    ) -> tp.Tuple[torch.Tensor, tp.Optional[LSTMState]]:
         codes, scale = encoded_frame
         codes = codes.transpose(0, 1)
         emb = self.quantizer.decode(codes)
-        out = self.decoder(emb)
+        out, lstm_state = self.decoder(emb, lstm_state)
         if scale is not None:
             out = out * scale.view(-1, 1, 1)
-        return out
+        return out, lstm_state
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        frames = self.encode(x)
-        return self.decode(frames)[:, :, :x.shape[-1]]
+        """Standard forward pass — stateless, returns audio only.
+        Signature unchanged for backward compatibility and ONNX export.
+
+        Stereo input to a mono model (self.channels == 1) is handled by
+        processing L and R as a batch of two mono streams and recombining.
+        """
+        stereo_as_batch = (x.shape[1] == 2 and self.channels == 1 and x.shape[0] == 1)
+        if stereo_as_batch:
+            # [1, 2, T] → [2, 1, T]: process L and R as independent mono streams
+            x = x.squeeze(0).unsqueeze(1)
+
+        frames, _ = self.encode(x)
+        audio, _ = self.decode(frames)
+        audio = audio[:, :, :x.shape[-1]]
+
+        if stereo_as_batch:
+            # [2, 1, T] → [1, 2, T]
+            audio = audio.squeeze(1).unsqueeze(0)
+        return audio
 
     def set_target_bandwidth(self, bandwidth: float):
         if bandwidth not in self.target_bandwidths:

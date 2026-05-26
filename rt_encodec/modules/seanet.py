@@ -16,6 +16,7 @@ from . import (
     SConvTranspose1d,
     SLSTM
 )
+from .lstm import LSTMState
 
 
 class SEANetResnetBlock(nn.Module):
@@ -140,8 +141,17 @@ class SEANetEncoder(nn.Module):
 
         self.model = nn.Sequential(*model)
 
-    def forward(self, x):
-        return self.model(x)
+    def forward(
+        self,
+        x: nn.Module,
+        lstm_state: tp.Optional[LSTMState] = None,
+    ) -> tp.Tuple[nn.Module, tp.Optional[LSTMState]]:
+        for module in self.model:
+            if isinstance(module, SLSTM):
+                x, lstm_state = module(x, lstm_state)
+            else:
+                x = module(x)
+        return x, lstm_state
 
 
 class SEANetDecoder(nn.Module):
@@ -233,9 +243,18 @@ class SEANetDecoder(nn.Module):
             ]
         self.model = nn.Sequential(*model)
 
-    def forward(self, z):
-        y = self.model(z)
-        return y
+    def forward(
+        self,
+        z: nn.Module,
+        lstm_state: tp.Optional[LSTMState] = None,
+    ) -> tp.Tuple[nn.Module, tp.Optional[LSTMState]]:
+        x = z
+        for module in self.model:
+            if isinstance(module, SLSTM):
+                x, lstm_state = module(x, lstm_state)
+            else:
+                x = module(x)
+        return x, lstm_state
 
 
 def test():
