@@ -398,9 +398,10 @@ const NOTES = {
   '24k-true': () => {
     const f = parseInt(frameSel.value);
     const ms = Math.round(f / 24000 * 1000);
-    return `<strong>Streaming (${f} samples · ${ms} ms frames).</strong> Audio is processed ` +
-      'chunk by chunk. LSTM hidden state is carried from each chunk to the next, giving the model ' +
-      'continuous temporal context across boundaries — as it would in a live stream.';
+    return `<strong>Streaming (${f} samples · ${ms} ms frames).</strong> Audio is split into ` +
+      'overlapping segments; each segment extends ±27 ms (640 samples) beyond the frame boundary ' +
+      'so the causal encoder always has valid cross-boundary context. A triangle-window crossfade ' +
+      'blends the overlap region. LSTM state is carried across segments.';
   },
 
   '48k': () =>

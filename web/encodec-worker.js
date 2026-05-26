@@ -123,9 +123,19 @@ async function processChunk(chunk, modelHz, hEnc, cEnc, hDec, cDec) {
 }
 
 // ---------------------------------------------------------------------------
-// 48 kHz overlap-add constants  (mirrors _linear_overlap_add in rt_encodec)
+// Overlap-add constants
 // ---------------------------------------------------------------------------
 
+// 24 kHz streaming OLA
+// The causal encoder's Conv1d stack has a receptive field of ~600-1200 input
+// samples; without context from the previous chunk the first encoder frames are
+// corrupted, producing an audible click at every boundary. Extending each
+// segment by HALF_OV_24 samples on both sides gives the encoder the causal
+// context it needs; the triangle crossfade then blends the overlap region.
+// HALF_OV_24 = 640 = 2 × 320 (two encoder frames, ≈ 27 ms).
+const HALF_OV_24 = 640;
+
+// 48 kHz OLA  (mirrors _linear_overlap_add in rt_encodec)
 const SEG_48    = 48000;   // 1.0 s segment
 const STRIDE_48 = 43200;   // 0.9 s stride → 4800-sample (100 ms) overlap
                            // The original Python model uses 47520 (10 ms), but
@@ -171,52 +181,80 @@ async function runJob(msg) {
 }
 
 // ---------------------------------------------------------------------------
-// 24 kHz runner  (simple chunk concatenation)
+// 24 kHz runner
+//   Non-streaming — single pass, zero LSTM state throughout.
+//   Streaming     — triangle-windowed overlap-add (stride = frameSize,
+//                   window = frameSize + 2×HALF_OV_24), LSTM state carried.
+//                   The ±HALF_OV_24 extension gives the causal encoder the
+//                   cross-boundary context it needs to avoid click artifacts.
 // ---------------------------------------------------------------------------
 
 async function run24k(audio, streaming, frameSize, jobId) {
-  const chunkSize = streaming ? frameSize : audio.length;
+  if (!streaming) {
+    // Single-pass, stateless
+    if (currentJobId !== jobId) return null;
+    self.postMessage({ type: 'progress', jobId, value: 0.5, status: 'Processing… 50 %' });
+    const result = await processChunk(
+      audio.slice(), '24k', zeroState(1), zeroState(1), zeroState(1), zeroState(1));
+    if (currentJobId !== jobId) return null;
+    self.postMessage({ type: 'progress', jobId, value: 1,   status: 'Processing… 100 %' });
+    return result.outAudio.slice(0, audio.length);
+  }
+
+  // --- Streaming: OLA ---
+  const stride = frameSize;
+  const seg    = stride + 2 * HALF_OV_24;   // window length; multiple of 320 ✓
+
+  // Triangle window for this segment length
+  const win = new Float32Array(seg);
+  for (let i = 0; i < seg; i++) {
+    const t = (i + 1) / (seg + 1);
+    win[i] = 0.5 - Math.abs(t - 0.5);
+  }
+
+  const totalLen = audio.length;
+  const outBuf   = new Float32Array(totalLen);
+  const wgtBuf   = new Float32Array(totalLen);
+  const numSegs  = Math.ceil(totalLen / stride);
+
   let hEnc = zeroState(1), cEnc = zeroState(1);
   let hDec = zeroState(1), cDec = zeroState(1);
-  const parts = [];
-  let done = 0;
 
-  for (let start = 0; start < audio.length; start += chunkSize) {
+  for (let s = 0; s < numSegs; s++) {
     if (currentJobId !== jobId) return null;
 
-    let chunk = audio.subarray(start, start + chunkSize);
-    if (chunk.length < chunkSize) {
-      const padded = new Float32Array(chunkSize);
-      padded.set(chunk);
-      chunk = padded;
-    }
+    const off = s * stride - HALF_OV_24;   // window start in audio coords (may be < 0)
+
+    // Build input: zero-padded where out of range
+    const chunk  = new Float32Array(seg);  // zero-initialised
+    const srcS   = Math.max(off, 0);
+    const srcE   = Math.min(off + seg, totalLen);
+    if (srcE > srcS) chunk.set(audio.subarray(srcS, srcE), srcS - off);
 
     const result = await processChunk(chunk, '24k', hEnc, cEnc, hDec, cDec);
+    hEnc = result.hEncNew; cEnc = result.cEncNew;
+    hDec = result.hDecNew; cDec = result.cDecNew;
 
-    if (streaming) {
-      hEnc = result.hEncNew; cEnc = result.cEncNew;
-      hDec = result.hDecNew; cDec = result.cDecNew;
-    } else {
-      hEnc = zeroState(1); cEnc = zeroState(1);
-      hDec = zeroState(1); cDec = zeroState(1);
+    // Weighted accumulate — only within valid (non-padded) output range
+    for (let i = srcS - off; i < srcE - off; i++) {
+      const pos = off + i;
+      outBuf[pos] += win[i] * result.outAudio[i];
+      wgtBuf[pos] += win[i];
     }
 
-    const actualLen = Math.min(chunkSize, audio.length - start);
-    parts.push(result.outAudio.slice(0, actualLen));
-
-    done += actualLen;
     self.postMessage({
       type: 'progress', jobId,
-      value: done / audio.length,
-      status: `Processing… ${Math.round(done / audio.length * 100)} %`,
+      value: Math.min((s + 1) / numSegs, 1),
+      status: `Processing… ${Math.round((s + 1) / numSegs * 100)} %`,
     });
   }
 
-  const totalLen = parts.reduce((s, p) => s + p.length, 0);
-  const out = new Float32Array(totalLen);
-  let offset = 0;
-  for (const p of parts) { out.set(p, offset); offset += p.length; }
-  return out;
+  // Normalise by accumulated window weights
+  for (let i = 0; i < totalLen; i++) {
+    if (wgtBuf[i] > 0) outBuf[i] /= wgtBuf[i];
+  }
+
+  return outBuf;
 }
 
 // ---------------------------------------------------------------------------
