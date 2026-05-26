@@ -1,22 +1,30 @@
 """
-export_onnx.py
+export_onnx.py — export rt_encodec to ONNX as four independent graphs per model.
 
-Exports the rt_encodec encoder and decoder to ONNX.
+Each graph corresponds to one stage in the pipeline:
 
-Sections
---------
-1. Sanity-check  — load the 24 kHz model, run encode / decode / forward on a
-                   real audio clip and print shapes.
-2. Encoder ONNX  — wrap the 48 kHz encoder, test it, export to
-                   encodec_encoder.onnx, inspect the saved graph.
-3. Decoder ONNX  — wrap the 48 kHz decoder, export to encodec_decoder.onnx.
+  encode_audio_segment.onnx   audio + LSTM state → embeddings + LSTM state
+  quantize_encodings.onnx     embeddings → codes   (stateless)
+  decode_codes.onnx           codes → embeddings   (stateless)
+  decode_audio.onnx           embeddings + LSTM state → audio + LSTM state
+
+For the 48 kHz model, encode_audio_segment also returns an RMS scale and
+decode_audio takes it back to undo the normalisation.
+
+LSTM state shape: [num_layers=2, B, hidden_size=512] for all stateful graphs.
+  24 kHz: B=1 (mono) or B=2 (stereo-as-batch)
+  48 kHz: B always 1
+
+Outputs written to serialization/onnx_exports/{24k,48k}/{bw}kbps/
+K (active codebooks) is fixed at export time:
+  24 kHz: K = floor(bw * 1000 / (75  * 10))
+  48 kHz: K = floor(bw * 1000 / (150 * 10))
 
 Run from repo root:
-    python serialization/export_onnx.py
-or from inside the serialization/ folder:
-    python export_onnx.py
+  python serialization/export_onnx.py [--bw24 BW [BW ...]] [--bw48 BW [BW ...]]
 """
 
+import argparse
 import os
 import sys
 import warnings
@@ -24,155 +32,356 @@ import warnings
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 import torch
-import torchaudio
+import torch.nn as nn
 import onnx
 
-# Suppress non-actionable export warnings:
-# - legacy TorchScript ONNX exporter deprecation (switching to dynamo is a
-#   separate effort; the legacy path works fine for this use case)
-# - LSTM variable-batch warning (h0/c0 are initialised dynamically in SLSTM,
-#   so the warning does not apply)
 warnings.filterwarnings("ignore", message=".*legacy TorchScript-based ONNX.*")
-warnings.filterwarnings("ignore", message=".*Exporting a model to ONNX with a batch_size other than 1.*")
-warnings.filterwarnings("ignore", message=".*torch.nn.utils.weight_norm.*")
+warnings.filterwarnings("ignore", message=".*batch_size other than 1.*")
+warnings.filterwarnings("ignore", message=".*weight_norm.*")
 warnings.filterwarnings("ignore", message=".*Constant folding.*Only steps=1.*")
 warnings.filterwarnings("ignore", message=".*torchaudio.*torchcodec.*")
 
 from rt_encodec import EncodecModel
 
-
-# ---------------------------------------------------------------------------
-# 1. Sanity-check with the 24 kHz model
-# ---------------------------------------------------------------------------
-
-print("=" * 60)
-print("1. Sanity-check (24 kHz model)")
-print("=" * 60)
-
-model_24 = EncodecModel.encodec_model_24khz()
-model_24.set_target_bandwidth(12.0)
-model_24.exporting_to_onnx = True
-model_24.eval()
-
-wav, sr = torchaudio.load(os.path.join(os.path.dirname(__file__), "..", "test_24k.wav"))
-wav = wav[:, : model_24.sample_rate * 2]   # keep 2 seconds
-wav_in = wav.unsqueeze(0)                  # [1, 1, T]
-print(f"Audio input shape : {wav_in.shape}")
-
-with torch.no_grad():
-    wav_rec = model_24.forward(wav_in)
-    print(f"Forward output    : {wav_rec.shape}")
-
-    encoded_frames_24 = model_24.encode(wav_in)
-    encodings = [ef[0] for ef in encoded_frames_24]
-    print(f"Is normalised     : {model_24.normalize}")
-    print(f"Segment frames    : {len(encoded_frames_24)}")
-    print(f"Codes shapes      : {[e.shape for e in encodings]}")
-    print(f"Scaling factors   : {[ef[1] for ef in encoded_frames_24]}")
-
-    decoded = model_24.decode(encoded_frames_24)[:, :, : wav_in.shape[-1]]
-    print(f"Decoded shape     : {decoded.shape}")
+_HERE = os.path.dirname(os.path.abspath(__file__))
+LSTM_LAYERS = 2
+LSTM_HIDDEN = 512   # mult * n_filters = 16 * 32, shared by encoder and decoder
 
 
 # ---------------------------------------------------------------------------
-# 2. Encoder — export to ONNX (48 kHz model)
+# Stage wrappers — 24 kHz
 # ---------------------------------------------------------------------------
 
-print()
-print("=" * 60)
-print("2. Encoder ONNX export (48 kHz model)")
-print("=" * 60)
+class EncodeAudioSegment24(nn.Module):
+    """SEANet encoder for the 24 kHz model.
 
-
-class EncodecEncoderWrapper(torch.nn.Module):
-    def __init__(self, encodec_model):
+    Inputs : audio [B, 1, T],        h [2, B, 512],  c [2, B, 512]
+    Outputs: emb   [B, D, T_frames], h [2, B, 512],  c [2, B, 512]
+    """
+    def __init__(self, model: EncodecModel):
         super().__init__()
-        self.encodec_model = encodec_model
+        self.encoder = model.encoder
 
-    def forward(self, x):
-        # x: [n_channels, n_samples]  (no batch dimension)
-        x_batched = x.unsqueeze(0)                      # [1, n_channels, n_samples]
-        encoded_frames = self.encodec_model.encode(x_batched)
-        codes = encoded_frames[0][0]                    # [1, n_codebooks, n_frames]
-        return codes.squeeze(0)                         # [n_codebooks, n_frames]
+    def forward(self, audio: torch.Tensor, h: torch.Tensor, c: torch.Tensor):
+        emb, (h_out, c_out) = self.encoder(audio, (h, c))
+        return emb, h_out, c_out
 
 
-encoder_model = EncodecModel.encodec_model_48khz()
-encoder_model.set_target_bandwidth(3.0)
-encoder_model.exporting_to_onnx = True
-encoder_model.eval()
+class QuantizeEncodings24(nn.Module):
+    """RVQ encoder for the 24 kHz model (stateless).
 
-encoder_wrapper = EncodecEncoderWrapper(encoder_model)
-# 48 kHz model is always stereo (2 channels); only n_samples is dynamic.
-dummy_audio = torch.randn(2, 48000)   # [n_channels=2, n_samples]
-
-with torch.no_grad():
-    codes_out = encoder_wrapper(dummy_audio)
-    print(f"Encoder input shape  : {dummy_audio.shape}")
-    print(f"Encoder output shape : {codes_out.shape}")
-
-encoder_onnx_path = os.path.join(os.path.dirname(__file__), "encodec_encoder.onnx")
-torch.onnx.export(
-    encoder_wrapper,
-    dummy_audio,
-    encoder_onnx_path,
-    opset_version=13,
-    input_names=["audio_input"],
-    output_names=["encoded_codes"],
-    # dim 0 (channels) is fixed at 2; only n_samples varies
-    dynamic_axes={
-        "audio_input":   {1: "n_samples"},
-        "encoded_codes": {1: "n_frames"},
-    },
-)
-print(f"Exported encoder → {encoder_onnx_path}")
-
-onnx_encoder = onnx.load(encoder_onnx_path)
-print("ONNX encoder input shape:", onnx_encoder.graph.input[0].type.tensor_type.shape)
-print(f"segment_length={encoder_model.segment_length}  "
-      f"segment_stride={encoder_model.segment_stride}")
-
-
-# ---------------------------------------------------------------------------
-# 3. Decoder — export to ONNX (48 kHz model, same weights)
-# ---------------------------------------------------------------------------
-
-print()
-print("=" * 60)
-print("3. Decoder ONNX export (48 kHz model)")
-print("=" * 60)
-
-
-class EncodecDecoderWrapper(torch.nn.Module):
-    def __init__(self, encodec_model):
+    Inputs : emb   [B, D, T_frames]
+    Outputs: codes [B, K, T_frames]  (int64)
+    """
+    def __init__(self, model: EncodecModel):
         super().__init__()
-        self.encodec_model = encodec_model
+        self.quantizer = model.quantizer
+        self.frame_rate = model.frame_rate
+        self.bandwidth = model.bandwidth
 
-    def forward(self, encoded_frames):
-        # encoded_frames: List[EncodedFrame] where EncodedFrame = (codes, scale)
-        decoded_audio = self.encodec_model.decode(encoded_frames)[0]
-        return decoded_audio
+    def forward(self, emb: torch.Tensor):
+        codes = self.quantizer.encode(emb, self.frame_rate, self.bandwidth)
+        return codes.transpose(0, 1)   # [K, B, Tf] → [B, K, Tf]
 
 
-decoder_model = EncodecModel.encodec_model_48khz()
-decoder_model.set_target_bandwidth(3.0)
-decoder_model.exporting_to_onnx = True
-decoder_model.eval()
+class DecodeCodes24(nn.Module):
+    """RVQ decoder for the 24 kHz model (stateless).
 
-decoder_wrapper = EncodecDecoderWrapper(decoder_model)
+    Inputs : codes [B, K, T_frames]
+    Outputs: emb   [B, D, T_frames]
+    """
+    def __init__(self, model: EncodecModel):
+        super().__init__()
+        self.quantizer = model.quantizer
 
-# Generate example encoded frames from the 48 kHz encoder for tracing
-with torch.no_grad():
-    encoded_frames_48 = encoder_model.encode(dummy_audio.unsqueeze(0))
+    def forward(self, codes: torch.Tensor):
+        return self.quantizer.decode(codes.transpose(0, 1))   # [B,K,Tf]→[K,B,Tf]
 
-decoder_onnx_path = os.path.join(os.path.dirname(__file__), "encodec_decoder.onnx")
-torch.onnx.export(
-    decoder_wrapper,
-    encoded_frames_48,
-    decoder_onnx_path,
-    opset_version=13,
-    input_names=["encoded_frames"],
-    output_names=["decoded_audio"],
-    dynamic_axes={"encoded_frames": {2: "n_frames"}},
-)
-print(f"Exported decoder → {decoder_onnx_path}")
+
+class DecodeAudio24(nn.Module):
+    """SEANet decoder for the 24 kHz model.
+
+    Inputs : emb   [B, D, T_frames], h [2, B, 512],  c [2, B, 512]
+    Outputs: audio [B, 1, T],        h [2, B, 512],  c [2, B, 512]
+    """
+    def __init__(self, model: EncodecModel):
+        super().__init__()
+        self.decoder = model.decoder
+
+    def forward(self, emb: torch.Tensor, h: torch.Tensor, c: torch.Tensor):
+        audio, (h_out, c_out) = self.decoder(emb, (h, c))
+        return audio, h_out, c_out
+
+
+# ---------------------------------------------------------------------------
+# Stage wrappers — 48 kHz
+# ---------------------------------------------------------------------------
+
+class EncodeAudioSegment48(nn.Module):
+    """SEANet encoder for the 48 kHz model, with RMS normalisation.
+
+    Inputs : audio [1, 2, T],                  h [2, 1, 512],  c [2, 1, 512]
+    Outputs: emb   [1, D, T_frames], scale [1, 1], h [2, 1, 512], c [2, 1, 512]
+    """
+    def __init__(self, model: EncodecModel):
+        super().__init__()
+        self.encoder = model.encoder
+
+    def forward(self, audio: torch.Tensor, h: torch.Tensor, c: torch.Tensor):
+        mono = audio.mean(dim=1, keepdim=True)
+        volume = mono.pow(2).mean(dim=2, keepdim=True).sqrt()
+        scale = 1e-8 + volume
+        emb, (h_out, c_out) = self.encoder(audio / scale, (h, c))
+        return emb, scale.view(-1, 1), h_out, c_out
+
+
+class QuantizeEncodings48(nn.Module):
+    """RVQ encoder for the 48 kHz model (stateless).
+
+    Inputs : emb   [1, D, T_frames]
+    Outputs: codes [1, K, T_frames]  (int64)
+    """
+    def __init__(self, model: EncodecModel):
+        super().__init__()
+        self.quantizer = model.quantizer
+        self.frame_rate = model.frame_rate
+        self.bandwidth = model.bandwidth
+
+    def forward(self, emb: torch.Tensor):
+        codes = self.quantizer.encode(emb, self.frame_rate, self.bandwidth)
+        return codes.transpose(0, 1)   # [K, 1, Tf] → [1, K, Tf]
+
+
+class DecodeCodes48(nn.Module):
+    """RVQ decoder for the 48 kHz model (stateless).
+
+    Inputs : codes [1, K, T_frames]
+    Outputs: emb   [1, D, T_frames]
+    """
+    def __init__(self, model: EncodecModel):
+        super().__init__()
+        self.quantizer = model.quantizer
+
+    def forward(self, codes: torch.Tensor):
+        return self.quantizer.decode(codes.transpose(0, 1))
+
+
+class DecodeAudio48(nn.Module):
+    """SEANet decoder for the 48 kHz model, with RMS denormalisation.
+
+    Inputs : emb   [1, D, T_frames], scale [1, 1], h [2, 1, 512], c [2, 1, 512]
+    Outputs: audio [1, 2, T],                      h [2, 1, 512], c [2, 1, 512]
+    """
+    def __init__(self, model: EncodecModel):
+        super().__init__()
+        self.decoder = model.decoder
+
+    def forward(self, emb: torch.Tensor, scale: torch.Tensor,
+                h: torch.Tensor, c: torch.Tensor):
+        audio, (h_out, c_out) = self.decoder(emb, (h, c))
+        return audio * scale.view(-1, 1, 1), h_out, c_out
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _zero_state(batch: int, device='cpu') -> tuple:
+    h = torch.zeros(LSTM_LAYERS, batch, LSTM_HIDDEN, device=device)
+    c = torch.zeros(LSTM_LAYERS, batch, LSTM_HIDDEN, device=device)
+    return h, c
+
+
+def _export(wrapper, dummy_inputs, path, input_names, output_names, dynamic_axes):
+    torch.onnx.export(
+        wrapper,
+        dummy_inputs,
+        path,
+        opset_version=13,
+        input_names=input_names,
+        output_names=output_names,
+        dynamic_axes=dynamic_axes,
+    )
+    model_onnx = onnx.load(path)
+    onnx.checker.check_model(model_onnx)
+    print(f"  saved & verified → {path}")
+
+
+# ---------------------------------------------------------------------------
+# Per-bandwidth export helpers
+# ---------------------------------------------------------------------------
+
+BW_24 = [1.5, 3.0, 6.0, 12.0, 24.0]
+BW_48 = [3.0, 6.0, 12.0, 24.0]
+_EXPORTS_ROOT = os.path.join(_HERE, "encodec_onnx_exports")
+
+
+def _bw_dirname(bw: float) -> str:
+    return f"{bw:g}kbps"
+
+
+def _export_24khz(model: EncodecModel, bw: float) -> None:
+    out_dir = os.path.join(_EXPORTS_ROOT, "24k", _bw_dirname(bw))
+    os.makedirs(out_dir, exist_ok=True)
+
+    model.set_target_bandwidth(bw)
+    K = int(1000 * bw // (model.frame_rate * 10))
+    print(f"\n  24 kHz  {bw:g} kbps  (K={K})")
+
+    # T=321: odd → non-zero extra_padding exercised (avoids constant-folding)
+    B, T = 1, 321
+    h, c = _zero_state(B)
+    audio = torch.randn(B, 1, T)
+
+    # 1. encode_audio_segment
+    enc_seg = EncodeAudioSegment24(model)
+    with torch.no_grad():
+        emb_out, _, _ = enc_seg(audio, h, c)
+    _export(enc_seg, (audio, h, c),
+            os.path.join(out_dir, "encode_audio_segment.onnx"),
+            input_names=["audio", "h_in", "c_in"],
+            output_names=["emb", "h_out", "c_out"],
+            dynamic_axes={
+                "audio": {0: "B", 2: "T"},
+                "h_in":  {1: "B"}, "c_in":  {1: "B"},
+                "emb":   {0: "B", 2: "T_frames"},
+                "h_out": {1: "B"}, "c_out": {1: "B"},
+            })
+
+    # 2. quantize_encodings
+    quant = QuantizeEncodings24(model)
+    with torch.no_grad():
+        codes_out = quant(emb_out)
+    _export(quant, (emb_out,),
+            os.path.join(out_dir, "quantize_encodings.onnx"),
+            input_names=["emb"],
+            output_names=["codes"],
+            dynamic_axes={"emb": {0: "B", 2: "T_frames"}, "codes": {0: "B", 2: "T_frames"}})
+
+    # 3. decode_codes
+    dec_codes = DecodeCodes24(model)
+    codes = torch.randint(0, 1024, (B, K, codes_out.shape[-1]))
+    with torch.no_grad():
+        emb_dec = dec_codes(codes)
+    _export(dec_codes, (codes,),
+            os.path.join(out_dir, "decode_codes.onnx"),
+            input_names=["codes"],
+            output_names=["emb"],
+            dynamic_axes={"codes": {0: "B", 2: "T_frames"}, "emb": {0: "B", 2: "T_frames"}})
+
+    # 4. decode_audio
+    dec_audio = DecodeAudio24(model)
+    _export(dec_audio, (emb_dec, h, c),
+            os.path.join(out_dir, "decode_audio.onnx"),
+            input_names=["emb", "h_in", "c_in"],
+            output_names=["audio", "h_out", "c_out"],
+            dynamic_axes={
+                "emb":   {0: "B", 2: "T_frames"},
+                "h_in":  {1: "B"}, "c_in":  {1: "B"},
+                "audio": {0: "B", 2: "T"},
+                "h_out": {1: "B"}, "c_out": {1: "B"},
+            })
+
+
+def _export_48khz(model: EncodecModel, bw: float) -> None:
+    out_dir = os.path.join(_EXPORTS_ROOT, "48k", _bw_dirname(bw))
+    os.makedirs(out_dir, exist_ok=True)
+
+    model.set_target_bandwidth(bw)
+    K = int(1000 * bw // (model.frame_rate * 10))
+    print(f"\n  48 kHz  {bw:g} kbps  (K={K})")
+
+    # T=1281: odd + ≥ 1280 (=4×320). Min valid input: 1280 samples.
+    h, c = _zero_state(1)
+    audio = torch.randn(1, 2, 1281)
+
+    # 1. encode_audio_segment
+    enc_seg = EncodeAudioSegment48(model)
+    with torch.no_grad():
+        emb_out, scale_out, _, _ = enc_seg(audio, h, c)
+    _export(enc_seg, (audio, h, c),
+            os.path.join(out_dir, "encode_audio_segment.onnx"),
+            input_names=["audio", "h_in", "c_in"],
+            output_names=["emb", "scale", "h_out", "c_out"],
+            dynamic_axes={"audio": {2: "T"}, "emb": {2: "T_frames"}})
+
+    # 2. quantize_encodings
+    quant = QuantizeEncodings48(model)
+    with torch.no_grad():
+        codes_out = quant(emb_out)
+    _export(quant, (emb_out,),
+            os.path.join(out_dir, "quantize_encodings.onnx"),
+            input_names=["emb"],
+            output_names=["codes"],
+            dynamic_axes={"emb": {2: "T_frames"}, "codes": {2: "T_frames"}})
+
+    # 3. decode_codes
+    dec_codes = DecodeCodes48(model)
+    codes = torch.randint(0, 1024, (1, K, codes_out.shape[-1]))
+    with torch.no_grad():
+        emb_dec = dec_codes(codes)
+    _export(dec_codes, (codes,),
+            os.path.join(out_dir, "decode_codes.onnx"),
+            input_names=["codes"],
+            output_names=["emb"],
+            dynamic_axes={"codes": {2: "T_frames"}, "emb": {2: "T_frames"}})
+
+    # 4. decode_audio
+    dec_audio = DecodeAudio48(model)
+    scale = torch.ones(1, 1)
+    _export(dec_audio, (emb_dec, scale, h, c),
+            os.path.join(out_dir, "decode_audio.onnx"),
+            input_names=["emb", "scale", "h_in", "c_in"],
+            output_names=["audio", "h_out", "c_out"],
+            dynamic_axes={"emb": {2: "T_frames"}, "audio": {2: "T"}})
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Export rt_encodec pipeline stages to ONNX. "
+                    "Without flags, all bandwidths for both models are exported."
+    )
+    parser.add_argument("--bw24", type=float, nargs="+", metavar="BW",
+                        help="24 kHz bandwidth(s) to export (kbps). "
+                             f"Default: all {BW_24}")
+    parser.add_argument("--bw48", type=float, nargs="+", metavar="BW",
+                        help="48 kHz bandwidth(s) to export (kbps). "
+                             f"Default: all {BW_48}")
+    args = parser.parse_args()
+
+    bws_24 = args.bw24 if args.bw24 else BW_24
+    bws_48 = args.bw48 if args.bw48 else BW_48
+
+    print(f"Output root: {_EXPORTS_ROOT}")
+    print(f"24 kHz bandwidths : {bws_24}")
+    print(f"48 kHz bandwidths : {bws_48}")
+
+    if bws_24:
+        print(f"\n{'='*60}")
+        print("24 kHz model")
+        print(f"{'='*60}")
+        model_24 = EncodecModel.encodec_model_24khz()
+        model_24.exporting_to_onnx = True
+        model_24.eval()
+        for bw in bws_24:
+            _export_24khz(model_24, bw)
+
+    if bws_48:
+        print(f"\n{'='*60}")
+        print("48 kHz model")
+        print(f"{'='*60}")
+        model_48 = EncodecModel.encodec_model_48khz()
+        model_48.exporting_to_onnx = True
+        model_48.eval()
+        for bw in bws_48:
+            _export_48khz(model_48, bw)
+
+    print(f"\nDone. All exports written to {_EXPORTS_ROOT}/")
+
+
+if __name__ == "__main__":
+    main()
