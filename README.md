@@ -1,6 +1,8 @@
 # EnCodec — ONNX Export Fork
 
-This repository is a fork of [Meta's EnCodec](https://github.com/facebookresearch/encodec) extended to support ONNX serialization of the encoder and decoder. The original README has been preserved as [`encodec_readme.md`](encodec_readme.md).
+Fork of [Meta's EnCodec](https://github.com/facebookresearch/encodec) extended to support ONNX serialization and streaming-capable inference. The original README is preserved as [`encodec_readme.md`](encodec_readme.md).
+
+`encodec/` is kept intact as the upstream reference. All modifications live in `rt_encodec/`.
 
 ---
 
@@ -8,144 +10,197 @@ This repository is a fork of [Meta's EnCodec](https://github.com/facebookresearc
 
 ```
 .
-├── encodec/              # Original Meta EnCodec source code (unmodified)
-├── rt_encodec/           # Modified package with ONNX-compatible changes (see below)
+├── encodec/              # Original Meta EnCodec (unmodified)
+├── rt_encodec/           # Modified package (ONNX + streaming)
 ├── serialization/        # ONNX export scripts
-│   ├── export_onnx.py               # Exports encoder and decoder to ONNX
-│   └── test_serialization_traced.py # JIT tracing / state-dict serialization tests
-├── tests/                # Numerical equivalence tests (encodec vs rt_encodec)
-│   └── test_equivalence.py          # Comprehensive bit-exact comparison across all configs
-├── encodec_readme.md     # Original Meta README
-└── README.md             # This file
+│   ├── export_onnx.py
+│   └── test_serialization_traced.py
+├── tests/
+│   └── test_equivalence.py   # Bit-exact equivalence: encodec vs rt_encodec
+├── scripts/
+│   └── docs/
+│       ├── draw_architecture.py
+│       ├── architecture_24khz.png
+│       └── architecture_48khz.png
+├── encodec_readme.md
+└── README.md
 ```
-
-`encodec` is kept intact as the upstream reference. All modifications live exclusively in `rt_encodec`. Import from `rt_encodec` wherever ONNX export is needed.
 
 ---
 
-## Changes in `rt_encodec`
+## Differences from `encodec`
+
+All changes are forward-pass logic only — no module names or parameter keys are renamed, so **pre-trained checkpoints load without modification** (`model.load_state_dict(state_dict)`).
 
 ### `modules/conv.py`
 
-**`get_extra_padding_for_conv1d`** — replaced `math.ceil()` on a Python float with pure integer arithmetic so the expression is ONNX-traceable:
+`get_extra_padding_for_conv1d` — replaced `math.ceil()` on a Python float with integer arithmetic so the expression is ONNX-traceable:
 
 ```python
-# Before (not ONNX-traceable)
-n_frames = (length - kernel_size + padding_total) / stride + 1
+# Before
 ideal_length = (math.ceil(n_frames) - 1) * stride + (kernel_size - padding_total)
 
-# After (integer ceiling: ceil(a/stride) + 1 = (a + stride - 1) // stride + 1)
+# After  (integer ceiling)
 n_frames_ceil = (length - kernel_size + padding_total + stride - 1) // stride + 1
-ideal_length = (n_frames_ceil - 1) * stride + (kernel_size - padding_total)
+ideal_length  = (n_frames_ceil - 1) * stride + (kernel_size - padding_total)
 ```
 
-**`pad_for_conv1d`** — removed (was unused; `SConv1d` calls `get_extra_padding_for_conv1d` directly).
+`pad1d` — decorated with `@torch.jit.script`; conditional branch replaced with always-computed expression; asserts incompatible with TorchScript removed.
 
-**`pad1d`** — decorated with `@torch.jit.script`. Replaced the conditional branch `if length <= max_pad` with an always-computed `extra_pad = max(0, max_pad - length + 1)` so the function traces cleanly. Removed asserts incompatible with TorchScript.
-
-**`unpad1d`** — removed asserts that cannot be traced.
+`pad_for_conv1d`, `unpad1d` asserts — removed.
 
 ---
 
 ### `modules/lstm.py`
 
-**`SLSTM.forward`** — initialised `h0` and `c0` explicitly as zero tensors instead of passing `None`. The ONNX exporter cannot trace `nn.LSTM` with implicit hidden-state initialisation:
+`SLSTM.forward(x, state=None)` now accepts an optional `(h, c)` state and returns `(y, (h_n, c_n))`. Hidden states are initialised to zeros when `state=None` (default, identical to original behaviour). Callers that want streaming pass the returned state back on the next call.
 
 ```python
 # Before
 y, _ = self.lstm(x)
+return y
 
 # After
-h0 = torch.zeros(self.lstm.num_layers, batch_size, self.lstm.hidden_size, ...)
-c0 = torch.zeros(self.lstm.num_layers, batch_size, self.lstm.hidden_size, ...)
-y, _ = self.lstm(x, (h0, c0))
+y, (h_n, c_n) = self.lstm(x, (h0, c0))   # h0/c0 from state or zeros
+return y, (h_n, c_n)
 ```
+
+---
+
+### `modules/seanet.py`
+
+`SEANetEncoder.forward(x, lstm_state=None)` and `SEANetDecoder.forward(z, lstm_state=None)` — replaced `self.model(x)` with a manual loop that threads `lstm_state` through the `SLSTM` layer. Returns `(output, lstm_state)`. `self.model` (an `nn.Sequential`) is unchanged.
 
 ---
 
 ### `model.py`
 
-Added an `exporting_to_onnx: bool = False` constructor argument. When `True`, Python-level asserts that depend on runtime values (input rank, channel count, segment checks) are skipped so the tracer can proceed with concrete dummy inputs:
-
-```python
-model.exporting_to_onnx = True   # set before torch.onnx.export(...)
-```
-
-No forward-pass logic is altered; only guard asserts are gated.
+- `exporting_to_onnx: bool = False` constructor flag — gates Python-level asserts so the ONNX tracer can proceed with concrete dummy inputs. No computation is altered.
+- `encode(x, lstm_state=None)` → `(List[EncodedFrame], LSTMState)` — returns LSTM state from the last segment.
+- `decode(frames, lstm_state=None)` → `(Tensor, LSTMState)` — same.
+- `forward(x)` — unchanged signature (returns audio tensor only). Handles stereo input to the mono model by processing L and R as a batch of two mono streams and recombining.
 
 ---
 
 ### `quantization/core_vq.py`
 
-**`ResidualVectorQuantization.decode`** — replaced the scalar `torch.tensor(0.0)` accumulator (which causes shape-broadcast issues) with a `None`-initialised accumulator, and replaced direct iteration over the tensor with `torch.unbind(q_indices, dim=0)` for cleaner tracing:
-
-```python
-# Before
-quantized_out = torch.tensor(0.0, device=q_indices.device)
-for i, indices in enumerate(q_indices):
-    quantized_out = quantized_out + layer.decode(indices)
-
-# After
-quantized_out = None
-for i, indices in enumerate(torch.unbind(q_indices, dim=0)):
-    quantized = layer.decode(indices)
-    quantized_out = quantized if quantized_out is None else quantized_out + quantized
-```
+`ResidualVectorQuantization.decode` — replaced scalar `torch.tensor(0.0)` accumulator with `None`-initialised accumulator and `torch.unbind` iteration for cleaner ONNX tracing.
 
 ---
 
 ### `utils.py`
 
-Commented out the `assert sum_weight.min() > 0` guard in `_linear_overlap_add` — it is a Python-level check that is irrelevant inside a traced graph.
+`_linear_overlap_add` — removed `assert sum_weight.min() > 0` (Python-level check irrelevant inside a traced graph).
 
 ---
 
-## Serialization Usage
+## Streaming Usage
 
-Scripts in `serialization/` add the repo root to `sys.path` automatically, so no install step is required.
+```python
+from rt_encodec import EncodecModel
+from rt_encodec.modules import LSTMState
 
-**`serialization/export_onnx.py`** — main export script. Three sections:
-1. Sanity-check: loads the 24 kHz model, runs `encode` / `decode` / `forward` on a real audio clip and prints shapes.
-2. Encoder export: wraps the 48 kHz encoder so it accepts `[n_channels, n_samples]` and returns `[n_codebooks, n_frames]`, then exports to `encodec_encoder.onnx`.
-3. Decoder export: wraps the 48 kHz decoder and exports to `encodec_decoder.onnx`.
+model = EncodecModel.encodec_model_24khz()
+model.set_target_bandwidth(6.0)
+model.eval()
 
-**`serialization/test_serialization_traced.py`** — verifies three serialization approaches: state-dict round-trip, full-model pickle, and JIT tracing.
+enc_state = None
+dec_state = None
 
-Run from the repo root:
+for chunk in audio_stream:               # chunk: [1, 1, 320] at 24 kHz
+    frames, enc_state = model.encode(chunk, enc_state)
+    audio,  dec_state = model.decode(frames, dec_state)
+    output_stream.write(audio)
+```
+
+LSTM state is reset to zeros when `None` is passed (default). Passing the returned state back on the next call gives continuous temporal context across chunk boundaries.
+
+---
+
+## Serialization
 
 ```bash
-python serialization/export_onnx.py
+python serialization/export_onnx.py     # exports encodec_encoder.onnx / encodec_decoder.onnx
 ```
 
 ---
 
 ## Tests
 
-`tests/test_equivalence.py` verifies that `rt_encodec` produces bit-exact output
-compared to the original `encodec` for every combination of model, bandwidth, and
-input length. It uses random weights (no pretrained download required) and covers:
-
-| Test class | What is checked |
-|---|---|
-| `TestEncode` | `encode()` codebook indices and scale factors are identical |
-| `TestDecode` | `decode()` reconstructed audio is identical given the same frames |
-| `TestForward` | Full encode+decode roundtrip output is identical |
-| `TestExportingFlagNeutral` | `exporting_to_onnx=True` does not alter any computed values |
-| `TestBatchEquivalence` | Results agree at batch size > 1 |
-| `TestPaddingRegression` | Targeted regression for inputs where `length % stride != 0` — the cases most sensitive to the ceiling-arithmetic fix in `get_extra_padding_for_conv1d` |
-
-Both 24 kHz (bandwidths 1.5 / 3 / 6 / 12 / 24 kbps) and 48 kHz (3 / 6 / 12 / 24 kbps)
-models are covered, with input lengths chosen to hit clean multiples, off-by-one edges,
-and multi-segment inputs that exercise the overlap-add decoder path.
-
-Run from the repo root:
-
 ```bash
 pytest tests/test_equivalence.py -v
 ```
 
+Verifies bit-exact equivalence between `encodec` and `rt_encodec` across all model / bandwidth / length combinations (no pretrained download required).
+
 ---
 
-## Original EnCodec
+## Architecture
 
-See [`encodec_readme.md`](encodec_readme.md) for the full original documentation, model details, training setup, and citation.
+Both models share the same four-stage pipeline. Both `SEANetEncoder` and `SEANetDecoder` contain a 2-layer `SLSTM` (with residual skip). Within a single call the LSTM runs over all T_frames with continuous context. Across calls the state resets to zeros unless the caller passes the returned `(h, c)` back in.
+
+Variable key: `B` = batch, `C` = audio channels, `D` = embedding dim (128), `T_audio` = samples, `T_frames` = T_audio // 320, `K` = active codebooks.
+
+---
+
+### `encodec_24khz` — causal, mono, 24 kHz
+
+![24 kHz pipeline](scripts/docs/architecture_24khz.png)
+
+Inherently mono. Stereo is supported via parallel processing: L and R are encoded and decoded as independent streams (B=2, C=1) and recombined.
+
+| Stage | Method | Shape | dtype |
+|---|---|---|---|
+| Audio in (mono) | — | `[1, 1, T_audio]` | float32 |
+| Audio in (stereo, batch trick) | — | `[2, 1, T_audio]` | float32 |
+| → `encode_audio_segment` | `SEANetEncoder.forward` | `[B, D, T_frames]` | float32 |
+| → `quantize_encodings` | `ResidualVectorQuantizer.encode` | `[B, K, T_frames]` | int64 |
+| → `decode_codes` | `ResidualVectorQuantizer.decode` | `[B, D, T_frames]` | float32 |
+| → `decode_audio` | `SEANetDecoder.forward` | `[B, 1, T_audio]` | float32 |
+
+`K` = active codebooks = `⌊bandwidth × 1000 / (frame_rate × 10)⌋`:
+
+| Bandwidth | K |
+|---|---|
+| 1.5 kbps | 2 |
+| 3 kbps | 4 |
+| 6 kbps | 8 |
+| 12 kbps | 16 |
+| 24 kbps | 32 |
+
+`frame_rate = 75 Hz`, `segment = None` (full audio in one pass). Streaming chunk: **320 samples ≈ 13.3 ms**.
+
+---
+
+### `encodec_48khz` — non-causal, stereo, 48 kHz
+
+![48 kHz pipeline](scripts/docs/architecture_48khz.png)
+
+Native stereo — both channels are processed jointly by the encoder. Audio channels are absorbed into the embedding dimension D.
+
+| Stage | Method | Shape | dtype |
+|---|---|---|---|
+| Audio in | — | `[1, 2, T_audio]` | float32 |
+| → `encode_audio_segment` | `SEANetEncoder.forward` | `[1, D, T_frames]` | float32 |
+| → `quantize_encodings` | `ResidualVectorQuantizer.encode` | `[1, K, T_frames]` | int64 |
+| → `decode_codes` | `ResidualVectorQuantizer.decode` | `[1, D, T_frames]` | float32 |
+| → `decode_audio` | `SEANetDecoder.forward` | `[1, 2, T_audio]` | float32 |
+
+`K` = active codebooks = `⌊bandwidth × 1000 / (frame_rate × 10)⌋`:
+
+| Bandwidth | K |
+|---|---|
+| 3 kbps | 2 |
+| 6 kbps | 4 |
+| 12 kbps | 8 |
+| 24 kbps | 16 |
+
+`frame_rate = 150 Hz`, `segment = 1.0 s`, `stride = 0.99 s`. Segments are stitched with `_linear_overlap_add` (triangle crossfade, 10 ms overlap). Streaming latency: **~1 s**.
+
+Minimum input for both models: 1 sample. Natural streaming chunk: 320 samples (= 1 output frame).
+
+### Running in Max/MSP
+
+Max/MSP defaults to 44.1 kHz. Set to 48 kHz for the stereo model; always resample to 24 kHz for the mono model. Use `convert_audio(wav, sr, target_sr, target_channels)` from `rt_encodec/utils.py`.
+
+Max's signal vector size (64 or 256 samples) does not align with the 320-sample hop — accumulate samples into a 320-sample buffer before each `encode` call.
