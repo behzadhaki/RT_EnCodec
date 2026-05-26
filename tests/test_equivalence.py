@@ -138,7 +138,8 @@ class TestEncode:
         orig, rt = _make_pair("encodec_model_24khz", bandwidth)
         x = _audio(1, n_samples)
         with torch.no_grad():
-            _assert_frames_equal(orig.encode(x), rt.encode(x))
+            rt_frames, _ = rt.encode(x)
+            _assert_frames_equal(orig.encode(x), rt_frames)
 
     @pytest.mark.parametrize("n_samples", LENGTHS_48)
     @pytest.mark.parametrize("bandwidth", BW_48)
@@ -146,7 +147,8 @@ class TestEncode:
         orig, rt = _make_pair("encodec_model_48khz", bandwidth)
         x = _audio(2, n_samples)
         with torch.no_grad():
-            _assert_frames_equal(orig.encode(x), rt.encode(x))
+            rt_frames, _ = rt.encode(x)
+            _assert_frames_equal(orig.encode(x), rt_frames)
 
 
 # ---------------------------------------------------------------------------
@@ -163,7 +165,8 @@ class TestDecode:
         x = _audio(1, n_samples)
         with torch.no_grad():
             frames = orig.encode(x)
-            _assert_audio_equal(orig.decode(frames), rt.decode(frames))
+            rt_audio, _ = rt.decode(frames)
+            _assert_audio_equal(orig.decode(frames), rt_audio)
 
     @pytest.mark.parametrize("n_samples", LENGTHS_48)
     @pytest.mark.parametrize("bandwidth", BW_48)
@@ -172,7 +175,8 @@ class TestDecode:
         x = _audio(2, n_samples)
         with torch.no_grad():
             frames = orig.encode(x)
-            _assert_audio_equal(orig.decode(frames), rt.decode(frames))
+            rt_audio, _ = rt.decode(frames)
+            _assert_audio_equal(orig.decode(frames), rt_audio)
 
 
 # ---------------------------------------------------------------------------
@@ -293,9 +297,10 @@ class TestPaddingRegression:
         x = _audio(1, n_samples)
         with torch.no_grad():
             o_frames = orig.encode(x)
-            r_frames = rt.encode(x)
+            r_frames, _ = rt.encode(x)
+            rt_audio, _ = rt.decode(r_frames)
         _assert_frames_equal(o_frames, r_frames, label=f"padding-regression-{n_samples}")
-        _assert_audio_equal(orig.decode(o_frames), rt.decode(r_frames),
+        _assert_audio_equal(orig.decode(o_frames), rt_audio,
                             label=f"padding-regression-decode-{n_samples}")
 
     @pytest.mark.parametrize("n_samples", [
@@ -310,7 +315,8 @@ class TestPaddingRegression:
         x = _audio(2, n_samples)
         with torch.no_grad():
             o_frames = orig.encode(x)
-            r_frames = rt.encode(x)
+            r_frames, _ = rt.encode(x)
+            rt_audio, _ = rt.decode(r_frames)
         _assert_frames_equal(o_frames, r_frames, label=f"padding-regression-{n_samples}")
-        _assert_audio_equal(orig.decode(o_frames), rt.decode(r_frames),
+        _assert_audio_equal(orig.decode(o_frames), rt_audio,
                             label=f"padding-regression-decode-{n_samples}")
