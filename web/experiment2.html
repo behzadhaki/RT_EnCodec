@@ -80,14 +80,6 @@ select:focus, input[type=number]:focus { outline: none; border-color: var(--acce
 .tog:disabled { opacity: 0.4; cursor: default; }
 .tog:disabled:hover { color: var(--muted); }
 
-#encodeBtn {
-  width: 100%; padding: 5px;
-  background: var(--accent-lo); border: 1px solid var(--accent);
-  color: var(--text); border-radius: 3px; font-size: 13px;
-  font-weight: 600; cursor: pointer;
-}
-#encodeBtn:hover { filter: brightness(1.2); }
-#encodeBtn:disabled { opacity: 0.4; cursor: default; filter: none; }
 
 /* ── Interpolation slider ────────────────────────────────────────────── */
 .interp-slider-row {
@@ -144,14 +136,16 @@ select:focus, input[type=number]:focus { outline: none; border-color: var(--acce
   padding: 0.4em 0.7em; border-bottom: 1px solid var(--border);
   background: var(--surface); flex-shrink: 0;
 }
-#playBtn {
+#playBtn, #loopBtn {
   width: 28px; height: 28px; border-radius: 4px; cursor: pointer;
   background: var(--accent-lo); border: 1px solid var(--accent);
   color: var(--text); font-size: 14px;
   display: flex; align-items: center; justify-content: center;
 }
-#playBtn:hover { filter: brightness(1.2); }
-#playBtn:disabled { opacity: 0.4; cursor: default; filter: none; }
+#playBtn:hover, #loopBtn:hover { filter: brightness(1.2); }
+#playBtn:disabled, #loopBtn:disabled { opacity: 0.4; cursor: default; filter: none; }
+#loopBtn { font-size: 20px; }
+#loopBtn.active { background: var(--accent); color: #000; }
 
 .tab-group {
   display: flex; gap: 2px;
@@ -249,11 +243,6 @@ select:focus, input[type=number]:focus { outline: none; border-color: var(--acce
         <input type="number" id="freqA" value="440" min="20" max="20000" step="1">
         <span class="unit">Hz</span>
       </div>
-      <div class="row">
-        <span class="lbl">Duration</span>
-        <input type="number" id="durA" value="2" min="0.1" max="10" step="0.1">
-        <span class="unit">s</span>
-      </div>
       <div class="row" id="fileRowA" style="display:none">
         <button class="file-btn" id="fileBtnA">choose file…</button>
         <input type="file" id="fileInputA" accept="audio/*" style="display:none">
@@ -279,14 +268,23 @@ select:focus, input[type=number]:focus { outline: none; border-color: var(--acce
         <input type="number" id="freqB" value="880" min="20" max="20000" step="1">
         <span class="unit">Hz</span>
       </div>
-      <div class="row">
-        <span class="lbl">Duration</span>
-        <input type="number" id="durB" value="2" min="0.1" max="10" step="0.1">
-        <span class="unit">s</span>
-      </div>
       <div class="row" id="fileRowB" style="display:none">
         <button class="file-btn" id="fileBtnB">choose file…</button>
         <input type="file" id="fileInputB" accept="audio/*" style="display:none">
+      </div>
+    </div>
+
+    <!-- Duration -->
+    <div class="section">
+      <div class="section-title">Duration</div>
+      <div class="row">
+        <span class="lbl">Target</span>
+        <input type="number" id="dur" value="2" min="0.1" max="10" step="0.1">
+        <span class="unit">s</span>
+      </div>
+      <div class="row">
+        <span class="lbl">Levels</span>
+        <button class="tog active" id="togNorm" style="flex:1">Normalize</button>
       </div>
     </div>
 
@@ -340,9 +338,9 @@ select:focus, input[type=number]:focus { outline: none; border-color: var(--acce
       <div id="vqModeSection" style="display:none">
         <div class="section-title">VQ Mix Mode</div>
         <div class="toggle-row" id="vqModeRow" style="margin-bottom:0.45em">
-          <button class="tog active" data-vqmode="element_wise">Elem.-wise</button>
-          <button class="tog"        data-vqmode="per_frame">Per Frame</button>
-          <button class="tog"        data-vqmode="per_level">Per Level</button>
+          <button class="tog active" data-vqmode="flat_swap">Flat Swap</button>
+          <button class="tog"        data-vqmode="frame_swap">Frame Swap</button>
+          <button class="tog"        data-vqmode="level_swap">Level Swap</button>
           <button class="tog"        data-vqmode="int_lerp">Int. Lerp</button>
         </div>
       </div>
@@ -363,11 +361,6 @@ select:focus, input[type=number]:focus { outline: none; border-color: var(--acce
       </div>
     </div>
 
-    <!-- Encode button -->
-    <div class="section">
-      <button id="encodeBtn">Encode A &amp; B</button>
-    </div>
-
   </div><!-- #controls -->
 
   <!-- ─────────── RIGHT PANEL ─────────── -->
@@ -375,12 +368,13 @@ select:focus, input[type=number]:focus { outline: none; border-color: var(--acce
 
     <div id="toolbar">
       <button id="playBtn" disabled>▶</button>
+      <button id="loopBtn" disabled title="Loop">↺</button>
       <div class="tab-group">
         <button class="tab active" data-view="A">Source A</button>
         <button class="tab"        data-view="B">Source B</button>
         <button class="tab"        data-view="interp">A → B</button>
       </div>
-      <span id="statusBar">Configure sources and click Encode A &amp; B.</span>
+      <span id="statusBar">Click to enable audio.</span>
       <div id="progressWrap"><div id="progressBar"></div></div>
     </div>
 
@@ -422,16 +416,16 @@ const OCEAN  = [[5,10,40],[0,60,120],[0,140,180],[40,200,220],[180,240,255]];
 const HOT    = [[0,0,0],[191,0,0],[255,128,0],[255,255,64],[255,255,255]];
 
 const VQ_MODE_NOTES = {
-  element_wise:
-    '<strong>Elem.-wise.</strong> Each scalar code position independently picks A\'s or B\'s ' +
-    'index via a golden-ratio hash. Mixes freely across time frames <em>and</em> codebook levels ' +
+  flat_swap:
+    '<strong>Flat Swap.</strong> Each scalar code position independently picks A\'s or B\'s ' +
+    'index via a golden-ratio hash. Swaps freely across time frames <em>and</em> codebook levels ' +
     '— the RVQ hierarchy is broken within each frame.',
-  per_frame:
-    '<strong>Per Frame.</strong> All N<sub>q</sub> levels at a given time frame come from the ' +
+  frame_swap:
+    '<strong>Frame Swap.</strong> All N<sub>q</sub> levels at a given time frame come from the ' +
     'same source (A or B). RVQ intra-frame coherence is preserved: coarse and fine detail always ' +
     'originate from the same signal at each moment.',
-  per_level:
-    '<strong>Per Level.</strong> Each RVQ level k has its own α slider. Within that level each ' +
+  level_swap:
+    '<strong>Level Swap.</strong> Each RVQ level k has its own α slider. Within that level each ' +
     'time frame independently picks A or B. Levels are uncorrelated — a given frame may have ' +
     'level 0 from A and level 1 from B.',
   int_lerp:
@@ -473,10 +467,12 @@ let offA  = null, offB  = null, offInterp  = null;
 let currentView  = 'A';   // 'A' | 'B' | 'interp'
 let streaming    = false;
 let interpPoint  = 'encoder_latents';
-let vqMode       = 'element_wise';
+let vqMode       = 'flat_swap';
+let normalizeLevel = true;
 
 const MAX_NQ         = 32;
-let levelAlphas      = new Array(MAX_NQ).fill(0.5);
+let levelAlphas      = new Array(MAX_NQ).fill(0);
+let shiftHeld        = false;
 const levelSliderEls = [];
 const levelValEls    = [];
 
@@ -484,11 +480,15 @@ let worker       = null;
 let jobSeq       = 0;
 let activeJobId  = -1;
 let encodePhase  = null;   // 'A' | 'B' | 'interp' | null
+let recalcTimer  = null;   // debounce handle
+let recalcToken  = 0;      // incremented on every new pipeline start, guards async file loads
 
-let isPlaying    = false;
-let playNode     = null;
-let playStart    = 0;
-let phRAF        = null;
+let isPlaying       = false;
+let looping         = true;
+let playNode        = null;
+let playStart       = 0;
+let playingDuration = 0;   // duration of the buffer currently in playNode
+let phRAF           = null;
 
 const dpr = devicePixelRatio || 1;
 
@@ -505,8 +505,8 @@ const togS      = $('togS');
 const modeToggleRow = $('modeToggleRow');
 const frameRow  = $('frameRow');
 const frameSel  = $('frameSel');
-const encodeBtn = $('encodeBtn');
 const playBtn   = $('playBtn');
+const loopBtn   = $('loopBtn');
 const statusBar = $('statusBar');
 const progWrap  = $('progressWrap');
 const progBar   = $('progressBar');
@@ -524,7 +524,11 @@ const alphaDisplay = $('alphaDisplay');
 // ═══════════════════════════════════════════════════════════════════════
 
 function ensureAudioCtx() {
-  if (!audioCtx) { audioCtx = new AudioContext(); actOvl.style.display = 'none'; }
+  if (!audioCtx) {
+    audioCtx = new AudioContext();
+    actOvl.style.display = 'none';
+    scheduleFullRecalc();   // kick off generation now that audio is unlocked
+  }
 }
 actOvl.addEventListener('click', ensureAudioCtx);
 
@@ -545,8 +549,14 @@ actOvl.addEventListener('click', ensureAudioCtx);
     freqRow.style.display  = (v === 'file' || v === 'sweep') ? 'none' : '';
   });
   fileBtn.addEventListener('click', () => fileInput.click());
-  fileInput.addEventListener('change', () => {
-    if (fileInput.files[0]) fileBtn.textContent = fileInput.files[0].name;
+  fileInput.addEventListener('change', async () => {
+    if (!fileInput.files[0]) return;
+    fileBtn.textContent = fileInput.files[0].name;
+    // Bump the shared target duration if the file is longer
+    const fileDur = await getAudioFileDuration(fileInput.files[0]);
+    const current = parseFloat($('dur').value) || 2;
+    if (fileDur > current) $('dur').value = fileDur.toFixed(2);
+    scheduleFullRecalc();
   });
 });
 
@@ -589,6 +599,13 @@ function updateFrameRowVisibility() {
   frameRow.style.display = (streaming && modelSel.value === '24k') ? '' : 'none';
 }
 
+// ── Normalize toggle ──────────────────────────────────────────────────────
+$('togNorm').addEventListener('click', () => {
+  normalizeLevel = !normalizeLevel;
+  $('togNorm').classList.toggle('active', normalizeLevel);
+  scheduleFullRecalc();
+});
+
 // ═══════════════════════════════════════════════════════════════════════
 // Interpolation point toggle
 // ═══════════════════════════════════════════════════════════════════════
@@ -600,7 +617,7 @@ document.querySelectorAll('#interpPointRow .tog').forEach(btn => {
     interpPoint = btn.dataset.point;
     updateNotePanel();
     updateVqSectionVisibility();
-    if (decodedA && decodedB) triggerInterpolation();
+    scheduleInterpRecalc();
   });
 });
 
@@ -611,7 +628,7 @@ document.querySelectorAll('#vqModeRow .tog').forEach(btn => {
     vqMode = btn.dataset.vqmode;
     updateVqSectionVisibility();
     updateNotePanel();
-    if (decodedA && decodedB) triggerInterpolation();
+    scheduleInterpRecalc();
   });
 });
 
@@ -624,9 +641,7 @@ interpSlider.addEventListener('input', () => {
   alphaDisplay.textContent = `α = ${a.toFixed(2)}  (${Math.round((1-a)*100)} % A · ${Math.round(a*100)} % B)`;
 });
 
-interpSlider.addEventListener('change', () => {
-  if (decodedA && decodedB) triggerInterpolation();
-});
+interpSlider.addEventListener('change', () => scheduleInterpRecalc());
 
 // ═══════════════════════════════════════════════════════════════════════
 // View tabs
@@ -636,11 +651,12 @@ document.querySelectorAll('.tab').forEach(tab => tab.addEventListener('click', (
   document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
   tab.classList.add('active');
   currentView = tab.dataset.view;
-  stopPlayback();
+  stopPlayback();   // user explicitly changed view — stop and let them re-trigger
   updateLegend();
   drawSpec();
 }));
 
+// Internal view switch — does NOT stop playback (swapIfPlaying handles continuity).
 function setView(v) {
   currentView = v;
   document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.view === v));
@@ -680,22 +696,30 @@ function initLevelSliders() {
 
     const slider = document.createElement('input');
     slider.type = 'range'; slider.min = 0; slider.max = 100;
-    slider.value = 50; slider.step = 1;
+    slider.value = 0; slider.step = 1;
     slider.className = 'level-slider';
     slider.disabled = true;
 
     const val = document.createElement('span');
     val.className = 'level-val';
-    val.textContent = '0.50';
+    val.textContent = '0.00';
 
     const kk = k; // capture for closure
     slider.addEventListener('input', () => {
-      levelAlphas[kk] = slider.value / 100;
-      val.textContent = (slider.value / 100).toFixed(2);
+      const v = slider.value / 100;
+      levelAlphas[kk] = v;
+      val.textContent = v.toFixed(2);
+      // Shift+drag: gang all visible sliders to the same value
+      if (shiftHeld) {
+        const nq = computeNq();
+        for (let i = 0; i < nq; i++) {
+          levelSliderEls[i].value = slider.value;
+          levelAlphas[i] = v;
+          levelValEls[i].textContent = v.toFixed(2);
+        }
+      }
     });
-    slider.addEventListener('change', () => {
-      if (decodedA && decodedB) triggerInterpolation();
-    });
+    slider.addEventListener('change', () => scheduleInterpRecalc());
 
     row.appendChild(lbl);
     row.appendChild(slider);
@@ -717,7 +741,7 @@ function updateLevelSliders() {
 
 function updateVqSectionVisibility() {
   const isVQ       = interpPoint === 'vq_codes';
-  const usesLevels = isVQ && (vqMode === 'per_level' || vqMode === 'int_lerp');
+  const usesLevels = isVQ && (vqMode === 'level_swap' || vqMode === 'int_lerp');
   $('vqModeSection').style.display       = isVQ       ? '' : 'none';
   $('levelSlidersSection').style.display  = usesLevels ? '' : 'none';
   $('mainSliderSection').style.display    = usesLevels ? 'none' : '';
@@ -741,9 +765,11 @@ updateNotePanel();
 // Audio generation
 // ═══════════════════════════════════════════════════════════════════════
 
-function generateSource(srcId) {
+function generateSource(srcId, durSecOverride) {
   const sr    = modelSel.value === '24k' ? 24000 : 48000;
-  const dur   = Math.min(parseFloat($(`dur${srcId}`).value) || 2, MAX_S);
+  const dur   = durSecOverride !== undefined
+    ? Math.min(durSecOverride, MAX_S)
+    : Math.min(parseFloat($('dur').value) || 2, MAX_S);
   const n     = Math.round(dur * sr);
   const type  = $(`srcType${srcId}`).value;
   const f     = parseFloat($(`freq${srcId}`).value) || 440;
@@ -772,8 +798,6 @@ function generateSource(srcId) {
       break;
     }
   }
-  const peak = buf.reduce((m, v) => Math.max(m, Math.abs(v)), 0);
-  if (peak > 0) for (let i = 0; i < n; i++) buf[i] *= 0.8 / peak;
   return buf;
 }
 
@@ -781,8 +805,10 @@ async function loadFile(file, sr) {
   const arrBuf  = await file.arrayBuffer();
   const tmpCtx  = new OfflineAudioContext(1, 1, sr);
   const decoded = await tmpCtx.decodeAudioData(arrBuf);
+  // Trim to MAX_S at the original sample rate, then resample to target sr
   const trimLen = Math.min(decoded.length, Math.round(MAX_S * decoded.sampleRate));
-  const offCtx  = new OfflineAudioContext(1, Math.round(MAX_S * sr), sr);
+  const outLen  = Math.round(trimLen / decoded.sampleRate * sr);
+  const offCtx  = new OfflineAudioContext(1, outLen, sr);
   const src     = offCtx.createBufferSource();
   const trimBuf = new AudioBuffer({
     numberOfChannels: decoded.numberOfChannels,
@@ -802,14 +828,72 @@ async function loadFile(file, sr) {
   return mono;
 }
 
-async function buildAudio(srcId) {
+// Return the duration (seconds) of an audio file, capped at MAX_S.
+async function getAudioFileDuration(file) {
+  const arrBuf = await file.arrayBuffer();
+  const tmpCtx = new OfflineAudioContext(1, 1, 44100);
+  const decoded = await tmpCtx.decodeAudioData(arrBuf);
+  return Math.min(decoded.duration, MAX_S);
+}
+
+// Scale audio so its peak magnitude is `target` (default 0.8). Returns a new array.
+function normalizePeak(audio, target = 0.8) {
+  let peak = 0;
+  for (let i = 0; i < audio.length; i++) { const a = Math.abs(audio[i]); if (a > peak) peak = a; }
+  if (peak < 1e-9) return audio; // silence — nothing to do
+  const scale = target / peak;
+  const out = new Float32Array(audio.length);
+  for (let i = 0; i < audio.length; i++) out[i] = audio[i] * scale;
+  return out;
+}
+
+// Loop `audio` to exactly `targetLen` samples (wraps around).
+function loopToLength(audio, targetLen) {
+  if (audio.length >= targetLen) return audio.slice(0, targetLen);
+  const out = new Float32Array(targetLen);
+  for (let i = 0; i < targetLen; i++) out[i] = audio[i % audio.length];
+  return out;
+}
+
+// Build one source aligned to exactly `finalLen` samples at sample-rate `sr`.
+// Generated signals are produced directly at the right duration — never looped.
+// File signals are loaded, then looped if shorter than finalLen, trimmed if longer.
+async function buildAligned(srcId, finalLen, sr) {
   const type = $(`srcType${srcId}`).value;
-  if (type === 'file') {
-    const f = $(`fileInput${srcId}`).files[0];
-    if (!f) throw new Error(`No file selected for Source ${srcId}.`);
-    return loadFile(f, modelSel.value === '24k' ? 24000 : 48000);
+  if (type !== 'file') {
+    // Generate at exactly the target duration — no looping needed.
+    return generateSource(srcId, finalLen / sr);
   }
-  return generateSource(srcId);
+  const f = $(`fileInput${srcId}`).files[0];
+  if (!f) throw new Error(`No file selected for Source ${srcId}.`);
+  const raw = await loadFile(f, sr);
+  if (raw.length === finalLen) return raw;
+  if (raw.length >  finalLen) return raw.slice(0, finalLen);
+  return loopToLength(raw, finalLen);
+}
+
+// Load both sources aligned to the shared target duration.
+async function buildBothAudios(token) {
+  const sr        = modelSel.value === '24k' ? 24000 : 48000;
+  const targetSec = Math.min(parseFloat($('dur').value) || 2, MAX_S);
+  const finalLen  = Math.round(targetSec * sr);
+
+  setStatus('Loading A…');
+  let audioA;
+  try { audioA = await buildAligned('A', finalLen, sr); } catch (err) { throw err; }
+  if (recalcToken !== token) return null;
+
+  setStatus('Loading B…');
+  let audioB;
+  try { audioB = await buildAligned('B', finalLen, sr); } catch (err) { throw err; }
+  if (recalcToken !== token) return null;
+
+  if (normalizeLevel) {
+    audioA = normalizePeak(audioA);
+    audioB = normalizePeak(audioB);
+  }
+
+  return { audioA, audioB };
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -838,76 +922,123 @@ function onWorkerMsg(e) {
       decodedA = msg.decoded;
       sourceSR = modelSel.value === '24k' ? 24000 : 48000;
       stftA = computeSTFT(decodedA); offA = null;
-      setStatus('Source A encoded. Encoding B…');
+      swapIfPlaying('A');
+      drawSpec();
+      setStatus('Source A encoded — encoding B…');
       startEncodeB();
 
     } else if (encodePhase === 'B') {
       decodedB = msg.decoded;
       stftB = computeSTFT(decodedB); offB = null;
-      setStatus('Both sources encoded. Move the slider to interpolate.');
-      encodeBtn.disabled = false;
       encodePhase = null;
       interpSlider.disabled = false;
       playBtn.disabled = false;
-      updateLevelSliders();   // reveal N_q sliders for current model/bw
-      setView('A');
+      loopBtn.disabled = false;
+      updateLevelSliders();
+      swapIfPlaying('B');
+      drawSpec();
+      if (!isPlaying) setView('A');
       triggerInterpolation();
 
     } else if (encodePhase === 'interp') {
       interpAudio = msg.decoded;
       stftInterp = computeSTFT(interpAudio); offInterp = null;
       const a = parseInt(interpSlider.value) / 100;
-      setStatus(`Interpolated at α = ${a.toFixed(2)} (${interpPoint.replace(/_/g,' ')})`);
-      encodeBtn.disabled = false;
+      const modeLabel = interpPoint === 'vq_codes'
+        ? ` · ${vqMode.replace(/_/g,' ')}` : '';
+      setStatus(`α = ${a.toFixed(2)}  ·  ${interpPoint.replace(/_/g,' ')}${modeLabel}`);
       encodePhase = null;
       playBtn.disabled = false;
-      setView('interp');
+      loopBtn.disabled = false;
+      swapIfPlaying('interp');
+      if (!isPlaying) setView('interp');
+      else drawSpec();
     }
 
   } else if (msg.type === 'error') {
     progWrap.style.display = 'none';
     setStatus('Error: ' + msg.message, true);
-    encodeBtn.disabled = false;
     encodePhase = null;
   }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Encode A → B sequence
+// Recalculation scheduling + cancellation
 // ═══════════════════════════════════════════════════════════════════════
 
-encodeBtn.addEventListener('click', async () => {
-  ensureAudioCtx();
-  stopPlayback();
-  decodedA = decodedB = interpAudio = null;
-  stftA = stftB = stftInterp = null;
-  offA = offB = offInterp = null;
-  interpSlider.disabled = true;
-  playBtn.disabled = true;
-  encodeBtn.disabled = true;
+// Cancel the currently running worker job and reset phase state.
+function cancelCurrentJob() {
+  if (encodePhase !== null) {
+    worker.postMessage({ type: 'cancel', jobId: activeJobId });
+    activeJobId = ++jobSeq;   // invalidate any in-flight result messages
+    encodePhase = null;
+  }
+}
 
-  setStatus('Loading source A…');
-  let audio;
-  try { audio = await buildAudio('A'); }
-  catch (err) { setStatus(err.message, true); encodeBtn.disabled = false; return; }
-  rawAudioA = audio;
-  sourceSR  = modelSel.value === '24k' ? 24000 : 48000;
-  drawSpec();
-
-  if (!worker) initWorker();
-
-  startEncodeA();
-});
-
-function startEncodeA() {
-  encodePhase = 'A';
-  activeJobId = ++jobSeq;
+// Clear visualisers. interpOnly=true keeps decodedA/B intact (interp-only recalc).
+// Never stops playback — old audio keeps playing until new results swap in.
+function clearVisualizers(interpOnly) {
+  // Wipe stale interp result (A/B kept so playback continues uninterrupted)
+  interpAudio = null; stftInterp = null; offInterp = null;
+  if (!interpOnly) {
+    rawAudioA = rawAudioB = null;   // will be reloaded by startFullPipeline
+    interpSlider.disabled = true;
+    updateLevelSliders();
+    // decodedA/B, stftA/B, offA/B intentionally kept for continuous playback
+  }
   progWrap.style.display = 'block';
   progBar.style.width = '0%';
+  setStatus('Re-calculating…');
+  drawSpec();
+}
+
+// Trigger a full pipeline recalc (encode A + B + interpolate), debounced.
+function scheduleFullRecalc(delay = 0) {
+  clearTimeout(recalcTimer);
+  recalcTimer = setTimeout(() => {
+    if (!audioCtx) return;   // wait for user to click the overlay first
+    cancelCurrentJob();
+    clearVisualizers(false);
+    startFullPipeline();
+  }, delay);
+}
+
+// Trigger an interpolation-only recalc (reuses cached rawAudio), immediate.
+function scheduleInterpRecalc() {
+  clearTimeout(recalcTimer);
+  recalcTimer = setTimeout(() => {
+    if (!rawAudioA || !rawAudioB) return;
+    cancelCurrentJob();
+    clearVisualizers(true);
+    triggerInterpolation();
+  }, 0);
+}
+
+// Load both source audios then kick off encode A.
+async function startFullPipeline() {
+  const token = ++recalcToken;
+  if (!worker) initWorker();
+
+  let result;
+  try {
+    result = await buildBothAudios(token);
+  } catch (err) {
+    if (recalcToken === token) { setStatus(err.message, true); progWrap.style.display = 'none'; }
+    return;
+  }
+  if (!result) return; // superseded
+
+  rawAudioA = result.audioA;
+  rawAudioB = result.audioB;
+  sourceSR  = modelSel.value === '24k' ? 24000 : 48000;
+
+  encodePhase = 'A';
+  activeJobId = ++jobSeq;
   setStatus('Encoding A…');
 
   worker.postMessage({
-    type:      'process',
+    type:      'encode',
+    source:    'A',
     jobId:     activeJobId,
     audio:     rawAudioA.slice(),
     modelHz:   modelSel.value,
@@ -917,13 +1048,8 @@ function startEncodeA() {
   });
 }
 
-async function startEncodeB() {
-  setStatus('Loading source B…');
-  let audio;
-  try { audio = await buildAudio('B'); }
-  catch (err) { setStatus(err.message, true); encodeBtn.disabled = false; encodePhase = null; return; }
-  rawAudioB = audio;
-
+// Encode B with already-loaded rawAudioB (called after A result arrives).
+function startEncodeB() {
   encodePhase = 'B';
   activeJobId = ++jobSeq;
   progWrap.style.display = 'block';
@@ -931,7 +1057,8 @@ async function startEncodeB() {
   setStatus('Encoding B…');
 
   worker.postMessage({
-    type:      'process',
+    type:      'encode',
+    source:    'B',
     jobId:     activeJobId,
     audio:     rawAudioB.slice(),
     modelHz:   modelSel.value,
@@ -947,9 +1074,6 @@ async function startEncodeB() {
 
 function triggerInterpolation() {
   if (!rawAudioA || !rawAudioB) return;
-  stopPlayback();
-  encodeBtn.disabled = true;
-  playBtn.disabled = true;
   encodePhase = 'interp';
   activeJobId = ++jobSeq;
   progWrap.style.display = 'block';
@@ -960,8 +1084,6 @@ function triggerInterpolation() {
   const msg = {
     type:       'interpolate',
     jobId:      activeJobId,
-    audio_a:    rawAudioA.slice(),
-    audio_b:    rawAudioB.slice(),
     modelHz:    modelSel.value,
     bwKbps:     parseFloat(bwSel.value),
     streaming,
@@ -970,7 +1092,7 @@ function triggerInterpolation() {
     interpPoint,
     vqMode,
   };
-  if (vqMode === 'per_level' || vqMode === 'int_lerp') {
+  if (vqMode === 'level_swap' || vqMode === 'int_lerp') {
     const nq = computeNq();
     msg.levelAlphas = new Float32Array(levelAlphas.slice(0, nq));
   }
@@ -983,32 +1105,67 @@ function triggerInterpolation() {
 
 playBtn.addEventListener('click', () => { isPlaying ? stopPlayback() : startPlayback(); });
 
+loopBtn.addEventListener('click', () => {
+  looping = !looping;
+  loopBtn.classList.toggle('active', looping);
+  // Apply to the currently running node immediately
+  if (playNode) playNode.loop = looping;
+  if (playNode && !looping) playNode.onended = stopPlayback;
+  if (playNode && looping)  playNode.onended = null;
+});
+
 function currentAudio() {
-  if (currentView === 'A')     return decodedA;
-  if (currentView === 'B')     return decodedB;
+  if (currentView === 'A')      return decodedA;
+  if (currentView === 'B')      return decodedB;
   if (currentView === 'interp') return interpAudio;
   return null;
 }
 
-function startPlayback() {
+// Start (or restart) playback at `atOffset` seconds into the current view's audio.
+function startPlayback(atOffset = 0) {
   if (!audioCtx) return;
   const pcm = currentAudio();
   if (!pcm) return;
+
+  // Tear down existing node without triggering onended → stopPlayback
+  if (playNode) {
+    playNode.onended = null;
+    try { playNode.stop(); } catch {}
+    playNode = null;
+  }
+  cancelAnimationFrame(phRAF);
+
   const buf = audioCtx.createBuffer(1, pcm.length, sourceSR);
   buf.copyToChannel(pcm, 0);
   playNode = audioCtx.createBufferSource();
-  playNode.buffer = buf;
+  playNode.buffer  = buf;
+  playNode.loop    = looping;
+  playNode.onended = looping ? null : stopPlayback;
   playNode.connect(audioCtx.destination);
-  playNode.onended = stopPlayback;
-  playNode.start();
-  playStart = audioCtx.currentTime;
-  isPlaying = true;
+
+  const offset = Math.max(0, Math.min(atOffset, pcm.length / sourceSR - 0.001));
+  playNode.start(0, offset);
+  playStart       = audioCtx.currentTime - offset;
+  playingDuration = pcm.length / sourceSR;
+  isPlaying       = true;
   playBtn.textContent = '⏹';
   animatePlayhead();
 }
 
+// Seamlessly swap the buffer when a new result for `view` arrives.
+// Calculates the current playhead position and restarts at the same offset.
+function swapIfPlaying(view) {
+  if (!isPlaying || currentView !== view) return;
+  const elapsed = audioCtx.currentTime - playStart;
+  const pcm = currentAudio();   // already updated to new data by caller
+  if (!pcm) return;
+  const dur = pcm.length / sourceSR;
+  const offset = looping ? elapsed % dur : Math.min(elapsed, dur - 0.001);
+  startPlayback(Math.max(0, offset));
+}
+
 function stopPlayback() {
-  if (playNode) { try { playNode.stop(); } catch {} playNode = null; }
+  if (playNode) { playNode.onended = null; try { playNode.stop(); } catch {} playNode = null; }
   isPlaying = false;
   playBtn.textContent = '▶';
   cancelAnimationFrame(phRAF);
@@ -1018,9 +1175,12 @@ function stopPlayback() {
 function animatePlayhead() {
   function tick() {
     if (!isPlaying) return;
-    const pcm = currentAudio();
-    const dur = pcm ? pcm.length / sourceSR : 1;
-    drawPlayhead((audioCtx.currentTime - playStart) / dur);
+    // Use playingDuration (the actual buffer length) not currentAudio(),
+    // which may be null while a recalc is in flight.
+    const dur     = playingDuration || 1;
+    const elapsed = audioCtx.currentTime - playStart;
+    const frac    = looping ? (elapsed % dur) / dur : elapsed / dur;
+    drawPlayhead(frac);
     phRAF = requestAnimationFrame(tick);
   }
   tick();
@@ -1216,11 +1376,44 @@ function setStatus(msg, isErr = false) {
 // Boot
 // ═══════════════════════════════════════════════════════════════════════
 
+// ═══════════════════════════════════════════════════════════════════════
+// Shift key tracking (for gang-drag on level sliders)
+// ═══════════════════════════════════════════════════════════════════════
+
+document.addEventListener('keydown', e => { if (e.key === 'Shift') shiftHeld = true;  });
+document.addEventListener('keyup',   e => { if (e.key === 'Shift') shiftHeld = false; });
+// Clear on blur so a window switch doesn't leave shift stuck
+window.addEventListener('blur', () => { shiftHeld = false; });
+
+// ═══════════════════════════════════════════════════════════════════════
+// Auto-recalc listeners
+// ═══════════════════════════════════════════════════════════════════════
+
+// Source/model/mode controls → full pipeline recalc
+['modelSel', 'bwSel', 'frameSel', 'srcTypeA', 'srcTypeB'].forEach(id =>
+  $(id).addEventListener('change', () => scheduleFullRecalc()));
+
+[togNS, togS].forEach(btn => {
+  // mode toggles already set `streaming` — just hook the recalc
+  btn.addEventListener('click', () => scheduleFullRecalc());
+});
+
+// Number inputs: debounce to avoid firing on every keystroke
+['freqA', 'freqB', 'dur'].forEach(id =>
+  $(id).addEventListener('input', () => scheduleFullRecalc(500)));
+
+// (file input recalc is handled inside the async change handler in the forEach loop above)
+
+// ═══════════════════════════════════════════════════════════════════════
+// Boot
+// ═══════════════════════════════════════════════════════════════════════
+
 initWorker();
 initLevelSliders();
 updateLegend();
 updateNotePanel();
 updateVqSectionVisibility();
+loopBtn.classList.add('active');   // loop on by default
 </script>
 </body>
 </html>
