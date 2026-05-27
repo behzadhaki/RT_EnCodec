@@ -42,11 +42,31 @@ the original.
 
 ---
 
+### `experiment2.html` — Latent Space Interpolation
+
+Configure two audio sources (A and B), encode both, then morph between them
+by dragging an interpolation slider. The interpolation is performed at one of
+three points in the EnCodec pipeline:
+
+| Point | Location | What happens |
+|---|---|---|
+| **Encoder Latents** | After `encode_audio_segment`, before the VQ | Continuous encoder embeddings are linearly interpolated, then **re-quantized** (snapped to nearest codebook entries) before decoding. The decoder stays in-distribution while the interpolation explores the pre-VQ manifold. |
+| **VQ Codes** | After `quantize_encodings` | Discrete codebook indices are mixed element-wise: each position uses B's code with probability α, determined by a deterministic golden-ratio hash. Mixed codes are re-embedded via `decode_codes` before audio decoding. |
+| **Quantized Embeddings** | After `decode_codes`, before `decode_audio` | The continuous embeddings output by the code decoder are linearly interpolated, then decoded by the audio LSTM. |
+
+Releasing the slider triggers a fresh inference pass through the pipeline from
+the chosen interpolation point onwards. Works with both non-streaming and
+streaming (OLA) modes. Results are shown in an **A → B** spectrogram tab
+alongside the individual decoded spectrograms for A and B.
+
+---
+
 ## Files
 
 ```
 web/
-├── experiment1.html    Main widget (self-contained except worker + models)
-├── encodec-worker.js   Web Worker: onnxruntime-web inference
+├── experiment1.html    Encode / decode explorer
+├── experiment2.html    Latent space interpolation
+├── encodec-worker.js   Web Worker: onnxruntime-web inference (shared by both)
 └── README.md
 ```

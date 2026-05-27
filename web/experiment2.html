@@ -1,0 +1,1058 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>EnCodec — Latent Space Interpolation</title>
+<style>
+/* ── Design tokens ───────────────────────────────────────────────────── */
+:root {
+  --bg:        #1a1a1a;
+  --surface:   #222222;
+  --surface2:  #282828;
+  --border:    #333333;
+  --border2:   #3a3a3a;
+  --accent:    #c8902a;
+  --accent-lo: #7a5418;
+  --text:      #d0d0d0;
+  --muted:     #aaaaaa;
+  --red:       #cc4444;
+  --lbl-w:     4.8em;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; background: var(--bg); color: var(--text);
+             font: 13px/1.4 system-ui, sans-serif; overflow: hidden; }
+
+/* ── Top-level layout ───────────────────────────────────────────────── */
+#frame {
+  display: grid;
+  grid-template-columns: 230px 1fr;
+  height: 100vh;
+}
+
+/* ── Left panel ─────────────────────────────────────────────────────── */
+#controls {
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+.section {
+  padding: 0.5em 0.7em;
+  border-bottom: 1px solid var(--border);
+}
+.section-title {
+  font-size: 10px; font-weight: 700; letter-spacing: 0.1em;
+  text-transform: uppercase; color: var(--muted); margin-bottom: 0.45em;
+}
+.row {
+  display: flex; align-items: center; gap: 0.4em; margin-bottom: 0.28em;
+}
+.row:last-child { margin-bottom: 0; }
+.lbl { width: var(--lbl-w); flex-shrink: 0; color: var(--muted); font-size: 12px; }
+.unit { color: var(--muted); font-size: 11px; }
+
+select, input[type=number] {
+  flex: 1; min-width: 0;
+  background: #1c1c1c; border: 1px solid var(--border2);
+  color: var(--text); padding: 2px 4px; border-radius: 3px;
+  font-size: 12px; box-shadow: inset 0 1px 2px rgba(0,0,0,.4);
+}
+select:focus, input[type=number]:focus { outline: none; border-color: var(--accent); }
+
+.file-btn {
+  flex: 1; background: #1c1c1c; border: 1px solid var(--border2);
+  color: var(--muted); padding: 2px 6px; border-radius: 3px;
+  font-size: 11px; cursor: pointer; text-align: left;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.file-btn:hover { border-color: var(--accent); color: var(--text); }
+
+.toggle-row { display: flex; gap: 3px; }
+.tog {
+  flex: 1; background: #1c1c1c; border: 1px solid var(--border2);
+  color: var(--muted); padding: 3px 0; border-radius: 3px;
+  font-size: 10px; cursor: pointer; text-align: center;
+}
+.tog.active { background: var(--accent-lo); border-color: var(--accent); color: var(--text); }
+.tog:hover:not(.active) { color: var(--text); }
+.tog:disabled { opacity: 0.4; cursor: default; }
+.tog:disabled:hover { color: var(--muted); }
+
+#encodeBtn {
+  width: 100%; padding: 5px;
+  background: var(--accent-lo); border: 1px solid var(--accent);
+  color: var(--text); border-radius: 3px; font-size: 13px;
+  font-weight: 600; cursor: pointer;
+}
+#encodeBtn:hover { filter: brightness(1.2); }
+#encodeBtn:disabled { opacity: 0.4; cursor: default; filter: none; }
+
+/* ── Interpolation slider ────────────────────────────────────────────── */
+.interp-slider-row {
+  display: flex; align-items: center; gap: 0.5em;
+  margin-bottom: 0.3em;
+}
+.interp-end {
+  font-size: 11px; font-weight: 700; color: var(--text);
+  flex-shrink: 0;
+}
+#interpSlider {
+  flex: 1; accent-color: var(--accent); cursor: pointer;
+  height: 4px;
+}
+#interpSlider:disabled { opacity: 0.35; cursor: default; }
+#alphaDisplay {
+  text-align: center; font-size: 11px; color: var(--muted);
+}
+
+/* ── Right panel ────────────────────────────────────────────────────── */
+#right { display: flex; flex-direction: column; min-width: 0; }
+
+#toolbar {
+  display: flex; align-items: center; gap: 0.5em;
+  padding: 0.4em 0.7em; border-bottom: 1px solid var(--border);
+  background: var(--surface); flex-shrink: 0;
+}
+#playBtn {
+  width: 28px; height: 28px; border-radius: 4px; cursor: pointer;
+  background: var(--accent-lo); border: 1px solid var(--accent);
+  color: var(--text); font-size: 14px;
+  display: flex; align-items: center; justify-content: center;
+}
+#playBtn:hover { filter: brightness(1.2); }
+#playBtn:disabled { opacity: 0.4; cursor: default; filter: none; }
+
+.tab-group {
+  display: flex; gap: 2px;
+  background: #1c1c1c; border: 1px solid var(--border2);
+  border-radius: 4px; padding: 2px;
+}
+.tab {
+  padding: 2px 10px; border-radius: 3px; font-size: 11px; cursor: pointer;
+  color: var(--muted); border: none; background: none;
+}
+.tab.active  { background: var(--accent-lo); color: var(--text); }
+.tab:hover:not(.active) { color: var(--text); }
+
+#statusBar { flex: 1; font-size: 11px; color: var(--muted); min-width: 0;
+             white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+#progressWrap {
+  width: 70px; height: 3px; background: var(--border2);
+  border-radius: 2px; overflow: hidden; display: none;
+}
+#progressBar { height: 100%; background: var(--accent); width: 0; transition: width 0.08s; }
+
+/* ── Spectrogram area ───────────────────────────────────────────────── */
+#specArea { flex: 1; display: flex; min-height: 0; }
+
+/* ── Note panel ─────────────────────────────────────────────────────── */
+#notePanel {
+  flex-shrink: 0;
+  padding: 0.45em 0.75em 0.45em calc(2.5em + 0.75em);
+  border-top: 1px solid var(--border);
+  background: var(--surface2);
+  font-size: 11px; line-height: 1.5; color: var(--muted);
+}
+#notePanel strong { color: var(--text); font-weight: 600; }
+
+#stripWrap {
+  width: 2.5em; flex-shrink: 0;
+  background: var(--surface2); border-right: 1px solid var(--border);
+  position: relative;
+}
+#stripCanvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+
+#specWrap { flex: 1; position: relative; overflow: hidden; }
+#specCanvas, #playheadCanvas {
+  position: absolute; inset: 0; width: 100%; height: 100%;
+}
+#playheadCanvas { pointer-events: none; }
+
+/* ── Activation overlay ─────────────────────────────────────────────── */
+#activationOverlay {
+  position: absolute; inset: 0;
+  background: rgba(0,0,0,0.72);
+  display: flex; align-items: center; justify-content: center;
+  cursor: pointer; z-index: 10;
+}
+#activationOverlay span {
+  background: var(--surface); border: 1px solid var(--border2);
+  color: var(--text); padding: 0.5em 1.2em; border-radius: 4px; font-size: 13px;
+}
+
+/* ── Legend ─────────────────────────────────────────────────────────── */
+#legend {
+  display: flex; gap: 1.2em; padding: 0 0.7em 0 calc(2.5em + 0.7em);
+  font-size: 10px; color: var(--muted); flex-shrink: 0; height: 1.6em;
+  align-items: center;
+}
+.ldot {
+  display: inline-block; width: 8px; height: 8px;
+  border-radius: 50%; margin-right: 3px; vertical-align: middle;
+}
+</style>
+</head>
+<body>
+<div id="frame">
+
+  <!-- ─────────── LEFT CONTROLS ─────────── -->
+  <div id="controls">
+
+    <!-- Source A -->
+    <div class="section">
+      <div class="section-title">Source A</div>
+      <div class="row">
+        <span class="lbl">Type</span>
+        <select id="srcTypeA">
+          <option value="sine">Sine</option>
+          <option value="triangle">Triangle</option>
+          <option value="sawtooth">Sawtooth</option>
+          <option value="square">Square</option>
+          <option value="sweep">Sweep</option>
+          <option value="file">File</option>
+        </select>
+      </div>
+      <div class="row" id="freqRowA">
+        <span class="lbl">Freq</span>
+        <input type="number" id="freqA" value="440" min="20" max="20000" step="1">
+        <span class="unit">Hz</span>
+      </div>
+      <div class="row">
+        <span class="lbl">Duration</span>
+        <input type="number" id="durA" value="2" min="0.1" max="10" step="0.1">
+        <span class="unit">s</span>
+      </div>
+      <div class="row" id="fileRowA" style="display:none">
+        <button class="file-btn" id="fileBtnA">choose file…</button>
+        <input type="file" id="fileInputA" accept="audio/*" style="display:none">
+      </div>
+    </div>
+
+    <!-- Source B -->
+    <div class="section">
+      <div class="section-title">Source B</div>
+      <div class="row">
+        <span class="lbl">Type</span>
+        <select id="srcTypeB">
+          <option value="sine">Sine</option>
+          <option value="triangle">Triangle</option>
+          <option value="sawtooth">Sawtooth</option>
+          <option value="square">Square</option>
+          <option value="sweep">Sweep</option>
+          <option value="file">File</option>
+        </select>
+      </div>
+      <div class="row" id="freqRowB">
+        <span class="lbl">Freq</span>
+        <input type="number" id="freqB" value="880" min="20" max="20000" step="1">
+        <span class="unit">Hz</span>
+      </div>
+      <div class="row">
+        <span class="lbl">Duration</span>
+        <input type="number" id="durB" value="2" min="0.1" max="10" step="0.1">
+        <span class="unit">s</span>
+      </div>
+      <div class="row" id="fileRowB" style="display:none">
+        <button class="file-btn" id="fileBtnB">choose file…</button>
+        <input type="file" id="fileInputB" accept="audio/*" style="display:none">
+      </div>
+    </div>
+
+    <!-- Model -->
+    <div class="section">
+      <div class="section-title">Model</div>
+      <div class="row">
+        <span class="lbl">Model</span>
+        <select id="modelSel">
+          <option value="24k">24 kHz</option>
+          <option value="48k">48 kHz</option>
+        </select>
+      </div>
+      <div class="row">
+        <span class="lbl">Bandwidth</span>
+        <select id="bwSel"></select>
+        <span class="unit">kbps</span>
+      </div>
+    </div>
+
+    <!-- Mode -->
+    <div class="section">
+      <div class="section-title">Mode</div>
+      <div class="toggle-row" id="modeToggleRow" style="margin-bottom:0.45em">
+        <button class="tog active" id="togNS">Non-streaming</button>
+        <button class="tog"        id="togS">Streaming</button>
+      </div>
+      <div class="row" id="frameRow" style="display:none">
+        <span class="lbl">Frame</span>
+        <select id="frameSel">
+          <option value="320">320 smp · 13 ms</option>
+          <option value="640">640 smp · 27 ms</option>
+          <option value="1280">1280 smp · 53 ms</option>
+          <option value="2560">2560 smp · 107 ms</option>
+          <option value="4800">4800 smp · 200 ms</option>
+          <option value="9600">9600 smp · 400 ms</option>
+        </select>
+      </div>
+    </div>
+
+    <!-- Interpolation -->
+    <div class="section">
+      <div class="section-title">Interpolation Point</div>
+      <div class="toggle-row" id="interpPointRow" style="margin-bottom:0.5em">
+        <button class="tog active" id="togEncLatents"  data-point="encoder_latents">Enc. Latents</button>
+        <button class="tog"        id="togVQCodes"     data-point="vq_codes">VQ Codes</button>
+        <button class="tog"        id="togQuantEmb"    data-point="quantized_embeddings">Quant. Emb.</button>
+      </div>
+      <div class="interp-slider-row">
+        <span class="interp-end">A</span>
+        <input type="range" id="interpSlider" min="0" max="100" value="50" step="1" disabled>
+        <span class="interp-end">B</span>
+      </div>
+      <div id="alphaDisplay">α = 0.50  (50 % A · 50 % B)</div>
+    </div>
+
+    <!-- Encode button -->
+    <div class="section">
+      <button id="encodeBtn">Encode A &amp; B</button>
+    </div>
+
+  </div><!-- #controls -->
+
+  <!-- ─────────── RIGHT PANEL ─────────── -->
+  <div id="right">
+
+    <div id="toolbar">
+      <button id="playBtn" disabled>▶</button>
+      <div class="tab-group">
+        <button class="tab active" data-view="A">Source A</button>
+        <button class="tab"        data-view="B">Source B</button>
+        <button class="tab"        data-view="interp">A → B</button>
+      </div>
+      <span id="statusBar">Configure sources and click Encode A &amp; B.</span>
+      <div id="progressWrap"><div id="progressBar"></div></div>
+    </div>
+
+    <div id="legend">
+      <span id="lgA"><span class="ldot" style="background:#c87800"></span>Source A (plasma)</span>
+      <span id="lgB" style="display:none"><span class="ldot" style="background:#2090c0"></span>Source B (ocean)</span>
+      <span id="lgI" style="display:none"><span class="ldot" style="background:#ff4400"></span>Interpolated (hot)</span>
+    </div>
+
+    <div id="specArea">
+      <div id="stripWrap"><canvas id="stripCanvas"></canvas></div>
+      <div id="specWrap">
+        <canvas id="specCanvas"></canvas>
+        <canvas id="playheadCanvas"></canvas>
+        <div id="activationOverlay"><span>Click to enable audio</span></div>
+      </div>
+    </div>
+
+    <div id="notePanel"></div>
+
+  </div>
+</div><!-- #frame -->
+
+<script>
+'use strict';
+
+// ═══════════════════════════════════════════════════════════════════════
+// Config
+// ═══════════════════════════════════════════════════════════════════════
+
+const MODELS_BASE = new URL('../serialization/encodec_onnx_exports', location.href).href;
+const BW_OPTIONS  = { '24k': [1.5, 3, 6, 12, 24], '48k': [3, 6, 12, 24] };
+const FFT_N  = 2048;
+const HOP    = 512;
+const MAX_S  = 10;
+
+const PLASMA = [[5,5,25],[100,0,150],[200,50,100],[255,140,20],[255,255,100]];
+const OCEAN  = [[5,10,40],[0,60,120],[0,140,180],[40,200,220],[180,240,255]];
+const HOT    = [[0,0,0],[191,0,0],[255,128,0],[255,255,64],[255,255,255]];
+
+const INTERP_NOTES = {
+  encoder_latents: '<strong>Encoder Latents.</strong> Interpolation in the continuous latent space ' +
+    'produced by the encoder, before the vector quantizer. The interpolated embedding is then ' +
+    '<em>re-quantized</em> — snapped to the nearest codebook entries — before decoding. ' +
+    'This keeps the audio decoder in-distribution while exploring the pre-VQ manifold.',
+  vq_codes: '<strong>VQ Codes.</strong> Interpolation in the discrete codebook space. ' +
+    'Codes are mixed element-wise: each position uses B\'s code with probability α, determined ' +
+    'by a deterministic golden-ratio hash (reproducible per position). Mixed codes are then ' +
+    're-embedded via <code>decode_codes</code> before audio decoding.',
+  quantized_embeddings: '<strong>Quantized Embeddings.</strong> Interpolation on the continuous ' +
+    'embeddings output by <code>decode_codes</code> — after VQ discretisation and re-embedding, ' +
+    'before the audio LSTM decoder. Blends through the quantized representation space.',
+};
+
+// ═══════════════════════════════════════════════════════════════════════
+// State
+// ═══════════════════════════════════════════════════════════════════════
+
+let audioCtx     = null;
+let sourceSR     = 24000;
+
+let rawAudioA    = null;   // Float32Array — source audio before EnCodec
+let rawAudioB    = null;
+let decodedA     = null;   // Float32Array — after full pipeline
+let decodedB     = null;
+let interpAudio  = null;   // Float32Array — interpolated result
+
+let stftA = null, stftB = null, stftInterp = null;
+let offA  = null, offB  = null, offInterp  = null;
+
+let currentView  = 'A';   // 'A' | 'B' | 'interp'
+let streaming    = false;
+let interpPoint  = 'encoder_latents';
+
+let worker       = null;
+let jobSeq       = 0;
+let activeJobId  = -1;
+let encodePhase  = null;   // 'A' | 'B' | 'interp' | null
+
+let isPlaying    = false;
+let playNode     = null;
+let playStart    = 0;
+let phRAF        = null;
+
+const dpr = devicePixelRatio || 1;
+
+// ═══════════════════════════════════════════════════════════════════════
+// DOM refs
+// ═══════════════════════════════════════════════════════════════════════
+
+const $ = id => document.getElementById(id);
+
+const modelSel  = $('modelSel');
+const bwSel     = $('bwSel');
+const togNS     = $('togNS');
+const togS      = $('togS');
+const modeToggleRow = $('modeToggleRow');
+const frameRow  = $('frameRow');
+const frameSel  = $('frameSel');
+const encodeBtn = $('encodeBtn');
+const playBtn   = $('playBtn');
+const statusBar = $('statusBar');
+const progWrap  = $('progressWrap');
+const progBar   = $('progressBar');
+const specCvs   = $('specCanvas');
+const phCvs     = $('playheadCanvas');
+const stripCvs  = $('stripCanvas');
+const actOvl    = $('activationOverlay');
+const notePanel = $('notePanel');
+const lgA = $('lgA'), lgB = $('lgB'), lgI = $('lgI');
+const interpSlider = $('interpSlider');
+const alphaDisplay = $('alphaDisplay');
+
+// ═══════════════════════════════════════════════════════════════════════
+// Audio context (user-gesture gated)
+// ═══════════════════════════════════════════════════════════════════════
+
+function ensureAudioCtx() {
+  if (!audioCtx) { audioCtx = new AudioContext(); actOvl.style.display = 'none'; }
+}
+actOvl.addEventListener('click', ensureAudioCtx);
+
+// ═══════════════════════════════════════════════════════════════════════
+// Source type visibility (A and B)
+// ═══════════════════════════════════════════════════════════════════════
+
+['A', 'B'].forEach(id => {
+  const srcType  = $(`srcType${id}`);
+  const freqRow  = $(`freqRow${id}`);
+  const fileRow  = $(`fileRow${id}`);
+  const fileBtn  = $(`fileBtn${id}`);
+  const fileInput = $(`fileInput${id}`);
+
+  srcType.addEventListener('change', () => {
+    const v = srcType.value;
+    fileRow.style.display  = v === 'file'  ? '' : 'none';
+    freqRow.style.display  = (v === 'file' || v === 'sweep') ? 'none' : '';
+  });
+  fileBtn.addEventListener('click', () => fileInput.click());
+  fileInput.addEventListener('change', () => {
+    if (fileInput.files[0]) fileBtn.textContent = fileInput.files[0].name;
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// Bandwidth / model selector
+// ═══════════════════════════════════════════════════════════════════════
+
+function populateBW() {
+  bwSel.innerHTML = '';
+  BW_OPTIONS[modelSel.value].forEach(bw => {
+    const o = document.createElement('option');
+    o.value = bw; o.textContent = bw;
+    if (bw === 6) o.selected = true;
+    bwSel.appendChild(o);
+  });
+  const is48 = modelSel.value === '48k';
+  modeToggleRow.style.display = is48 ? 'none' : '';
+  if (is48) {
+    streaming = false;
+    togNS.classList.add('active');
+    togS.classList.remove('active');
+  }
+  updateFrameRowVisibility();
+}
+modelSel.addEventListener('change', populateBW);
+populateBW();
+
+// ═══════════════════════════════════════════════════════════════════════
+// Mode toggle
+// ═══════════════════════════════════════════════════════════════════════
+
+[togNS, togS].forEach(btn => btn.addEventListener('click', () => {
+  togNS.classList.toggle('active', btn === togNS);
+  togS .classList.toggle('active', btn === togS);
+  streaming = btn === togS;
+  updateFrameRowVisibility();
+}));
+
+function updateFrameRowVisibility() {
+  frameRow.style.display = (streaming && modelSel.value === '24k') ? '' : 'none';
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Interpolation point toggle
+// ═══════════════════════════════════════════════════════════════════════
+
+document.querySelectorAll('#interpPointRow .tog').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('#interpPointRow .tog').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    interpPoint = btn.dataset.point;
+    updateNotePanel();
+    // Re-run interpolation if we already have encoded audio
+    if (decodedA && decodedB) triggerInterpolation();
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// Interpolation slider
+// ═══════════════════════════════════════════════════════════════════════
+
+interpSlider.addEventListener('input', () => {
+  const a = parseInt(interpSlider.value) / 100;
+  alphaDisplay.textContent = `α = ${a.toFixed(2)}  (${Math.round((1-a)*100)} % A · ${Math.round(a*100)} % B)`;
+});
+
+interpSlider.addEventListener('change', () => {
+  if (decodedA && decodedB) triggerInterpolation();
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// View tabs
+// ═══════════════════════════════════════════════════════════════════════
+
+document.querySelectorAll('.tab').forEach(tab => tab.addEventListener('click', () => {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  tab.classList.add('active');
+  currentView = tab.dataset.view;
+  stopPlayback();
+  updateLegend();
+  drawSpec();
+}));
+
+function setView(v) {
+  currentView = v;
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.view === v));
+  updateLegend();
+  drawSpec();
+}
+
+function updateLegend() {
+  lgA.style.display = currentView === 'A'     ? '' : 'none';
+  lgB.style.display = currentView === 'B'     ? '' : 'none';
+  lgI.style.display = currentView === 'interp' ? '' : 'none';
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Note panel
+// ═══════════════════════════════════════════════════════════════════════
+
+function updateNotePanel() {
+  notePanel.innerHTML = INTERP_NOTES[interpPoint] || '';
+}
+updateNotePanel();
+
+// ═══════════════════════════════════════════════════════════════════════
+// Audio generation
+// ═══════════════════════════════════════════════════════════════════════
+
+function generateSource(srcId) {
+  const sr    = modelSel.value === '24k' ? 24000 : 48000;
+  const dur   = Math.min(parseFloat($(`dur${srcId}`).value) || 2, MAX_S);
+  const n     = Math.round(dur * sr);
+  const type  = $(`srcType${srcId}`).value;
+  const f     = parseFloat($(`freq${srcId}`).value) || 440;
+  const buf   = new Float32Array(n);
+  const τ     = 2 * Math.PI;
+
+  switch (type) {
+    case 'sine':
+      for (let i = 0; i < n; i++) buf[i] = Math.sin(τ * f * i / sr);
+      break;
+    case 'triangle':
+      for (let i = 0; i < n; i++) buf[i] = (2 / Math.PI) * Math.asin(Math.sin(τ * f * i / sr));
+      break;
+    case 'sawtooth':
+      for (let i = 0; i < n; i++) buf[i] = 2 * ((f * i / sr) % 1) - 1;
+      break;
+    case 'square':
+      for (let i = 0; i < n; i++) buf[i] = Math.sign(Math.sin(τ * f * i / sr));
+      break;
+    case 'sweep': {
+      const f0 = 20, f1 = sr / 2 * 0.9;
+      for (let i = 0; i < n; i++) {
+        const t = i / sr;
+        buf[i] = Math.sin(τ * (f0 * t + (f1 - f0) * t * t / (2 * dur)));
+      }
+      break;
+    }
+  }
+  const peak = buf.reduce((m, v) => Math.max(m, Math.abs(v)), 0);
+  if (peak > 0) for (let i = 0; i < n; i++) buf[i] *= 0.8 / peak;
+  return buf;
+}
+
+async function loadFile(file, sr) {
+  const arrBuf  = await file.arrayBuffer();
+  const tmpCtx  = new OfflineAudioContext(1, 1, sr);
+  const decoded = await tmpCtx.decodeAudioData(arrBuf);
+  const trimLen = Math.min(decoded.length, Math.round(MAX_S * decoded.sampleRate));
+  const offCtx  = new OfflineAudioContext(1, Math.round(MAX_S * sr), sr);
+  const src     = offCtx.createBufferSource();
+  const trimBuf = new AudioBuffer({
+    numberOfChannels: decoded.numberOfChannels,
+    length: trimLen, sampleRate: decoded.sampleRate,
+  });
+  for (let ch = 0; ch < decoded.numberOfChannels; ch++)
+    trimBuf.copyToChannel(decoded.getChannelData(ch).slice(0, trimLen), ch);
+  src.buffer = trimBuf;
+  src.connect(offCtx.destination);
+  src.start(0);
+  const rendered = await offCtx.startRendering();
+  const mono = new Float32Array(rendered.length);
+  for (let ch = 0; ch < rendered.numberOfChannels; ch++) {
+    const d = rendered.getChannelData(ch);
+    for (let i = 0; i < rendered.length; i++) mono[i] += d[i] / rendered.numberOfChannels;
+  }
+  return mono;
+}
+
+async function buildAudio(srcId) {
+  const type = $(`srcType${srcId}`).value;
+  if (type === 'file') {
+    const f = $(`fileInput${srcId}`).files[0];
+    if (!f) throw new Error(`No file selected for Source ${srcId}.`);
+    return loadFile(f, modelSel.value === '24k' ? 24000 : 48000);
+  }
+  return generateSource(srcId);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Worker
+// ═══════════════════════════════════════════════════════════════════════
+
+function initWorker() {
+  if (worker) worker.terminate();
+  worker = new Worker('encodec-worker.js');
+  worker.postMessage({ type: 'init', modelsBaseUrl: MODELS_BASE });
+  worker.onmessage = onWorkerMsg;
+}
+
+function onWorkerMsg(e) {
+  const msg = e.data;
+  if (msg.jobId !== activeJobId) return;
+
+  if (msg.type === 'progress') {
+    progBar.style.width = Math.round(msg.value * 100) + '%';
+    setStatus(msg.status);
+
+  } else if (msg.type === 'result') {
+    progWrap.style.display = 'none';
+
+    if (encodePhase === 'A') {
+      decodedA = msg.decoded;
+      sourceSR = modelSel.value === '24k' ? 24000 : 48000;
+      stftA = computeSTFT(decodedA); offA = null;
+      setStatus('Source A encoded. Encoding B…');
+      startEncodeB();
+
+    } else if (encodePhase === 'B') {
+      decodedB = msg.decoded;
+      stftB = computeSTFT(decodedB); offB = null;
+      setStatus('Both sources encoded. Move the slider to interpolate.');
+      encodeBtn.disabled = false;
+      encodePhase = null;
+      interpSlider.disabled = false;
+      playBtn.disabled = false;
+      setView('A');
+      triggerInterpolation();
+
+    } else if (encodePhase === 'interp') {
+      interpAudio = msg.decoded;
+      stftInterp = computeSTFT(interpAudio); offInterp = null;
+      const a = parseInt(interpSlider.value) / 100;
+      setStatus(`Interpolated at α = ${a.toFixed(2)} (${interpPoint.replace(/_/g,' ')})`);
+      encodeBtn.disabled = false;
+      encodePhase = null;
+      playBtn.disabled = false;
+      setView('interp');
+    }
+
+  } else if (msg.type === 'error') {
+    progWrap.style.display = 'none';
+    setStatus('Error: ' + msg.message, true);
+    encodeBtn.disabled = false;
+    encodePhase = null;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Encode A → B sequence
+// ═══════════════════════════════════════════════════════════════════════
+
+encodeBtn.addEventListener('click', async () => {
+  ensureAudioCtx();
+  stopPlayback();
+  decodedA = decodedB = interpAudio = null;
+  stftA = stftB = stftInterp = null;
+  offA = offB = offInterp = null;
+  interpSlider.disabled = true;
+  playBtn.disabled = true;
+  encodeBtn.disabled = true;
+
+  setStatus('Loading source A…');
+  let audio;
+  try { audio = await buildAudio('A'); }
+  catch (err) { setStatus(err.message, true); encodeBtn.disabled = false; return; }
+  rawAudioA = audio;
+  sourceSR  = modelSel.value === '24k' ? 24000 : 48000;
+  drawSpec();
+
+  if (!worker) initWorker();
+
+  startEncodeA();
+});
+
+function startEncodeA() {
+  encodePhase = 'A';
+  activeJobId = ++jobSeq;
+  progWrap.style.display = 'block';
+  progBar.style.width = '0%';
+  setStatus('Encoding A…');
+
+  worker.postMessage({
+    type:      'process',
+    jobId:     activeJobId,
+    audio:     rawAudioA.slice(),
+    modelHz:   modelSel.value,
+    bwKbps:    parseFloat(bwSel.value),
+    streaming,
+    frameSize: parseInt(frameSel.value),
+  });
+}
+
+async function startEncodeB() {
+  setStatus('Loading source B…');
+  let audio;
+  try { audio = await buildAudio('B'); }
+  catch (err) { setStatus(err.message, true); encodeBtn.disabled = false; encodePhase = null; return; }
+  rawAudioB = audio;
+
+  encodePhase = 'B';
+  activeJobId = ++jobSeq;
+  progWrap.style.display = 'block';
+  progBar.style.width = '0%';
+  setStatus('Encoding B…');
+
+  worker.postMessage({
+    type:      'process',
+    jobId:     activeJobId,
+    audio:     rawAudioB.slice(),
+    modelHz:   modelSel.value,
+    bwKbps:    parseFloat(bwSel.value),
+    streaming,
+    frameSize: parseInt(frameSel.value),
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Interpolation trigger (on slider release or interp point change)
+// ═══════════════════════════════════════════════════════════════════════
+
+function triggerInterpolation() {
+  if (!rawAudioA || !rawAudioB) return;
+  stopPlayback();
+  encodeBtn.disabled = true;
+  playBtn.disabled = true;
+  encodePhase = 'interp';
+  activeJobId = ++jobSeq;
+  progWrap.style.display = 'block';
+  progBar.style.width = '0%';
+  const alpha = parseInt(interpSlider.value) / 100;
+  setStatus(`Interpolating at α = ${alpha.toFixed(2)}…`);
+
+  worker.postMessage({
+    type:       'interpolate',
+    jobId:      activeJobId,
+    audio_a:    rawAudioA.slice(),
+    audio_b:    rawAudioB.slice(),
+    modelHz:    modelSel.value,
+    bwKbps:     parseFloat(bwSel.value),
+    streaming,
+    frameSize:  parseInt(frameSel.value),
+    alpha,
+    interpPoint,
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Playback
+// ═══════════════════════════════════════════════════════════════════════
+
+playBtn.addEventListener('click', () => { isPlaying ? stopPlayback() : startPlayback(); });
+
+function currentAudio() {
+  if (currentView === 'A')     return decodedA;
+  if (currentView === 'B')     return decodedB;
+  if (currentView === 'interp') return interpAudio;
+  return null;
+}
+
+function startPlayback() {
+  if (!audioCtx) return;
+  const pcm = currentAudio();
+  if (!pcm) return;
+  const buf = audioCtx.createBuffer(1, pcm.length, sourceSR);
+  buf.copyToChannel(pcm, 0);
+  playNode = audioCtx.createBufferSource();
+  playNode.buffer = buf;
+  playNode.connect(audioCtx.destination);
+  playNode.onended = stopPlayback;
+  playNode.start();
+  playStart = audioCtx.currentTime;
+  isPlaying = true;
+  playBtn.textContent = '⏹';
+  animatePlayhead();
+}
+
+function stopPlayback() {
+  if (playNode) { try { playNode.stop(); } catch {} playNode = null; }
+  isPlaying = false;
+  playBtn.textContent = '▶';
+  cancelAnimationFrame(phRAF);
+  clearPlayhead();
+}
+
+function animatePlayhead() {
+  function tick() {
+    if (!isPlaying) return;
+    const pcm = currentAudio();
+    const dur = pcm ? pcm.length / sourceSR : 1;
+    drawPlayhead((audioCtx.currentTime - playStart) / dur);
+    phRAF = requestAnimationFrame(tick);
+  }
+  tick();
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// STFT
+// ═══════════════════════════════════════════════════════════════════════
+
+function hann(n) {
+  const w = new Float32Array(n);
+  for (let i = 0; i < n; i++) w[i] = 0.5 * (1 - Math.cos(2 * Math.PI * i / (n - 1)));
+  return w;
+}
+const WINDOW = hann(FFT_N);
+
+function fft(re, im) {
+  const n = re.length;
+  for (let i = 1, j = 0; i < n; i++) {
+    let b = n >> 1;
+    for (; j & b; b >>= 1) j ^= b;
+    j ^= b;
+    if (i < j) {
+      let t=re[i]; re[i]=re[j]; re[j]=t;
+          t=im[i]; im[i]=im[j]; im[j]=t;
+    }
+  }
+  for (let len = 2; len <= n; len <<= 1) {
+    const ang = -2 * Math.PI / len;
+    const wr = Math.cos(ang), wi = Math.sin(ang);
+    for (let i = 0; i < n; i += len) {
+      let cr = 1, ci = 0;
+      for (let j = 0; j < len >> 1; j++) {
+        const ur=re[i+j], ui=im[i+j];
+        const vr=re[i+j+len/2]*cr - im[i+j+len/2]*ci;
+        const vi=re[i+j+len/2]*ci + im[i+j+len/2]*cr;
+        re[i+j]=ur+vr; im[i+j]=ui+vi;
+        re[i+j+len/2]=ur-vr; im[i+j+len/2]=ui-vi;
+        const nr=cr*wr-ci*wi; ci=cr*wi+ci*wr; cr=nr;
+      }
+    }
+  }
+}
+
+function computeSTFT(samples) {
+  const nBins   = FFT_N >> 1;
+  const nFrames = Math.max(1, Math.floor((samples.length - FFT_N) / HOP) + 1);
+  const magDB   = new Float32Array(nFrames * nBins);
+  const re = new Float32Array(FFT_N), im = new Float32Array(FFT_N);
+  let dBmax = -Infinity;
+
+  for (let f = 0; f < nFrames; f++) {
+    const s = f * HOP;
+    re.fill(0); im.fill(0);
+    for (let i = 0; i < FFT_N; i++) re[i] = (samples[s + i] || 0) * WINDOW[i];
+    fft(re, im);
+    for (let k = 0; k < nBins; k++) {
+      const m  = Math.sqrt(re[k]*re[k] + im[k]*im[k]);
+      const db = m > 1e-9 ? 20 * Math.log10(m) : -120;
+      magDB[f * nBins + k] = db;
+      if (db > dBmax) dBmax = db;
+    }
+  }
+  return { magDB, nFrames, nBins, dBmin: Math.max(dBmax - 100, -120), dBmax };
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Colormap
+// ═══════════════════════════════════════════════════════════════════════
+
+function cmap(t, stops) {
+  t = Math.max(0, Math.min(1, t));
+  const n = stops.length - 1;
+  const i = Math.min(Math.floor(t * n), n - 1);
+  const f = t * n - i;
+  const a = stops[i], b = stops[i + 1];
+  return [a[0]+f*(b[0]-a[0])|0, a[1]+f*(b[1]-a[1])|0, a[2]+f*(b[2]-a[2])|0];
+}
+
+function stftToOffscreen(stft, stops) {
+  const { magDB, nFrames, nBins, dBmin, dBmax } = stft;
+  const range = dBmax - dBmin || 1;
+  const off = document.createElement('canvas');
+  off.width = nFrames; off.height = nBins;
+  const ctx = off.getContext('2d');
+  const img = ctx.createImageData(nFrames, nBins);
+  for (let f = 0; f < nFrames; f++) {
+    for (let k = 0; k < nBins; k++) {
+      const t  = (magDB[f * nBins + k] - dBmin) / range;
+      const [r, g, b] = cmap(t, stops);
+      const px = ((nBins - 1 - k) * nFrames + f) * 4;
+      img.data[px]=r; img.data[px+1]=g; img.data[px+2]=b; img.data[px+3]=255;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  return off;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Spectrogram draw
+// ═══════════════════════════════════════════════════════════════════════
+
+function drawSpec() {
+  const cvs = specCvs;
+  const cW = Math.round(cvs.clientWidth  * dpr);
+  const cH = Math.round(cvs.clientHeight * dpr);
+  if (!cW || !cH) return;
+  cvs.width = cW; cvs.height = cH;
+  const ctx = cvs.getContext('2d');
+  ctx.clearRect(0, 0, cW, cH);
+
+  if (stftA && !offA) offA = stftToOffscreen(stftA, PLASMA);
+  if (stftB && !offB) offB = stftToOffscreen(stftB, OCEAN);
+  if (stftInterp && !offInterp) offInterp = stftToOffscreen(stftInterp, HOT);
+
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+
+  const off = currentView === 'A' ? offA : currentView === 'B' ? offB : offInterp;
+  if (off) ctx.drawImage(off, 0, 0, cW, cH);
+
+  drawStrip();
+}
+
+function drawStrip() {
+  const stft  = currentView === 'A' ? stftA : currentView === 'B' ? stftB : stftInterp;
+  const stops = currentView === 'A' ? PLASMA : currentView === 'B' ? OCEAN  : HOT;
+  if (!stft) return;
+
+  const cvs = stripCvs;
+  const cW  = Math.round(cvs.clientWidth  * dpr) || Math.round(2.5 * 16 * dpr);
+  const cH  = Math.round(cvs.clientHeight * dpr) || 400;
+  cvs.width = cW; cvs.height = cH;
+  const ctx = cvs.getContext('2d');
+  ctx.clearRect(0, 0, cW, cH);
+
+  const { magDB, nFrames, nBins, dBmin, dBmax } = stft;
+  const range = dBmax - dBmin || 1;
+  const f     = Math.floor(nFrames / 2);
+  for (let k = 0; k < nBins; k++) {
+    const t    = (magDB[f * nBins + k] - dBmin) / range;
+    const [r, g, b] = cmap(t, stops);
+    const y    = (1 - (k + 0.5) / nBins) * cH;
+    const barH = Math.ceil(cH / nBins) + 1;
+    const barW = Math.max(1, t * cW * 0.85);
+    ctx.fillStyle = `rgb(${r},${g},${b})`;
+    ctx.fillRect(cW - barW, y, barW, barH);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Playhead
+// ═══════════════════════════════════════════════════════════════════════
+
+function drawPlayhead(frac) {
+  const cvs = phCvs;
+  const cW = Math.round(cvs.clientWidth  * dpr);
+  const cH = Math.round(cvs.clientHeight * dpr);
+  cvs.width = cW; cvs.height = cH;
+  if (frac < 0 || frac > 1.001) return;
+  const ctx = cvs.getContext('2d');
+  const x   = Math.round(Math.min(frac, 1) * cW);
+  ctx.strokeStyle = 'rgba(255,255,255,0.85)';
+  ctx.lineWidth   = dpr;
+  ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, cH); ctx.stroke();
+}
+
+function clearPlayhead() {
+  const cvs = phCvs;
+  cvs.width  = cvs.clientWidth  * dpr;
+  cvs.height = cvs.clientHeight * dpr;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Resize
+// ═══════════════════════════════════════════════════════════════════════
+
+new ResizeObserver(() => {
+  offA = offB = offInterp = null;
+  drawSpec();
+}).observe($('specWrap'));
+
+// ═══════════════════════════════════════════════════════════════════════
+// Helpers
+// ═══════════════════════════════════════════════════════════════════════
+
+function setStatus(msg, isErr = false) {
+  statusBar.textContent = msg;
+  statusBar.style.color = isErr ? 'var(--red)' : 'var(--muted)';
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Boot
+// ═══════════════════════════════════════════════════════════════════════
+
+initWorker();
+updateLegend();
+updateNotePanel();
+</script>
+</body>
+</html>

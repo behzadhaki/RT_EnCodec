@@ -314,6 +314,294 @@ async function run48k(audio, streaming, jobId) {
 }
 
 // ---------------------------------------------------------------------------
+// Interpolation helpers
+// ---------------------------------------------------------------------------
+
+function lerpF32(a, b, alpha) {
+  const n = Math.min(a.length, b.length);
+  const out = new Float32Array(n);
+  const t = 1 - alpha;
+  for (let i = 0; i < n; i++) out[i] = a[i] * t + b[i] * alpha;
+  return out;
+}
+
+// Deterministic element-wise mixing of two discrete code arrays.
+// Uses a golden-ratio hash so the chosen positions are well-distributed
+// rather than contiguous — gives a perceptual "dissolution" morphing effect.
+function mixCodes(codes_a, codes_b, alpha) {
+  const out = new (codes_a.constructor)(codes_a.length);
+  for (let i = 0; i < out.length; i++) {
+    const frac = ((Math.imul(i + 1, 0x9E3779B9) >>> 0) / 0xFFFFFFFF);
+    out[i] = frac < alpha ? codes_b[i] : codes_a[i];
+  }
+  return out;
+}
+
+// Run stages 1–3 (encode → quantize → decode_codes) and capture all
+// intermediate tensors needed for any of the three interpolation points.
+async function encodeCapture(chunk, modelHz, hEnc, cEnc) {
+  const T = chunk.length;
+  let audioTensor;
+  if (modelHz === '48k') {
+    const stereo = new Float32Array(2 * T);
+    stereo.set(chunk, 0); stereo.set(chunk, T);
+    audioTensor = new ort.Tensor('float32', stereo, [1, 2, T]);
+  } else {
+    audioTensor = new ort.Tensor('float32', chunk.slice(), [1, 1, T]);
+  }
+
+  // Stage 1 — encoder
+  const encOut = await sessions.encSeg.run({
+    audio: audioTensor,
+    h_in:  stateTensor(hEnc, 1),
+    c_in:  stateTensor(cEnc, 1),
+  });
+
+  // Stage 2 — vector quantizer
+  const quantOut = await sessions.quantEnc.run({ emb: encOut.emb });
+
+  // Stage 3 — code decoder (reconstructs continuous embedding from codes)
+  const decCodesOut = await sessions.decCodes.run({ codes: quantOut.codes });
+
+  return {
+    // Point 1 — encoder latents (pre-VQ continuous embedding)
+    emb_enc:     new Float32Array(encOut.emb.data),
+    embEncDims:  encOut.emb.dims.slice(),
+    // Point 2 — VQ codes (discrete)
+    codes:       quantOut.codes.data.slice(),   // Int32Array or BigInt64Array
+    codesType:   quantOut.codes.type,
+    codesDims:   quantOut.codes.dims.slice(),
+    // Point 3 — quantized embeddings (post-VQ continuous embedding)
+    emb_quant:   new Float32Array(decCodesOut.emb.data),
+    embQuantDims: decCodesOut.emb.dims.slice(),
+    // RMS scale (48k only, needed by decode_audio)
+    scale:       encOut.scale ? new Float32Array(encOut.scale.data) : null,
+    scaleDims:   encOut.scale ? encOut.scale.dims.slice() : null,
+    // Updated encoder LSTM state
+    hEncNew: new Float32Array(encOut.h_out.data),
+    cEncNew: new Float32Array(encOut.c_out.data),
+  };
+}
+
+// Run stage 4 (decode_audio) from a continuous embedding tensor.
+async function decodeFromLatents(emb, embDims, scale, scaleDims, modelHz, hDec, cDec) {
+  const inputs = {
+    emb:  new ort.Tensor('float32', emb, embDims),
+    h_in: stateTensor(hDec, 1),
+    c_in: stateTensor(cDec, 1),
+  };
+  if (modelHz === '48k' && scale) {
+    inputs.scale = new ort.Tensor('float32', scale, scaleDims);
+  }
+  const decOut = await sessions.decAudio.run(inputs);
+
+  let outAudio;
+  if (modelHz === '48k') {
+    const raw  = decOut.audio.data;
+    const tOut = raw.length >> 1;
+    outAudio   = new Float32Array(tOut);
+    for (let i = 0; i < tOut; i++) outAudio[i] = (raw[i] + raw[tOut + i]) * 0.5;
+  } else {
+    outAudio = new Float32Array(decOut.audio.data);
+  }
+  return {
+    outAudio,
+    hDecNew: new Float32Array(decOut.h_out.data),
+    cDecNew: new Float32Array(decOut.c_out.data),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Interpolation runners
+// ---------------------------------------------------------------------------
+
+async function runInterpolation(msg) {
+  const { jobId, audio_a, audio_b, modelHz, bwKbps, streaming, frameSize,
+          alpha, interpPoint } = msg;
+  try {
+    self.postMessage({ type: 'progress', jobId, value: 0, status: 'Loading models…' });
+    await ensureSessions(modelHz, bwKbps);
+    if (currentJobId !== jobId) return;
+
+    const decoded = modelHz === '48k'
+      ? await interpRun48k(audio_a, audio_b, alpha, interpPoint, jobId)
+      : await interpRun24k(audio_a, audio_b, alpha, interpPoint, streaming, frameSize, jobId);
+
+    if (decoded === null) return;
+    self.postMessage({ type: 'result', jobId, decoded }, [decoded.buffer]);
+  } catch (err) {
+    self.postMessage({ type: 'error', jobId, message: err.message });
+  }
+}
+
+async function interpRun24k(audio_a, audio_b, alpha, interpPoint, streaming, frameSize, jobId) {
+  const totalLen = Math.min(audio_a.length, audio_b.length);
+  const a = audio_a.subarray(0, totalLen);
+  const b = audio_b.subarray(0, totalLen);
+
+  if (!streaming) {
+    // ── Non-streaming single pass ──────────────────────────────────────────
+    self.postMessage({ type: 'progress', jobId, value: 0.2, status: 'Encoding A…' });
+    const capA = await encodeCapture(a.slice(), '24k', zeroState(1), zeroState(1));
+    if (currentJobId !== jobId) return null;
+
+    self.postMessage({ type: 'progress', jobId, value: 0.4, status: 'Encoding B…' });
+    const capB = await encodeCapture(b.slice(), '24k', zeroState(1), zeroState(1));
+    if (currentJobId !== jobId) return null;
+
+    self.postMessage({ type: 'progress', jobId, value: 0.7, status: 'Interpolating…' });
+    const result = await interpDecodeOnce(capA, capB, alpha, interpPoint, '24k',
+                                          zeroState(1), zeroState(1));
+    if (currentJobId !== jobId) return null;
+
+    self.postMessage({ type: 'progress', jobId, value: 1.0, status: 'Done.' });
+    return result.outAudio.slice(0, totalLen);
+  }
+
+  // ── Streaming OLA ──────────────────────────────────────────────────────
+  const stride  = frameSize;
+  const seg     = stride + 2 * HALF_OV_24;
+  const win     = new Float32Array(seg);
+  for (let i = 0; i < seg; i++) {
+    const t = (i + 1) / (seg + 1);
+    win[i] = 0.5 - Math.abs(t - 0.5);
+  }
+
+  const outBuf  = new Float32Array(totalLen);
+  const wgtBuf  = new Float32Array(totalLen);
+  const numSegs = Math.ceil(totalLen / stride);
+
+  let hEncA = zeroState(1), cEncA = zeroState(1);
+  let hEncB = zeroState(1), cEncB = zeroState(1);
+  let hDec  = zeroState(1), cDec  = zeroState(1);
+
+  for (let s = 0; s < numSegs; s++) {
+    if (currentJobId !== jobId) return null;
+
+    const off  = s * stride - HALF_OV_24;
+    const srcS = Math.max(off, 0);
+    const srcE = Math.min(off + seg, totalLen);
+
+    const chunkA = new Float32Array(seg);
+    const chunkB = new Float32Array(seg);
+    if (srcE > srcS) {
+      chunkA.set(a.subarray(srcS, srcE), srcS - off);
+      chunkB.set(b.subarray(srcS, srcE), srcS - off);
+    }
+
+    const capA = await encodeCapture(chunkA, '24k', hEncA, cEncA);
+    hEncA = capA.hEncNew; cEncA = capA.cEncNew;
+
+    const capB = await encodeCapture(chunkB, '24k', hEncB, cEncB);
+    hEncB = capB.hEncNew; cEncB = capB.cEncNew;
+
+    const dec = await interpDecodeOnce(capA, capB, alpha, interpPoint, '24k', hDec, cDec);
+    hDec = dec.hDecNew; cDec = dec.cDecNew;
+
+    for (let i = srcS - off; i < srcE - off; i++) {
+      const pos = off + i;
+      outBuf[pos] += win[i] * dec.outAudio[i];
+      wgtBuf[pos] += win[i];
+    }
+
+    self.postMessage({
+      type: 'progress', jobId,
+      value: Math.min((s + 1) / numSegs, 1),
+      status: `Interpolating… ${Math.round((s + 1) / numSegs * 100)} %`,
+    });
+  }
+
+  for (let i = 0; i < totalLen; i++) {
+    if (wgtBuf[i] > 0) outBuf[i] /= wgtBuf[i];
+  }
+  return outBuf;
+}
+
+async function interpRun48k(audio_a, audio_b, alpha, interpPoint, jobId) {
+  const totalLen = Math.min(audio_a.length, audio_b.length);
+  const a = audio_a.subarray(0, totalLen);
+  const b = audio_b.subarray(0, totalLen);
+
+  const outBuf  = new Float32Array(totalLen);
+  const wgtBuf  = new Float32Array(totalLen);
+  const numSegs = Math.ceil(totalLen / STRIDE_48);
+
+  for (let seg = 0; seg < numSegs; seg++) {
+    if (currentJobId !== jobId) return null;
+
+    const offset = seg * STRIDE_48;
+    const chunkA = new Float32Array(SEG_48);
+    const chunkB = new Float32Array(SEG_48);
+    chunkA.set(a.subarray(offset, offset + SEG_48));
+    chunkB.set(b.subarray(offset, offset + SEG_48));
+
+    // 48k is always stateless per segment
+    const capA = await encodeCapture(chunkA, '48k', zeroState(1), zeroState(1));
+    const capB = await encodeCapture(chunkB, '48k', zeroState(1), zeroState(1));
+    const dec  = await interpDecodeOnce(capA, capB, alpha, interpPoint, '48k',
+                                        zeroState(1), zeroState(1));
+
+    const validEnd = Math.min(offset + SEG_48, totalLen);
+    for (let i = 0; i < validEnd - offset; i++) {
+      outBuf[offset + i] += TRI_WIN_48[i] * dec.outAudio[i];
+      wgtBuf[offset + i] += TRI_WIN_48[i];
+    }
+
+    self.postMessage({
+      type: 'progress', jobId,
+      value: Math.min((seg + 1) / numSegs, 1),
+      status: `Interpolating… ${Math.round((seg + 1) / numSegs * 100)} %`,
+    });
+  }
+
+  for (let i = 0; i < totalLen; i++) {
+    if (wgtBuf[i] > 0) outBuf[i] /= wgtBuf[i];
+  }
+  return outBuf;
+}
+
+// Apply interpolation at the chosen point then decode to audio.
+// capA / capB are encodeCapture() results for the two sources.
+async function interpDecodeOnce(capA, capB, alpha, interpPoint, modelHz, hDec, cDec) {
+  if (interpPoint === 'encoder_latents') {
+    // Lerp continuous encoder embeddings, then re-quantize so the decoder
+    // stays in-distribution (it only saw quantized embeddings during training).
+    const n         = Math.min(capA.emb_enc.length, capB.emb_enc.length);
+    const interpEmb = lerpF32(capA.emb_enc.subarray(0, n), capB.emb_enc.subarray(0, n), alpha);
+    const [B, C]    = capA.embEncDims;
+    const dims      = [B, C, n / (B * C)];
+    // Re-quantize: snap interpolated embedding to nearest codebook entries.
+    const quantOut    = await sessions.quantEnc.run({
+      emb: new ort.Tensor('float32', interpEmb, dims),
+    });
+    const decCodesOut = await sessions.decCodes.run({ codes: quantOut.codes });
+    const qEmb  = new Float32Array(decCodesOut.emb.data);
+    const qDims = decCodesOut.emb.dims.slice();
+    const scale = (capA.scale && capB.scale) ? lerpF32(capA.scale, capB.scale, alpha) : null;
+    return decodeFromLatents(qEmb, qDims, scale, capA.scaleDims, modelHz, hDec, cDec);
+  }
+
+  if (interpPoint === 'vq_codes') {
+    // Mix discrete VQ codes, then re-embed via decode_codes before decoding audio.
+    const mixedCodes  = mixCodes(capA.codes, capB.codes, alpha);
+    const codesTensor = new ort.Tensor(capA.codesType, mixedCodes, capA.codesDims);
+    const decCodesOut = await sessions.decCodes.run({ codes: codesTensor });
+    const emb   = new Float32Array(decCodesOut.emb.data);
+    const dims  = decCodesOut.emb.dims.slice();
+    const scale = (capA.scale && capB.scale) ? lerpF32(capA.scale, capB.scale, alpha) : null;
+    return decodeFromLatents(emb, dims, scale, capA.scaleDims, modelHz, hDec, cDec);
+  }
+
+  // quantized_embeddings — lerp the decode_codes output embeddings.
+  const n        = Math.min(capA.emb_quant.length, capB.emb_quant.length);
+  const interpEmb = lerpF32(capA.emb_quant.subarray(0, n), capB.emb_quant.subarray(0, n), alpha);
+  const [B, C]   = capA.embQuantDims;
+  const dims     = [B, C, n / (B * C)];
+  const scale    = (capA.scale && capB.scale) ? lerpF32(capA.scale, capB.scale, alpha) : null;
+  return decodeFromLatents(interpEmb, dims, scale, capA.scaleDims, modelHz, hDec, cDec);
+}
+
+// ---------------------------------------------------------------------------
 // Message dispatcher
 // ---------------------------------------------------------------------------
 
@@ -327,6 +615,10 @@ self.onmessage = (e) => {
     case 'process':
       currentJobId = msg.jobId;
       runJob(msg);
+      break;
+    case 'interpolate':
+      currentJobId = msg.jobId;
+      runInterpolation(msg);
       break;
     case 'cancel':
       currentJobId = -1;
