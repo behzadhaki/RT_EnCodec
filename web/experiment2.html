@@ -107,6 +107,35 @@ select:focus, input[type=number]:focus { outline: none; border-color: var(--acce
   text-align: center; font-size: 11px; color: var(--muted);
 }
 
+/* ── VQ sub-mode section ─────────────────────────────────────────────── */
+#vqModeSection {
+  margin-bottom: 0.45em;
+}
+#vqModeSection .section-title {
+  margin-bottom: 0.3em;
+}
+
+/* ── Per-level sliders ───────────────────────────────────────────────── */
+#levelSlidersWrap {
+  max-height: 180px; overflow-y: auto;
+  padding: 0.1em 0; margin-bottom: 0.35em;
+}
+.level-row {
+  display: flex; align-items: center; gap: 0.35em; margin-bottom: 0.18em;
+}
+.level-lbl {
+  width: 2em; flex-shrink: 0; color: var(--muted);
+  font-size: 10px; text-align: right; font-variant-numeric: tabular-nums;
+}
+.level-slider {
+  flex: 1; accent-color: var(--accent); cursor: pointer; height: 3px;
+}
+.level-slider:disabled { opacity: 0.35; cursor: default; }
+.level-val {
+  width: 2.4em; flex-shrink: 0; color: var(--muted);
+  font-size: 10px; text-align: right; font-variant-numeric: tabular-nums;
+}
+
 /* ── Right panel ────────────────────────────────────────────────────── */
 #right { display: flex; flex-direction: column; min-width: 0; }
 
@@ -302,16 +331,36 @@ select:focus, input[type=number]:focus { outline: none; border-color: var(--acce
     <div class="section">
       <div class="section-title">Interpolation Point</div>
       <div class="toggle-row" id="interpPointRow" style="margin-bottom:0.5em">
-        <button class="tog active" id="togEncLatents"  data-point="encoder_latents">Enc. Latents</button>
-        <button class="tog"        id="togVQCodes"     data-point="vq_codes">VQ Codes</button>
-        <button class="tog"        id="togQuantEmb"    data-point="quantized_embeddings">Quant. Emb.</button>
+        <button class="tog active" id="togEncLatents" data-point="encoder_latents">Enc. Latents</button>
+        <button class="tog"        id="togVQCodes"    data-point="vq_codes">VQ Codes</button>
+        <button class="tog"        id="togQuantEmb"   data-point="quantized_embeddings">Quant. Emb.</button>
       </div>
-      <div class="interp-slider-row">
-        <span class="interp-end">A</span>
-        <input type="range" id="interpSlider" min="0" max="100" value="50" step="1" disabled>
-        <span class="interp-end">B</span>
+
+      <!-- VQ sub-mode — only visible when VQ Codes is selected -->
+      <div id="vqModeSection" style="display:none">
+        <div class="section-title">VQ Mix Mode</div>
+        <div class="toggle-row" id="vqModeRow" style="margin-bottom:0.45em">
+          <button class="tog active" data-vqmode="element_wise">Elem.-wise</button>
+          <button class="tog"        data-vqmode="per_frame">Per Frame</button>
+          <button class="tog"        data-vqmode="per_level">Per Level</button>
+          <button class="tog"        data-vqmode="int_lerp">Int. Lerp</button>
+        </div>
       </div>
-      <div id="alphaDisplay">α = 0.50  (50 % A · 50 % B)</div>
+
+      <!-- Per-level sliders — only visible when VQ Codes + Per Level -->
+      <div id="levelSlidersSection" style="display:none">
+        <div id="levelSlidersWrap"></div>
+      </div>
+
+      <!-- Main α slider — hidden in Per Level mode -->
+      <div id="mainSliderSection">
+        <div class="interp-slider-row">
+          <span class="interp-end">A</span>
+          <input type="range" id="interpSlider" min="0" max="100" value="50" step="1" disabled>
+          <span class="interp-end">B</span>
+        </div>
+        <div id="alphaDisplay">α = 0.50  (50 % A · 50 % B)</div>
+      </div>
     </div>
 
     <!-- Encode button -->
@@ -372,6 +421,25 @@ const PLASMA = [[5,5,25],[100,0,150],[200,50,100],[255,140,20],[255,255,100]];
 const OCEAN  = [[5,10,40],[0,60,120],[0,140,180],[40,200,220],[180,240,255]];
 const HOT    = [[0,0,0],[191,0,0],[255,128,0],[255,255,64],[255,255,255]];
 
+const VQ_MODE_NOTES = {
+  element_wise:
+    '<strong>Elem.-wise.</strong> Each scalar code position independently picks A\'s or B\'s ' +
+    'index via a golden-ratio hash. Mixes freely across time frames <em>and</em> codebook levels ' +
+    '— the RVQ hierarchy is broken within each frame.',
+  per_frame:
+    '<strong>Per Frame.</strong> All N<sub>q</sub> levels at a given time frame come from the ' +
+    'same source (A or B). RVQ intra-frame coherence is preserved: coarse and fine detail always ' +
+    'originate from the same signal at each moment.',
+  per_level:
+    '<strong>Per Level.</strong> Each RVQ level k has its own α slider. Within that level each ' +
+    'time frame independently picks A or B. Levels are uncorrelated — a given frame may have ' +
+    'level 0 from A and level 1 from B.',
+  int_lerp:
+    '<strong>Int. Lerp.</strong> Each RVQ level k has its own α<sub>k</sub> slider. The index ' +
+    'at each position is <code>round((1−α<sub>k</sub>)·a + α<sub>k</sub>·b)</code>. Codebook ' +
+    'entries are not acoustically ordered — this is a purely exploratory operation.',
+};
+
 const INTERP_NOTES = {
   encoder_latents: '<strong>Encoder Latents.</strong> Interpolation in the continuous latent space ' +
     'produced by the encoder, before the vector quantizer. The interpolated embedding is then ' +
@@ -405,6 +473,12 @@ let offA  = null, offB  = null, offInterp  = null;
 let currentView  = 'A';   // 'A' | 'B' | 'interp'
 let streaming    = false;
 let interpPoint  = 'encoder_latents';
+let vqMode       = 'element_wise';
+
+const MAX_NQ         = 32;
+let levelAlphas      = new Array(MAX_NQ).fill(0.5);
+const levelSliderEls = [];
+const levelValEls    = [];
 
 let worker       = null;
 let jobSeq       = 0;
@@ -525,7 +599,18 @@ document.querySelectorAll('#interpPointRow .tog').forEach(btn => {
     btn.classList.add('active');
     interpPoint = btn.dataset.point;
     updateNotePanel();
-    // Re-run interpolation if we already have encoded audio
+    updateVqSectionVisibility();
+    if (decodedA && decodedB) triggerInterpolation();
+  });
+});
+
+document.querySelectorAll('#vqModeRow .tog').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('#vqModeRow .tog').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    vqMode = btn.dataset.vqmode;
+    updateVqSectionVisibility();
+    updateNotePanel();
     if (decodedA && decodedB) triggerInterpolation();
   });
 });
@@ -570,11 +655,85 @@ function updateLegend() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// VQ sub-mode visibility + per-level sliders
+// ═══════════════════════════════════════════════════════════════════════
+
+function computeNq() {
+  const framesPerSec = modelSel.value === '24k' ? 75 : 150;
+  return Math.round(parseFloat(bwSel.value) * 1000 / (framesPerSec * 10));
+}
+
+function initLevelSliders() {
+  const wrap = $('levelSlidersWrap');
+  wrap.innerHTML = '';
+  levelSliderEls.length = 0;
+  levelValEls.length = 0;
+  for (let k = 0; k < MAX_NQ; k++) {
+    const row = document.createElement('div');
+    row.className = 'level-row';
+    row.id = `levelRow${k}`;
+    row.style.display = 'none';
+
+    const lbl = document.createElement('span');
+    lbl.className = 'level-lbl';
+    lbl.textContent = `L${k}`;
+
+    const slider = document.createElement('input');
+    slider.type = 'range'; slider.min = 0; slider.max = 100;
+    slider.value = 50; slider.step = 1;
+    slider.className = 'level-slider';
+    slider.disabled = true;
+
+    const val = document.createElement('span');
+    val.className = 'level-val';
+    val.textContent = '0.50';
+
+    const kk = k; // capture for closure
+    slider.addEventListener('input', () => {
+      levelAlphas[kk] = slider.value / 100;
+      val.textContent = (slider.value / 100).toFixed(2);
+    });
+    slider.addEventListener('change', () => {
+      if (decodedA && decodedB) triggerInterpolation();
+    });
+
+    row.appendChild(lbl);
+    row.appendChild(slider);
+    row.appendChild(val);
+    wrap.appendChild(row);
+    levelSliderEls.push(slider);
+    levelValEls.push(val);
+  }
+}
+
+function updateLevelSliders() {
+  const nq      = computeNq();
+  const enabled = !!(decodedA && decodedB);
+  for (let k = 0; k < MAX_NQ; k++) {
+    $(`levelRow${k}`).style.display = k < nq ? '' : 'none';
+    levelSliderEls[k].disabled = !enabled;
+  }
+}
+
+function updateVqSectionVisibility() {
+  const isVQ       = interpPoint === 'vq_codes';
+  const usesLevels = isVQ && (vqMode === 'per_level' || vqMode === 'int_lerp');
+  $('vqModeSection').style.display       = isVQ       ? '' : 'none';
+  $('levelSlidersSection').style.display  = usesLevels ? '' : 'none';
+  $('mainSliderSection').style.display    = usesLevels ? 'none' : '';
+  if (usesLevels) updateLevelSliders();
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // Note panel
 // ═══════════════════════════════════════════════════════════════════════
 
 function updateNotePanel() {
-  notePanel.innerHTML = INTERP_NOTES[interpPoint] || '';
+  let html = INTERP_NOTES[interpPoint] || '';
+  if (interpPoint === 'vq_codes' && VQ_MODE_NOTES[vqMode]) {
+    html += '<br>' + VQ_MODE_NOTES[vqMode];
+  }
+  notePanel.innerHTML = html;
 }
 updateNotePanel();
 
@@ -690,6 +849,7 @@ function onWorkerMsg(e) {
       encodePhase = null;
       interpSlider.disabled = false;
       playBtn.disabled = false;
+      updateLevelSliders();   // reveal N_q sliders for current model/bw
       setView('A');
       triggerInterpolation();
 
@@ -797,7 +957,7 @@ function triggerInterpolation() {
   const alpha = parseInt(interpSlider.value) / 100;
   setStatus(`Interpolating at α = ${alpha.toFixed(2)}…`);
 
-  worker.postMessage({
+  const msg = {
     type:       'interpolate',
     jobId:      activeJobId,
     audio_a:    rawAudioA.slice(),
@@ -808,7 +968,13 @@ function triggerInterpolation() {
     frameSize:  parseInt(frameSel.value),
     alpha,
     interpPoint,
-  });
+    vqMode,
+  };
+  if (vqMode === 'per_level' || vqMode === 'int_lerp') {
+    const nq = computeNq();
+    msg.levelAlphas = new Float32Array(levelAlphas.slice(0, nq));
+  }
+  worker.postMessage(msg);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1051,8 +1217,10 @@ function setStatus(msg, isErr = false) {
 // ═══════════════════════════════════════════════════════════════════════
 
 initWorker();
+initLevelSliders();
 updateLegend();
 updateNotePanel();
+updateVqSectionVisibility();
 </script>
 </body>
 </html>

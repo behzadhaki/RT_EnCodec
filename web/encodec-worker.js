@@ -325,14 +325,72 @@ function lerpF32(a, b, alpha) {
   return out;
 }
 
-// Deterministic element-wise mixing of two discrete code arrays.
-// Uses a golden-ratio hash so the chosen positions are well-distributed
-// rather than contiguous — gives a perceptual "dissolution" morphing effect.
-function mixCodes(codes_a, codes_b, alpha) {
+// ── VQ code mixing helpers ────────────────────────────────────────────────
+// All four modes use a deterministic golden-ratio hash so results are
+// reproducible across slider moves at the same alpha value.
+
+// Mode 1 — element-wise: each scalar code position independently picks A or B.
+function mixCodesElementWise(codes_a, codes_b, alpha) {
   const out = new (codes_a.constructor)(codes_a.length);
   for (let i = 0; i < out.length; i++) {
     const frac = ((Math.imul(i + 1, 0x9E3779B9) >>> 0) / 0xFFFFFFFF);
     out[i] = frac < alpha ? codes_b[i] : codes_a[i];
+  }
+  return out;
+}
+
+// Mode 2 — per-frame: all N_q levels at a given time frame come from the
+// same source (A or B), preserving intra-frame RVQ coherence.
+function mixCodesByFrame(codes_a, codes_b, dims, alpha) {
+  const N_q = dims[1], T = dims[2];
+  const out = new (codes_a.constructor)(codes_a.length);
+  for (let t = 0; t < T; t++) {
+    const frac = ((Math.imul(t + 1, 0x9E3779B9) >>> 0) / 0xFFFFFFFF);
+    const useB = frac < alpha;
+    for (let k = 0; k < N_q; k++) {
+      const idx = k * T + t;
+      out[idx] = useB ? codes_b[idx] : codes_a[idx];
+    }
+  }
+  return out;
+}
+
+// Mode 3 — per-level: each RVQ level k has its own alpha (levelAlphas[k]).
+// Within a level, each time frame independently picks A or B via a hash
+// seeded on (k, t) so levels don't correlate with each other.
+function mixCodesByLevel(codes_a, codes_b, dims, levelAlphas) {
+  const N_q = dims[1], T = dims[2];
+  const out = new (codes_a.constructor)(codes_a.length);
+  for (let k = 0; k < N_q; k++) {
+    const alpha_k = levelAlphas[k] ?? 0.5;
+    for (let t = 0; t < T; t++) {
+      const seed = (Math.imul(k + 1, 49999) + t + 1) | 0;
+      const frac = ((Math.imul(seed, 0x9E3779B9) >>> 0) / 0xFFFFFFFF);
+      const idx  = k * T + t;
+      out[idx] = frac < alpha_k ? codes_b[idx] : codes_a[idx];
+    }
+  }
+  return out;
+}
+
+// Mode 4 — integer lerp per level: each RVQ level k uses its own alpha_k.
+// round( (1-α_k)·code_a[k,t] + α_k·code_b[k,t] ) for every time frame t.
+// Codebooks are not acoustically ordered — this is purely exploratory.
+function mixCodesIntLerpByLevel(codes_a, codes_b, dims, levelAlphas) {
+  const N_q    = dims[1], T = dims[2];
+  const out    = new (codes_a.constructor)(codes_a.length);
+  const isBig  = codes_a instanceof BigInt64Array;
+  for (let k = 0; k < N_q; k++) {
+    const alpha_k = levelAlphas[k] ?? 0.5;
+    const w = 1 - alpha_k;
+    for (let t = 0; t < T; t++) {
+      const idx = k * T + t;
+      if (isBig) {
+        out[idx] = BigInt(Math.round(Number(codes_a[idx]) * w + Number(codes_b[idx]) * alpha_k));
+      } else {
+        out[idx] = Math.round(codes_a[idx] * w + codes_b[idx] * alpha_k);
+      }
+    }
   }
   return out;
 }
@@ -417,15 +475,16 @@ async function decodeFromLatents(emb, embDims, scale, scaleDims, modelHz, hDec, 
 
 async function runInterpolation(msg) {
   const { jobId, audio_a, audio_b, modelHz, bwKbps, streaming, frameSize,
-          alpha, interpPoint } = msg;
+          alpha, interpPoint,
+          vqMode = 'element_wise', levelAlphas = null } = msg;
   try {
     self.postMessage({ type: 'progress', jobId, value: 0, status: 'Loading models…' });
     await ensureSessions(modelHz, bwKbps);
     if (currentJobId !== jobId) return;
 
     const decoded = modelHz === '48k'
-      ? await interpRun48k(audio_a, audio_b, alpha, interpPoint, jobId)
-      : await interpRun24k(audio_a, audio_b, alpha, interpPoint, streaming, frameSize, jobId);
+      ? await interpRun48k(audio_a, audio_b, alpha, interpPoint, vqMode, levelAlphas, jobId)
+      : await interpRun24k(audio_a, audio_b, alpha, interpPoint, streaming, frameSize, vqMode, levelAlphas, jobId);
 
     if (decoded === null) return;
     self.postMessage({ type: 'result', jobId, decoded }, [decoded.buffer]);
@@ -434,7 +493,7 @@ async function runInterpolation(msg) {
   }
 }
 
-async function interpRun24k(audio_a, audio_b, alpha, interpPoint, streaming, frameSize, jobId) {
+async function interpRun24k(audio_a, audio_b, alpha, interpPoint, streaming, frameSize, vqMode, levelAlphas, jobId) {
   const totalLen = Math.min(audio_a.length, audio_b.length);
   const a = audio_a.subarray(0, totalLen);
   const b = audio_b.subarray(0, totalLen);
@@ -451,7 +510,7 @@ async function interpRun24k(audio_a, audio_b, alpha, interpPoint, streaming, fra
 
     self.postMessage({ type: 'progress', jobId, value: 0.7, status: 'Interpolating…' });
     const result = await interpDecodeOnce(capA, capB, alpha, interpPoint, '24k',
-                                          zeroState(1), zeroState(1));
+                                          zeroState(1), zeroState(1), vqMode, levelAlphas);
     if (currentJobId !== jobId) return null;
 
     self.postMessage({ type: 'progress', jobId, value: 1.0, status: 'Done.' });
@@ -495,7 +554,7 @@ async function interpRun24k(audio_a, audio_b, alpha, interpPoint, streaming, fra
     const capB = await encodeCapture(chunkB, '24k', hEncB, cEncB);
     hEncB = capB.hEncNew; cEncB = capB.cEncNew;
 
-    const dec = await interpDecodeOnce(capA, capB, alpha, interpPoint, '24k', hDec, cDec);
+    const dec = await interpDecodeOnce(capA, capB, alpha, interpPoint, '24k', hDec, cDec, vqMode, levelAlphas);
     hDec = dec.hDecNew; cDec = dec.cDecNew;
 
     for (let i = srcS - off; i < srcE - off; i++) {
@@ -517,7 +576,7 @@ async function interpRun24k(audio_a, audio_b, alpha, interpPoint, streaming, fra
   return outBuf;
 }
 
-async function interpRun48k(audio_a, audio_b, alpha, interpPoint, jobId) {
+async function interpRun48k(audio_a, audio_b, alpha, interpPoint, vqMode, levelAlphas, jobId) {
   const totalLen = Math.min(audio_a.length, audio_b.length);
   const a = audio_a.subarray(0, totalLen);
   const b = audio_b.subarray(0, totalLen);
@@ -539,7 +598,7 @@ async function interpRun48k(audio_a, audio_b, alpha, interpPoint, jobId) {
     const capA = await encodeCapture(chunkA, '48k', zeroState(1), zeroState(1));
     const capB = await encodeCapture(chunkB, '48k', zeroState(1), zeroState(1));
     const dec  = await interpDecodeOnce(capA, capB, alpha, interpPoint, '48k',
-                                        zeroState(1), zeroState(1));
+                                        zeroState(1), zeroState(1), vqMode, levelAlphas);
 
     const validEnd = Math.min(offset + SEG_48, totalLen);
     for (let i = 0; i < validEnd - offset; i++) {
@@ -562,7 +621,8 @@ async function interpRun48k(audio_a, audio_b, alpha, interpPoint, jobId) {
 
 // Apply interpolation at the chosen point then decode to audio.
 // capA / capB are encodeCapture() results for the two sources.
-async function interpDecodeOnce(capA, capB, alpha, interpPoint, modelHz, hDec, cDec) {
+async function interpDecodeOnce(capA, capB, alpha, interpPoint, modelHz, hDec, cDec,
+                                vqMode = 'element_wise', levelAlphas = null) {
   if (interpPoint === 'encoder_latents') {
     // Lerp continuous encoder embeddings, then re-quantize so the decoder
     // stays in-distribution (it only saw quantized embeddings during training).
@@ -582,8 +642,23 @@ async function interpDecodeOnce(capA, capB, alpha, interpPoint, modelHz, hDec, c
   }
 
   if (interpPoint === 'vq_codes') {
-    // Mix discrete VQ codes, then re-embed via decode_codes before decoding audio.
-    const mixedCodes  = mixCodes(capA.codes, capB.codes, alpha);
+    // Mix discrete VQ codes according to the chosen sub-mode, then
+    // re-embed via decode_codes and decode to audio.
+    let mixedCodes;
+    switch (vqMode) {
+      case 'per_frame':
+        mixedCodes = mixCodesByFrame(capA.codes, capB.codes, capA.codesDims, alpha);
+        break;
+      case 'per_level':
+        mixedCodes = mixCodesByLevel(capA.codes, capB.codes, capA.codesDims, levelAlphas || []);
+        break;
+      case 'int_lerp':
+        mixedCodes = mixCodesIntLerpByLevel(capA.codes, capB.codes, capA.codesDims,
+                       levelAlphas || new Array(capA.codesDims[1]).fill(alpha));
+        break;
+      default: // element_wise
+        mixedCodes = mixCodesElementWise(capA.codes, capB.codes, alpha);
+    }
     const codesTensor = new ort.Tensor(capA.codesType, mixedCodes, capA.codesDims);
     const decCodesOut = await sessions.decCodes.run({ codes: codesTensor });
     const emb   = new Float32Array(decCodesOut.emb.data);
