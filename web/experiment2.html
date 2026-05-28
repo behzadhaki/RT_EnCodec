@@ -164,10 +164,16 @@ select:focus, input[type=number]:focus { outline: none; border-color: var(--acce
 #scatterNav button:hover:not(:disabled) { color: var(--text); }
 #scatterNav button:disabled { opacity: 0.25; cursor: default; }
 #scatterSliders { padding: 4px 8px 5px; }
+@keyframes rowBlink {
+  0%, 100% { background: transparent; }
+  30%, 70% { background: rgba(255, 210, 100, 0.18); }
+}
 .scatter-row {
   display: flex; align-items: center; gap: 6px; margin-bottom: 3px;
+  border-radius: 3px;
 }
 .scatter-row:last-child { margin-bottom: 0; }
+.scatter-row.blinking { animation: rowBlink 350ms ease-in-out 3; }
 .scatter-lbl {
   width: 2.2em; flex-shrink: 0; text-align: right;
   color: var(--muted); font-size: 11px;
@@ -789,6 +795,7 @@ function updateLevelSliders() {
 let _activeLevel   = null;   // level currently being moved (drives pipeline blink)
 let _scatterOffset = 0;      // index of first visible level
 let _scatterRAF    = null;
+let _vqCircleGrid  = null;   // cached circle geometry for canvas hit-testing
 
 function _startScatterLoop() {
   if (_scatterRAF) return;
@@ -2027,6 +2034,8 @@ function drawPipeline() {
       ctx.textAlign    = 'center'; ctx.textBaseline = 'top';
       ctx.fillText(`f ${frame + 1}/${Nf}`, lx + lw / 2, dbY + dbH + 2);
     }
+
+    _vqCircleGrid = { gridX, gridY, circD, circR, colGap, rowGap, cols, Nq };
   }
 
   drawArrow(nx(9),  sw[9]);                             // ── 9: circles → Decode Codes ──
@@ -2063,6 +2072,39 @@ function stopPipelineTimer() {
   if (pipelineTimer) { clearInterval(pipelineTimer); pipelineTimer = null; }
   drawPipeline();
 }
+
+// Click a VQ circle → navigate slider panel to that level and blink it
+$('pipelineCanvas').addEventListener('click', e => {
+  if (interpPoint !== 'vq_codes') return;
+  if (vqMode !== 'level_swap' && vqMode !== 'int_lerp') return;
+  if (!_vqCircleGrid) return;
+  const { gridX, gridY, circD, circR, colGap, rowGap, cols, Nq } = _vqCircleGrid;
+  const rect = e.currentTarget.getBoundingClientRect();
+  const mx = e.clientX - rect.left;
+  const my = e.clientY - rect.top;
+  for (let k = 0; k < Nq; k++) {
+    const col = k % cols;
+    const row = Math.floor(k / cols);
+    const cx2 = gridX + col * (circD + colGap) + circR;
+    const cy2 = gridY + row * (circD + rowGap) + circR;
+    const dx = mx - cx2, dy = my - cy2;
+    if (dx * dx + dy * dy <= (circR + 3) * (circR + 3)) {
+      // Navigate slider page to show this level and blink its row
+      _scatterOffset = Math.floor(k / 4) * 4;
+      drawMultislider();
+      const rowIdx = k - _scatterOffset;
+      const rows = document.querySelectorAll('#scatterSliders .scatter-row');
+      const targetRow = rows[rowIdx];
+      if (targetRow) {
+        targetRow.classList.remove('blinking');
+        void targetRow.offsetWidth; // force reflow to restart animation
+        targetRow.classList.add('blinking');
+        targetRow.addEventListener('animationend', () => targetRow.classList.remove('blinking'), { once: true });
+      }
+      break;
+    }
+  }
+});
 
 // Seek position (seconds) — set by clicking spectrogram, used when play starts
 let seekOffset = 0;
