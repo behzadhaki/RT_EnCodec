@@ -680,18 +680,29 @@ interpSlider.addEventListener('change', () => scheduleInterpRecalc());
 // ═══════════════════════════════════════════════════════════════════════
 
 document.querySelectorAll('.tab').forEach(tab => tab.addEventListener('click', () => {
-  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-  tab.classList.add('active');
-  currentView = tab.dataset.view;
-  if (isPlaying && audioCtx && currentAudio()) {
+  const newView = tab.dataset.view;
+  if (newView === currentView) return;
+
+  // Capture old spec canvas before switching
+  if (stftA && !offA) offA = stftToOffscreen(stftA, PLASMA);
+  if (stftB && !offB) offB = stftToOffscreen(stftB, OCEAN);
+  if (stftInterp && !offInterp) offInterp = stftToOffscreen(stftInterp, HOT);
+  const oldOff = currentView === 'A' ? offA : currentView === 'B' ? offB : offInterp;
+  const newOff  = newView    === 'A' ? offA : newView    === 'B' ? offB : offInterp;
+
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.view === newView));
+  currentView = newView;
+  updateLegend();
+
+  // Visual crossfade
+  startSpecFade(oldOff, newOff, newView);
+
+  // Audio crossfade (or stop if new view has no audio yet)
+  if (isPlaying && audioCtx) {
     const elapsed = audioCtx.currentTime - playStart;
     const dur = playingDuration || 1;
     const offset = looping ? elapsed % dur : Math.min(elapsed, dur - 0.001);
-    startPlayback(Math.max(0, offset));
-  } else {
-    if (isPlaying) stopPlayback();
-    updateLegend();
-    drawSpec();
+    _crossfadeAudioTo(Math.max(0, offset));
   }
 }));
 
@@ -1254,20 +1265,15 @@ function startPlayback(atOffset = 0) {
   startPipelineTimer();
 }
 
-// Crossfade audio from the current buffer to a newly arrived buffer for `view`.
-// If not playing the relevant view, does nothing.
-function crossfadeToNew(view) {
-  if (!isPlaying || currentView !== view) return;
-  const elapsed = audioCtx.currentTime - playStart;
-  const pcm = currentAudio();   // already updated to new data by caller
-  if (!pcm) return;
-  const dur = pcm.length / sourceSR;
-  const offset = Math.max(0, looping ? elapsed % dur : Math.min(elapsed, dur - 0.001));
+// Core audio crossfade: fade out current node, fade in currentView's audio at `offset`.
+// Assumes currentView is already set to the desired target. Stops playback if no audio.
+function _crossfadeAudioTo(offset) {
+  if (!audioCtx) return;
+  const pcm = currentAudio();
+  if (!pcm) { stopPlayback(); return; }
 
-  // Abort any previous unfinished fadeout
   _killFadeOut();
 
-  // Demote current node to fadeout path
   if (playNode) {
     fadeOutNode = playNode;
     fadeOutGain = playGain;
@@ -1283,7 +1289,8 @@ function crossfadeToNew(view) {
     playNode = null; playGain = null;
   }
 
-  // Start new node fading in
+  const dur = pcm.length / sourceSR;
+  const safeOff = Math.max(0, Math.min(offset, dur - 0.001));
   const preBuf = currentView === 'A' ? bufA : currentView === 'B' ? bufB : bufInterp;
   let buf = preBuf;
   if (!buf) {
@@ -1300,9 +1307,19 @@ function crossfadeToNew(view) {
   playNode.loop    = looping;
   playNode.onended = looping ? null : stopPlayback;
   playNode.connect(playGain);
-  playNode.start(0, offset);
-  playStart       = audioCtx.currentTime - offset;
+  playNode.start(0, safeOff);
+  playStart       = audioCtx.currentTime - safeOff;
   playingDuration = dur;
+}
+
+// Crossfade audio when a new result arrives for the currently playing view.
+function crossfadeToNew(view) {
+  if (!isPlaying || currentView !== view) return;
+  const elapsed = audioCtx.currentTime - playStart;
+  const pcm = currentAudio();
+  if (!pcm) return;
+  const dur = pcm.length / sourceSR;
+  _crossfadeAudioTo(looping ? elapsed % dur : Math.min(elapsed, dur - 0.001));
 }
 
 function stopPlayback() {
