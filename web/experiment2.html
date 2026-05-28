@@ -99,33 +99,81 @@ select:focus, input[type=number]:focus { outline: none; border-color: var(--acce
   text-align: center; font-size: 11px; color: var(--muted);
 }
 
-/* ── VQ sub-mode section ─────────────────────────────────────────────── */
-#vqModeSection {
-  margin-bottom: 0.45em;
+/* ── Interp-point labels (above pipeline diagram) ────────────────────── */
+/* Labels float over the top of the pipeline canvas, inside the panel */
+#pipelineLabels {
+  position: absolute;
+  top: 4px; left: 0; right: 0;
+  z-index: 1; pointer-events: none;
 }
-#vqModeSection .section-title {
-  margin-bottom: 0.3em;
+.ipt-label {
+  position: absolute;
+  top: 0; transform: translateX(-50%);
+  font-size: 10px; font-weight: 600; letter-spacing: 0.04em;
+  white-space: nowrap; cursor: pointer; user-select: none;
+  pointer-events: auto;
+  color: var(--muted);
+  transition: color 0.15s;
+}
+.ipt-label.active { color: var(--accent); }
+.ipt-label:not(.active):hover { color: var(--text); }
+
+/* ── Pipeline panel ─────────────────────────────────────────────────── */
+#pipelinePanel {
+  flex-shrink: 0;
+  position: relative;
+  background: var(--surface2);
+  border-bottom: 1px solid var(--border);
+  overflow: hidden;
+}
+#pipelineCanvas { display: block; width: 100%; height: 75px; }
+
+/* Strip below the canvas that holds the positioned α slider / VQ mode row */
+#pipelineCtrl {
+  position: relative;
+  height: 42px;
+  border-top: 1px solid var(--border2);
 }
 
-/* ── Per-level sliders ───────────────────────────────────────────────── */
-#levelSlidersWrap {
-  max-height: 180px; overflow-y: auto;
-  padding: 0.1em 0; margin-bottom: 0.35em;
+/* Both overlays sit inside #pipelineCtrl, absolutely positioned by JS */
+#mainSliderSection, #vqModeBar {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  /* left + width set by positionPipelineControls() */
 }
-.level-row {
-  display: flex; align-items: center; gap: 0.35em; margin-bottom: 0.18em;
+#mainSliderSection { min-width: 180px; }
+#mainSliderSection .interp-slider-row { display: flex; align-items: center; gap: 6px; margin-bottom: 2px; }
+#alphaDisplay { text-align: center; font-size: 11px; color: var(--muted); white-space: nowrap; }
+#vqModeBar .toggle-row { gap: 3px; flex-wrap: nowrap; }
+
+/* ── Per-level slider grid ───────────────────────────────────────────── */
+#levelSlidersPanel {
+  flex-shrink: 0;
+  background: var(--surface2); border-bottom: 1px solid var(--border);
+  padding: 5px 10px;
+}
+#levelSlidersGrid {
+  display: grid;
+  grid-template-columns: repeat(8, 1fr);
+  gap: 4px 8px;
+}
+.level-cell {
+  display: flex; align-items: center; gap: 3px; min-width: 0;
 }
 .level-lbl {
-  width: 2em; flex-shrink: 0; color: var(--muted);
-  font-size: 10px; text-align: right; font-variant-numeric: tabular-nums;
+  flex-shrink: 0; color: var(--muted);
+  font-size: 10px; font-variant-numeric: tabular-nums;
+  width: 1.6em; text-align: right;
 }
 .level-slider {
-  flex: 1; accent-color: var(--accent); cursor: pointer; height: 3px;
+  flex: 1; min-width: 0; accent-color: var(--accent); cursor: pointer; height: 3px;
 }
 .level-slider:disabled { opacity: 0.35; cursor: default; }
 .level-val {
-  width: 2.4em; flex-shrink: 0; color: var(--muted);
+  flex-shrink: 0; color: var(--muted);
   font-size: 10px; text-align: right; font-variant-numeric: tabular-nums;
+  width: 2.2em;
 }
 
 /* ── Right panel ────────────────────────────────────────────────────── */
@@ -168,16 +216,6 @@ select:focus, input[type=number]:focus { outline: none; border-color: var(--acce
 }
 #progressBar { height: 100%; background: var(--accent); width: 0; transition: width 0.08s; }
 
-/* ── Pipeline panel ─────────────────────────────────────────────────── */
-#pipelinePanel {
-  flex-shrink: 0;
-  height: 120px;
-  background: var(--surface2);
-  border-bottom: 1px solid var(--border);
-  padding: 0 10px;
-  overflow: hidden;
-}
-#pipelineCanvas { display: block; width: 100%; height: 100%; }
 
 /* ── Spectrogram area ───────────────────────────────────────────────── */
 #specArea { flex: 1; display: flex; min-height: 0; }
@@ -336,42 +374,6 @@ select:focus, input[type=number]:focus { outline: none; border-color: var(--acce
       </div>
     </div>
 
-    <!-- Interpolation -->
-    <div class="section">
-      <div class="section-title">Interpolation Point</div>
-      <div class="toggle-row" id="interpPointRow" style="margin-bottom:0.5em">
-        <button class="tog active" id="togEncLatents" data-point="encoder_latents">Enc. Latents</button>
-        <button class="tog"        id="togVQCodes"    data-point="vq_codes">VQ Codes</button>
-        <button class="tog"        id="togQuantEmb"   data-point="quantized_embeddings">Quant. Emb.</button>
-      </div>
-
-      <!-- VQ sub-mode — only visible when VQ Codes is selected -->
-      <div id="vqModeSection" style="display:none">
-        <div class="section-title">VQ Mix Mode</div>
-        <div class="toggle-row" id="vqModeRow" style="margin-bottom:0.45em">
-          <button class="tog active" data-vqmode="flat_swap">Flat Swap</button>
-          <button class="tog"        data-vqmode="frame_swap">Frame Swap</button>
-          <button class="tog"        data-vqmode="level_swap">Level Swap</button>
-          <button class="tog"        data-vqmode="int_lerp">Int. Lerp</button>
-        </div>
-      </div>
-
-      <!-- Per-level sliders — only visible when VQ Codes + Per Level -->
-      <div id="levelSlidersSection" style="display:none">
-        <div id="levelSlidersWrap"></div>
-      </div>
-
-      <!-- Main α slider — hidden in Per Level mode -->
-      <div id="mainSliderSection">
-        <div class="interp-slider-row">
-          <span class="interp-end">A</span>
-          <input type="range" id="interpSlider" min="0" max="100" value="50" step="1" disabled>
-          <span class="interp-end">B</span>
-        </div>
-        <div id="alphaDisplay">α = 0.50  (50 % A · 50 % B)</div>
-      </div>
-    </div>
-
   </div><!-- #controls -->
 
   <!-- ─────────── RIGHT PANEL ─────────── -->
@@ -396,7 +398,39 @@ select:focus, input[type=number]:focus { outline: none; border-color: var(--acce
     </div>
 
     <div id="pipelinePanel">
+      <!-- Interp-point labels — sit above the relevant diagram sections -->
+      <div id="pipelineLabels">
+        <span class="ipt-label active" id="togEncLatents" data-point="encoder_latents">Interpolating Here</span>
+        <span class="ipt-label"        id="togVQCodes"    data-point="vq_codes">Click to Interpolate Here</span>
+        <span class="ipt-label"        id="togQuantEmb"   data-point="quantized_embeddings">Click to Interpolate Here</span>
+      </div>
       <canvas id="pipelineCanvas"></canvas>
+      <!-- Control strip — contains α slider OR VQ mode row, positioned by JS -->
+      <div id="pipelineCtrl">
+        <!-- α slider — shown for enc_latents, quant_emb, and flat/frame vq modes -->
+        <div id="mainSliderSection">
+          <div class="interp-slider-row">
+            <span class="interp-end">A</span>
+            <input type="range" id="interpSlider" min="0" max="100" value="50" step="1" disabled>
+            <span class="interp-end">B</span>
+          </div>
+          <div id="alphaDisplay">α = 0.50  (50 % A · 50 % B)</div>
+        </div>
+        <!-- VQ mode row — shown when VQ Codes is active -->
+        <div id="vqModeBar" style="display:none">
+          <div class="toggle-row" id="vqModeRow">
+            <button class="tog active" data-vqmode="flat_swap">Flat Swap</button>
+            <button class="tog"        data-vqmode="frame_swap">Frame Swap</button>
+            <button class="tog"        data-vqmode="level_swap">Level Swap</button>
+            <button class="tog"        data-vqmode="int_lerp">Int. Lerp</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Per-level slider grid — shown below the diagram for level_swap / int_lerp -->
+    <div id="levelSlidersPanel" style="display:none">
+      <div id="levelSlidersGrid"></div>
     </div>
 
     <div id="specArea">
@@ -639,10 +673,14 @@ $('togNorm').addEventListener('click', () => {
 // Interpolation point toggle
 // ═══════════════════════════════════════════════════════════════════════
 
-document.querySelectorAll('#interpPointRow .tog').forEach(btn => {
+document.querySelectorAll('#pipelineLabels .ipt-label').forEach(btn => {
   btn.addEventListener('click', () => {
-    document.querySelectorAll('#interpPointRow .tog').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('#pipelineLabels .ipt-label').forEach(b => {
+      b.classList.remove('active');
+      b.textContent = 'Click to Interpolate Here';
+    });
     btn.classList.add('active');
+    btn.textContent = 'Interpolating Here';
     interpPoint = btn.dataset.point;
     updateNotePanel();
     updateVqSectionVisibility();
@@ -730,15 +768,15 @@ function computeNq() {
 }
 
 function initLevelSliders() {
-  const wrap = $('levelSlidersWrap');
-  wrap.innerHTML = '';
+  const grid = $('levelSlidersGrid');
+  grid.innerHTML = '';
   levelSliderEls.length = 0;
   levelValEls.length = 0;
   for (let k = 0; k < MAX_NQ; k++) {
-    const row = document.createElement('div');
-    row.className = 'level-row';
-    row.id = `levelRow${k}`;
-    row.style.display = 'none';
+    const cell = document.createElement('div');
+    cell.className = 'level-cell';
+    cell.id = `levelRow${k}`;
+    cell.style.display = 'none';
 
     const lbl = document.createElement('span');
     lbl.className = 'level-lbl';
@@ -754,12 +792,11 @@ function initLevelSliders() {
     val.className = 'level-val';
     val.textContent = '0.00';
 
-    const kk = k; // capture for closure
+    const kk = k;
     slider.addEventListener('input', () => {
       const v = slider.value / 100;
       levelAlphas[kk] = v;
       val.textContent = v.toFixed(2);
-      // Shift+drag: gang all visible sliders to the same value
       if (shiftHeld) {
         const nq = computeNq();
         for (let i = 0; i < nq; i++) {
@@ -772,10 +809,10 @@ function initLevelSliders() {
     });
     slider.addEventListener('change', () => scheduleInterpRecalc());
 
-    row.appendChild(lbl);
-    row.appendChild(slider);
-    row.appendChild(val);
-    wrap.appendChild(row);
+    cell.appendChild(lbl);
+    cell.appendChild(slider);
+    cell.appendChild(val);
+    grid.appendChild(cell);
     levelSliderEls.push(slider);
     levelValEls.push(val);
   }
@@ -793,10 +830,11 @@ function updateLevelSliders() {
 function updateVqSectionVisibility() {
   const isVQ       = interpPoint === 'vq_codes';
   const usesLevels = isVQ && (vqMode === 'level_swap' || vqMode === 'int_lerp');
-  $('vqModeSection').style.display       = isVQ       ? '' : 'none';
-  $('levelSlidersSection').style.display  = usesLevels ? '' : 'none';
-  $('mainSliderSection').style.display    = usesLevels ? 'none' : '';
+  $('vqModeBar').style.display           = isVQ       ? '' : 'none';
+  $('levelSlidersPanel').style.display   = usesLevels ? '' : 'none';
+  $('mainSliderSection').style.display   = usesLevels ? 'none' : '';
   if (usesLevels) updateLevelSliders();
+  positionPipelineControls();
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1578,6 +1616,49 @@ new ResizeObserver(() => {
   offA = offB = offInterp = null;
   drawSpec();
 }).observe($('specWrap'));
+
+new ResizeObserver(() => positionPipelineControls()).observe($('pipelinePanel'));
+
+// ═══════════════════════════════════════════════════════════════════════
+// Pipeline control positioning
+// Computes the x-center of key pipeline sections and positions the
+// α slider / VQ mode row inside #pipelineCtrl to align with the diagram.
+// ═══════════════════════════════════════════════════════════════════════
+
+function positionPipelineControls() {
+  const panelW = $('pipelinePanel').clientWidth;
+  if (!panelW) return;
+
+  // Mirror the proportions used in drawPipeline()
+  const pcts = [7, 2.5, 11, 2, 3, 2, 5, 2, 13, 2, 11, 2, 3, 2, 11, 2.5, 6];
+  const tot  = pcts.reduce((a, b) => a + b, 0);
+  const padX = 10;
+  const usW  = panelW - 2 * padX;
+
+  function secLeft(i)   { return padX + pcts.slice(0, i).reduce((a, b) => a + b, 0) / tot * usW; }
+  function secWidth(i)  { return pcts[i] / tot * usW; }
+  function secCenter(i) { return secLeft(i) + secWidth(i) / 2; }
+
+  // α slider: center on active tensor section (4 = enc_latents, 12 = quant_emb)
+  const sliderW = Math.max(180, Math.min(260, secWidth(2) + secWidth(3) + secWidth(4) + secWidth(5) + secWidth(6)));
+  const sliderSec = interpPoint === 'quantized_embeddings' ? 12 : 4;
+  const sliderLeft = Math.max(0, secCenter(sliderSec) - sliderW / 2);
+  const sl = $('mainSliderSection');
+  sl.style.left  = sliderLeft + 'px';
+  sl.style.width = sliderW + 'px';
+
+  // VQ mode row: span the circles section (8)
+  const vqW    = Math.max(220, secWidth(8));
+  const vqLeft = Math.max(0, secCenter(8) - vqW / 2);
+  const vq = $('vqModeBar');
+  vq.style.left  = vqLeft + 'px';
+  vq.style.width = vqW + 'px';
+
+  // Interp-point labels above the diagram
+  $('togEncLatents').style.left = secCenter(4)  + 'px';
+  $('togVQCodes').style.left    = secCenter(8)  + 'px';
+  $('togQuantEmb').style.left   = secCenter(12) + 'px';
+}
 
 // ═══════════════════════════════════════════════════════════════════════
 // Helpers
