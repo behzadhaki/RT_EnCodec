@@ -1360,6 +1360,8 @@ function drawStrip() {
 // Playhead
 // ═══════════════════════════════════════════════════════════════════════
 
+const HANDLE_R = 7;   // logical px radius of drag handle
+
 function drawPlayhead(frac) {
   const cvs = phCvs;
   const cW = Math.round(cvs.clientWidth  * dpr);
@@ -1368,9 +1370,20 @@ function drawPlayhead(frac) {
   if (frac < 0 || frac > 1.001) return;
   const ctx = cvs.getContext('2d');
   const x   = Math.round(Math.min(frac, 1) * cW);
-  ctx.strokeStyle = 'rgba(255,255,255,0.85)';
+  const hr  = HANDLE_R * dpr;
+
+  // Vertical line (starts below the handle)
+  ctx.strokeStyle = 'rgba(255,255,255,0.80)';
   ctx.lineWidth   = dpr;
-  ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, cH); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(x, hr * 2); ctx.lineTo(x, cH); ctx.stroke();
+
+  // Drag handle circle at top
+  ctx.beginPath(); ctx.arc(x, hr, hr, 0, 2 * Math.PI);
+  ctx.fillStyle   = 'rgba(255,255,255,0.90)';
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(0,0,0,0.45)';
+  ctx.lineWidth   = dpr;
+  ctx.stroke();
 }
 
 function clearPlayhead() {
@@ -1682,26 +1695,44 @@ function stopPipelineTimer() {
 
 // Seek position (seconds) — set by clicking spectrogram, used when play starts
 let seekOffset = 0;
+let isDraggingPlayhead = false;
 
-// Click-to-seek: move playhead + update VQ viz, do NOT start playback
-$('specWrap').style.cursor = 'crosshair';
-$('specWrap').addEventListener('click', e => {
-  if (!audioCtx) return;
-  const frac = e.offsetX / $('specWrap').clientWidth;
-  currentScrubFrac = frac;
+function isNearHandle(offsetX, offsetY) {
+  const hw = $('specWrap').clientWidth;
+  return Math.abs(offsetX - currentScrubFrac * hw) < HANDLE_R + 6
+      && offsetY < HANDLE_R * 2 + 8;
+}
+
+function applySeek(frac) {
+  currentScrubFrac = Math.max(0, Math.min(1, frac));
   const pcm = currentAudio();
-  if (pcm) {
-    seekOffset = frac * (pcm.length / sourceSR);
-    drawPlayhead(frac);
+  if (pcm) seekOffset = currentScrubFrac * (pcm.length / sourceSR);
+  if (isPlaying) startPlayback(seekOffset);
+  else { drawPlayhead(currentScrubFrac); drawPipeline(); }
+}
+
+$('specWrap').style.cursor = 'crosshair';
+
+$('specWrap').addEventListener('mousedown', e => {
+  if (!audioCtx) return;
+  if (isNearHandle(e.offsetX, e.offsetY)) {
+    isDraggingPlayhead = true;
+    e.preventDefault();
+  } else {
+    applySeek(e.offsetX / $('specWrap').clientWidth);
   }
-  drawPipeline();
 });
+
 $('specWrap').addEventListener('mousemove', e => {
-  if (isPlaying) return;
-  currentScrubFrac = e.offsetX / $('specWrap').clientWidth;
-  drawPlayhead(currentScrubFrac);
-  drawPipeline();
+  // Update cursor shape based on proximity to handle
+  $('specWrap').style.cursor =
+    (isDraggingPlayhead || isNearHandle(e.offsetX, e.offsetY)) ? 'ew-resize' : 'crosshair';
+
+  if (!isDraggingPlayhead) return;
+  applySeek(e.offsetX / $('specWrap').clientWidth);
 });
+
+window.addEventListener('mouseup', () => { isDraggingPlayhead = false; });
 
 new ResizeObserver(() => drawPipeline()).observe($('pipelinePanel'));
 
