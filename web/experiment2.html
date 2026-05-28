@@ -168,6 +168,17 @@ select:focus, input[type=number]:focus { outline: none; border-color: var(--acce
 }
 #progressBar { height: 100%; background: var(--accent); width: 0; transition: width 0.08s; }
 
+/* ── Pipeline panel ─────────────────────────────────────────────────── */
+#pipelinePanel {
+  flex-shrink: 0;
+  height: 120px;
+  background: var(--surface2);
+  border-bottom: 1px solid var(--border);
+  padding: 0 10px;
+  overflow: hidden;
+}
+#pipelineCanvas { display: block; width: 100%; height: 100%; }
+
 /* ── Spectrogram area ───────────────────────────────────────────────── */
 #specArea { flex: 1; display: flex; min-height: 0; }
 
@@ -382,6 +393,10 @@ select:focus, input[type=number]:focus { outline: none; border-color: var(--acce
       <span id="lgA"><span class="ldot" style="background:#c87800"></span>Source A (plasma)</span>
       <span id="lgB" style="display:none"><span class="ldot" style="background:#2090c0"></span>Source B (ocean)</span>
       <span id="lgI" style="display:none"><span class="ldot" style="background:#ff4400"></span>Interpolated (hot)</span>
+    </div>
+
+    <div id="pipelinePanel">
+      <canvas id="pipelineCanvas"></canvas>
     </div>
 
     <div id="specArea">
@@ -617,6 +632,7 @@ document.querySelectorAll('#interpPointRow .tog').forEach(btn => {
     interpPoint = btn.dataset.point;
     updateNotePanel();
     updateVqSectionVisibility();
+    drawPipeline();
     scheduleInterpRecalc();
   });
 });
@@ -628,6 +644,7 @@ document.querySelectorAll('#vqModeRow .tog').forEach(btn => {
     vqMode = btn.dataset.vqmode;
     updateVqSectionVisibility();
     updateNotePanel();
+    drawPipeline();
     scheduleInterpRecalc();
   });
 });
@@ -639,6 +656,7 @@ document.querySelectorAll('#vqModeRow .tog').forEach(btn => {
 interpSlider.addEventListener('input', () => {
   const a = parseInt(interpSlider.value) / 100;
   alphaDisplay.textContent = `α = ${a.toFixed(2)}  (${Math.round((1-a)*100)} % A · ${Math.round(a*100)} % B)`;
+  drawPipeline();
 });
 
 interpSlider.addEventListener('change', () => scheduleInterpRecalc());
@@ -718,6 +736,7 @@ function initLevelSliders() {
           levelValEls[i].textContent = v.toFixed(2);
         }
       }
+      drawPipeline();
     });
     slider.addEventListener('change', () => scheduleInterpRecalc());
 
@@ -924,6 +943,7 @@ function onWorkerMsg(e) {
       stftA = computeSTFT(decodedA); offA = null;
       swapIfPlaying('A');
       drawSpec();
+      drawPipeline();
       setStatus('Source A encoded — encoding B…');
       startEncodeB();
 
@@ -937,6 +957,7 @@ function onWorkerMsg(e) {
       updateLevelSliders();
       swapIfPlaying('B');
       drawSpec();
+      drawPipeline();
       if (!isPlaying) setView('A');
       triggerInterpolation();
 
@@ -951,6 +972,7 @@ function onWorkerMsg(e) {
       playBtn.disabled = false;
       loopBtn.disabled = false;
       swapIfPlaying('interp');
+      drawPipeline();
       if (!isPlaying) setView('interp');
       else drawSpec();
     }
@@ -978,6 +1000,7 @@ function cancelCurrentJob() {
 // Clear visualisers. interpOnly=true keeps decodedA/B intact (interp-only recalc).
 // Never stops playback — old audio keeps playing until new results swap in.
 function clearVisualizers(interpOnly) {
+  if (!interpOnly) { seekOffset = 0; currentScrubFrac = 0; }
   // Wipe stale interp result (A/B kept so playback continues uninterrupted)
   interpAudio = null; stftInterp = null; offInterp = null;
   if (!interpOnly) {
@@ -1103,7 +1126,7 @@ function triggerInterpolation() {
 // Playback
 // ═══════════════════════════════════════════════════════════════════════
 
-playBtn.addEventListener('click', () => { isPlaying ? stopPlayback() : startPlayback(); });
+playBtn.addEventListener('click', () => { isPlaying ? stopPlayback() : startPlayback(seekOffset); });
 
 loopBtn.addEventListener('click', () => {
   looping = !looping;
@@ -1150,6 +1173,7 @@ function startPlayback(atOffset = 0) {
   isPlaying       = true;
   playBtn.textContent = '⏹';
   animatePlayhead();
+  startPipelineTimer();
 }
 
 // Seamlessly swap the buffer when a new result for `view` arrives.
@@ -1169,7 +1193,8 @@ function stopPlayback() {
   isPlaying = false;
   playBtn.textContent = '▶';
   cancelAnimationFrame(phRAF);
-  clearPlayhead();
+  drawPlayhead(currentScrubFrac);
+  stopPipelineTimer();
 }
 
 function animatePlayhead() {
@@ -1380,10 +1405,305 @@ function setStatus(msg, isErr = false) {
 // Shift key tracking (for gang-drag on level sliders)
 // ═══════════════════════════════════════════════════════════════════════
 
-document.addEventListener('keydown', e => { if (e.key === 'Shift') shiftHeld = true;  });
+document.addEventListener('keydown', e => {
+  if (e.key === 'Shift') shiftHeld = true;
+  if (e.key === ' ' && !e.target.matches('input, select, button, textarea')) {
+    e.preventDefault();
+    if (isPlaying) stopPlayback(); else startPlayback(seekOffset);
+  }
+});
 document.addEventListener('keyup',   e => { if (e.key === 'Shift') shiftHeld = false; });
 // Clear on blur so a window switch doesn't leave shift stuck
 window.addEventListener('blur', () => { shiftHeld = false; });
+
+// ═══════════════════════════════════════════════════════════════════════
+// Pipeline visualization
+// ═══════════════════════════════════════════════════════════════════════
+
+const COL_A_RGB = [204, 51,  51 ];   // red  — Source A
+const COL_B_RGB = [ 51, 102, 204];   // blue — Source B
+
+let currentScrubFrac = 0;
+let pipelineTimer    = null;
+
+function blendRGB(t, ca, cb) {
+  return [
+    Math.round(ca[0] * (1 - t) + cb[0] * t),
+    Math.round(ca[1] * (1 - t) + cb[1] * t),
+    Math.round(ca[2] * (1 - t) + cb[2] * t),
+  ];
+}
+
+function computeNf() {
+  if (!rawAudioA) return 1;
+  const fps = modelSel.value === '24k' ? 75 : 150;
+  return Math.max(1, Math.round(rawAudioA.length / sourceSR * fps));
+}
+
+function getVQCircleColor(levelK, scrubFrac) {
+  const alpha  = parseInt(interpSlider.value) / 100;
+  const Nf     = computeNf();
+  const frame  = Math.min(Math.floor(scrubFrac * Nf), Nf - 1);
+  let t;   // 0 = A (red), 1 = B (blue), or a continuous [0,1] for int_lerp
+
+  switch (vqMode) {
+    case 'flat_swap': {
+      const idx  = levelK * Nf + frame;
+      const frac = ((Math.imul(idx + 1, 0x9E3779B9) >>> 0) / 0xFFFFFFFF);
+      t = frac < alpha ? 1 : 0;
+      break;
+    }
+    case 'frame_swap': {
+      const frac = ((Math.imul(frame + 1, 0x9E3779B9) >>> 0) / 0xFFFFFFFF);
+      t = frac < alpha ? 1 : 0;
+      break;
+    }
+    case 'level_swap': {
+      const seed = (Math.imul(levelK + 1, 49999) + frame + 1) | 0;
+      const frac = ((Math.imul(seed, 0x9E3779B9) >>> 0) / 0xFFFFFFFF);
+      const ak   = levelAlphas[levelK] ?? 0.5;
+      t = frac < ak ? 1 : 0;
+      break;
+    }
+    case 'int_lerp':
+      t = levelAlphas[levelK] !== undefined ? levelAlphas[levelK] : alpha;
+      break;
+    default:
+      t = 0.5;
+  }
+
+  const [r, g, b] = blendRGB(t, COL_A_RGB, COL_B_RGB);
+  return `rgb(${r},${g},${b})`;
+}
+
+function pipeRR(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + w - r, y); ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+  ctx.lineTo(x + w, y + h - r); ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+  ctx.lineTo(x + r, y + h); ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+  ctx.lineTo(x, y + r); ctx.quadraticCurveTo(x, y, x + r, y);
+  ctx.closePath();
+}
+
+function drawPipeline() {
+  const cvs = $('pipelineCanvas');
+  const W = cvs.clientWidth;
+  const H = cvs.clientHeight;
+  if (!W || !H) return;
+  cvs.width  = W * dpr;
+  cvs.height = H * dpr;
+  const ctx = cvs.getContext('2d');
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, W, H);
+
+  const alpha     = parseInt(interpSlider.value) / 100;
+  const Nq        = computeNq();
+  const ready     = !!(rawAudioA && rawAudioB);
+  const encActive = interpPoint === 'encoder_latents';
+  const vqActive  = interpPoint === 'vq_codes';
+  const qeActive  = interpPoint === 'quantized_embeddings';
+
+  const padX = 10;
+  const usW  = W - 2 * padX;
+  const cy   = H / 2;
+  const bH   = 30;                    // box height
+  const bY   = cy - bH / 2;
+  const fs   = Math.max(9, Math.min(11, W / 95));  // font size
+
+  // Proportional section widths — index map:
+  // 0:sources  1:arr  2:EncAudio  3:arr  4:tensor1  5:arr  6:VQ
+  // 7:arr(VQ→circ)  8:circles  9:arr(circ→Dec)
+  // 10:DecCodes  11:arr  12:tensor2  13:arr  14:DecAudio  15:arr  16:Out
+  const pcts = [7, 2.5, 11, 2, 3, 2, 5, 2, 13, 2, 11, 2, 3, 2, 11, 2.5, 6];
+  const tot  = pcts.reduce((a, b) => a + b, 0);
+  const sw   = pcts.map(p => p / tot * usW);
+
+  let x = padX;
+  const nx = i => { const v = x; x += sw[i]; return v; };  // advance and return start
+
+  // ── helpers ──
+
+  function drawBox(label, lx, lw, active) {
+    ctx.fillStyle   = active ? '#3a2a0a' : '#252525';
+    ctx.strokeStyle = active ? '#c8902a' : '#404040';
+    ctx.lineWidth   = active ? 1.5 : 1;
+    pipeRR(ctx, lx, bY, lw, bH, 4); ctx.fill(); ctx.stroke();
+    ctx.fillStyle   = active ? '#ffb030' : '#909090';
+    ctx.font        = `${fs}px system-ui`;
+    ctx.textAlign   = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(label, lx + lw / 2, cy);
+  }
+
+  function drawArrow(lx, lw) {
+    const ex = lx + lw;
+    ctx.strokeStyle = '#484848'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(lx, cy); ctx.lineTo(ex - 5, cy); ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(ex - 7, cy - 3); ctx.lineTo(ex, cy); ctx.lineTo(ex - 7, cy + 3);
+    ctx.stroke();
+  }
+
+  function drawTensor(lx, lw, active) {
+    const th = bH * 0.80;
+    const ty = cy - th / 2;
+    if (active) {
+      const [r, g, b] = blendRGB(alpha, COL_A_RGB, COL_B_RGB);
+      ctx.fillStyle   = ready ? `rgb(${r},${g},${b})` : 'rgba(110,55,55,0.45)';
+      ctx.strokeStyle = '#c8902a';
+      ctx.lineWidth   = 1.5;
+    } else {
+      ctx.fillStyle   = '#363636';
+      ctx.strokeStyle = '#303030';
+      ctx.lineWidth   = 1;
+    }
+    pipeRR(ctx, lx, ty, lw, th, 2); ctx.fill(); ctx.stroke();
+
+    if (active) {
+      ctx.fillStyle    = ready ? 'rgba(255,255,255,0.75)' : 'rgba(255,180,80,0.6)';
+      ctx.font         = `bold ${fs + 1}px system-ui`;
+      ctx.textAlign    = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText('α', lx + lw / 2, cy);
+    }
+  }
+
+  // ── 0: Source A / B labels ──
+  {
+    const lx = nx(0); const lw = sw[0];
+    const sh = Math.floor(bH / 2) - 2;
+    ctx.fillStyle = `rgb(${COL_A_RGB.join(',')})`;
+    pipeRR(ctx, lx, cy - sh - 1, lw, sh, 3); ctx.fill();
+    ctx.fillStyle = `rgb(${COL_B_RGB.join(',')})`;
+    pipeRR(ctx, lx, cy + 1, lw, sh, 3); ctx.fill();
+    ctx.fillStyle = '#fff';
+    ctx.font = `bold ${Math.min(fs, 10)}px system-ui`;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText('A', lx + lw / 2, cy - sh / 2 - 1);
+    ctx.fillText('B', lx + lw / 2, cy + sh / 2 + 1);
+  }
+
+  drawArrow(nx(1), sw[1]);                              // ── 1 ──
+  drawBox('Encode Audio', nx(2), sw[2], false);         // ── 2 ──
+  drawArrow(nx(3), sw[3]);                              // ── 3 ──
+  drawTensor(nx(4), sw[4], encActive);                  // ── 4: Tensor 1 ──
+  drawArrow(nx(5), sw[5]);                              // ── 5 ──
+  drawBox('VQ', nx(6), sw[6], false);                   // ── 6 ──
+  drawArrow(nx(7), sw[7]);                              // ── 7: VQ → circles ──
+
+  // ── 8: VQ circles (one frame, dashed box, max 4 per row) ──
+  {
+    const lx = nx(8); const lw = sw[8];
+    const cols    = Math.min(Nq, 8);
+    const rows    = Math.ceil(Nq / cols);
+    const padI    = 5;
+    const rowGap  = 3;
+    const colGap  = 3;
+    const availH  = H - 2 * 8;
+    const circByH = Math.floor((availH - 2 * padI - (rows - 1) * rowGap) / rows);
+    const circByW = Math.floor((lw   - 2 * padI - (cols - 1) * colGap) / cols);
+    const circD   = Math.max(6, Math.min(12, circByH, circByW));
+    const circR   = circD / 2;
+
+    // Dashed box spans the full section so arrows connect flush on both sides
+    const gridW = cols * circD + (cols - 1) * colGap;
+    const gridH = rows * circD + (rows - 1) * rowGap;
+    const dbH   = gridH + 2 * padI;
+    const dbX   = lx;          // flush with left arrow end
+    const dbW   = lw;          // flush with right arrow start
+    const dbY   = cy - dbH / 2;
+
+    ctx.save();
+    ctx.strokeStyle = vqActive ? '#c8902a' : '#444';
+    ctx.lineWidth   = 1;
+    ctx.setLineDash([4, 3]);
+    pipeRR(ctx, dbX, dbY, dbW, dbH, 4); ctx.stroke();
+    ctx.restore();
+
+    // Centre the circles grid inside the box
+    const gridX = dbX + (dbW - gridW) / 2;
+    const gridY = dbY + padI;
+
+    for (let k = 0; k < Nq; k++) {
+      const col  = k % cols;
+      const row  = Math.floor(k / cols);
+      const cx2  = gridX + col * (circD + colGap) + circR;
+      const cy2  = gridY + row * (circD + rowGap) + circR;
+      ctx.fillStyle = (vqActive && ready) ? getVQCircleColor(k, currentScrubFrac) : '#484848';
+      ctx.beginPath(); ctx.arc(cx2, cy2, circR, 0, 2 * Math.PI);
+      ctx.fill();
+      ctx.strokeStyle = '#1a1a1a'; ctx.lineWidth = 0.5;
+      ctx.stroke();
+    }
+
+    if (vqActive && ready) {
+      const Nf    = computeNf();
+      const frame = Math.min(Math.floor(currentScrubFrac * Nf), Nf - 1);
+      ctx.fillStyle    = '#666';
+      ctx.font         = `${fs - 2}px system-ui`;
+      ctx.textAlign    = 'center'; ctx.textBaseline = 'top';
+      ctx.fillText(`f ${frame + 1}/${Nf}`, lx + lw / 2, dbY + dbH + 2);
+    }
+  }
+
+  drawArrow(nx(9),  sw[9]);                             // ── 9: circles → Decode Codes ──
+  drawBox('Decode Codes', nx(10), sw[10], false);       // ── 10 ──
+  drawArrow(nx(11), sw[11]);                            // ── 11 ──
+  drawTensor(nx(12), sw[12], qeActive);                 // ── 12: Tensor 2 ──
+  drawArrow(nx(13), sw[13]);                            // ── 13 ──
+  drawBox('Decode Audio', nx(14), sw[14], false);       // ── 14 ──
+  drawArrow(nx(15), sw[15]);                            // ── 15 ──
+
+  // ── 16: Out label ──
+  {
+    const lx = nx(16); const lw = sw[16];
+    ctx.fillStyle = '#777'; ctx.font = `${fs}px system-ui`;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText('Out', lx + lw / 2, cy);
+  }
+}
+
+function startPipelineTimer() {
+  if (pipelineTimer) return;
+  pipelineTimer = setInterval(() => {
+    if (!isPlaying || !audioCtx) return;
+    const dur = playingDuration || 1;
+    const elapsed = audioCtx.currentTime - playStart;
+    currentScrubFrac = looping
+      ? (elapsed % dur) / dur
+      : Math.min(elapsed / dur, 1);
+    drawPipeline();
+  }, 100);
+}
+
+function stopPipelineTimer() {
+  if (pipelineTimer) { clearInterval(pipelineTimer); pipelineTimer = null; }
+  drawPipeline();
+}
+
+// Seek position (seconds) — set by clicking spectrogram, used when play starts
+let seekOffset = 0;
+
+// Click-to-seek: move playhead + update VQ viz, do NOT start playback
+$('specWrap').style.cursor = 'crosshair';
+$('specWrap').addEventListener('click', e => {
+  if (!audioCtx) return;
+  const frac = e.offsetX / $('specWrap').clientWidth;
+  currentScrubFrac = frac;
+  const pcm = currentAudio();
+  if (pcm) {
+    seekOffset = frac * (pcm.length / sourceSR);
+    drawPlayhead(frac);
+  }
+  drawPipeline();
+});
+$('specWrap').addEventListener('mousemove', e => {
+  if (isPlaying) return;
+  currentScrubFrac = e.offsetX / $('specWrap').clientWidth;
+  drawPlayhead(currentScrubFrac);
+  drawPipeline();
+});
+
+new ResizeObserver(() => drawPipeline()).observe($('pipelinePanel'));
 
 // ═══════════════════════════════════════════════════════════════════════
 // Auto-recalc listeners
@@ -1391,7 +1711,10 @@ window.addEventListener('blur', () => { shiftHeld = false; });
 
 // Source/model/mode controls → full pipeline recalc
 ['modelSel', 'bwSel', 'frameSel', 'srcTypeA', 'srcTypeB'].forEach(id =>
-  $(id).addEventListener('change', () => scheduleFullRecalc()));
+  $(id).addEventListener('change', () => {
+    if (id === 'modelSel' || id === 'bwSel') { updateLevelSliders(); drawPipeline(); }
+    scheduleFullRecalc();
+  }));
 
 [togNS, togS].forEach(btn => {
   // mode toggles already set `streaming` — just hook the recalc
@@ -1414,6 +1737,7 @@ updateLegend();
 updateNotePanel();
 updateVqSectionVisibility();
 loopBtn.classList.add('active');   // loop on by default
+drawPipeline();
 </script>
 </body>
 </html>
