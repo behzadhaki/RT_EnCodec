@@ -505,9 +505,19 @@ let recalcToken  = 0;      // incremented on every new pipeline start, guards as
 let isPlaying       = false;
 let looping         = true;
 let playNode        = null;
+let playGain        = null;   // GainNode routing playNode → destination
+let fadeOutNode     = null;   // old BufferSourceNode being crossfaded out
+let fadeOutGain     = null;   // GainNode for fadeOutNode
+const CROSSFADE_S   = 1.5;    // audio + visual crossfade duration (seconds)
 let playStart       = 0;
 let playingDuration = 0;   // duration of the buffer currently in playNode
 let phRAF           = null;
+
+let specFadeOldOff  = null;   // offscreen canvas being faded out
+let specFadeNewOff  = null;   // offscreen canvas being faded in
+let specFadeView    = null;   // which view is fading ('A'|'B'|'interp')
+let specFadeStart   = 0;      // performance.now() when spec fade started
+let specFadeRAF     = null;
 
 const dpr = devicePixelRatio || 1;
 
@@ -685,7 +695,7 @@ document.querySelectorAll('.tab').forEach(tab => tab.addEventListener('click', (
   }
 }));
 
-// Internal view switch — does NOT stop playback (swapIfPlaying handles continuity).
+// Internal view switch — does NOT stop playback.
 function setView(v) {
   currentView = v;
   document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.view === v));
@@ -949,35 +959,45 @@ function onWorkerMsg(e) {
     progWrap.style.display = 'none';
 
     if (encodePhase === 'A') {
+      const prevOff = offA;
       decodedA = msg.decoded;
       sourceSR = modelSel.value === '24k' ? 24000 : 48000;
       bufA = makeAudioBuf(decodedA);
-      stftA = computeSTFT(decodedA); offA = null;
-      swapIfPlaying('A');
-      drawSpec();
+      stftA = computeSTFT(decodedA);
+      offA = stftToOffscreen(stftA, PLASMA);
+      crossfadeToNew('A');
       drawPipeline();
       setStatus('Source A encoded — encoding B…');
+      // Start spec fade before any setView call so its RAF guard blocks drawSpec
+      if (currentView === 'A') startSpecFade(prevOff, offA, 'A');
+      else drawSpec();
       startEncodeB();
 
     } else if (encodePhase === 'B') {
+      const prevOff = offB;
       decodedB = msg.decoded;
       bufB = makeAudioBuf(decodedB);
-      stftB = computeSTFT(decodedB); offB = null;
+      stftB = computeSTFT(decodedB);
+      offB = stftToOffscreen(stftB, OCEAN);
       encodePhase = null;
       interpSlider.disabled = false;
       playBtn.disabled = false;
       loopBtn.disabled = false;
       updateLevelSliders();
-      swapIfPlaying('B');
-      drawSpec();
+      crossfadeToNew('B');
       drawPipeline();
+      // If on B and playing, fade spec; then auto-switch to A if not playing
+      if (currentView === 'B') startSpecFade(prevOff, offB, 'B');
+      else drawSpec();
       if (!isPlaying) setView('A');
       triggerInterpolation();
 
     } else if (encodePhase === 'interp') {
+      const prevOff = offInterp;
       interpAudio = msg.decoded;
       bufInterp = makeAudioBuf(interpAudio);
-      stftInterp = computeSTFT(interpAudio); offInterp = null;
+      stftInterp = computeSTFT(interpAudio);
+      offInterp = stftToOffscreen(stftInterp, HOT);
       const a = parseInt(interpSlider.value) / 100;
       const modeLabel = interpPoint === 'vq_codes'
         ? ` · ${vqMode.replace(/_/g,' ')}` : '';
@@ -985,10 +1005,12 @@ function onWorkerMsg(e) {
       encodePhase = null;
       playBtn.disabled = false;
       loopBtn.disabled = false;
-      swapIfPlaying('interp');
+      crossfadeToNew('interp');
       drawPipeline();
-      if (!isPlaying) setView('interp');
+      // Start fade first so the RAF guard blocks drawSpec inside setView
+      if (currentView === 'interp' || !isPlaying) startSpecFade(prevOff, offInterp, 'interp');
       else drawSpec();
+      if (!isPlaying) setView('interp');
     }
 
   } else if (msg.type === 'error') {
@@ -1019,17 +1041,19 @@ function makeAudioBuf(pcm) {
 }
 
 // Clear visualisers. interpOnly=true keeps decodedA/B intact (interp-only recalc).
-// Never stops playback — old audio keeps playing until new results swap in.
+// Never stops playback — old audio keeps playing until new results crossfade in.
+// Spec canvases are intentionally kept so the display stays live during recalc.
 function clearVisualizers(interpOnly) {
+  _cancelSpecFade();
   if (!interpOnly) { seekOffset = 0; currentScrubFrac = 0; bufA = null; bufB = null; }
   bufInterp = null;
-  // Wipe stale interp result (A/B kept so playback continues uninterrupted)
-  interpAudio = null; stftInterp = null; offInterp = null;
+  interpAudio = null;
+  // stftInterp / offInterp kept so spectrogram stays visible during recalc
   if (!interpOnly) {
     rawAudioA = rawAudioB = null;   // will be reloaded by startFullPipeline
     interpSlider.disabled = true;
     updateLevelSliders();
-    // decodedA/B, stftA/B, offA/B intentionally kept for continuous playback
+    // decodedA/B, stftA/B/offA/B, stftInterp/offInterp all kept for display continuity
   }
   progWrap.style.display = 'block';
   progBar.style.width = '0%';
@@ -1166,11 +1190,30 @@ function currentAudio() {
   return null;
 }
 
+// Kill any in-progress audio fadeout immediately.
+function _killFadeOut() {
+  if (!fadeOutNode) return;
+  fadeOutGain.gain.cancelScheduledValues(audioCtx.currentTime);
+  fadeOutGain.gain.setValueAtTime(0, audioCtx.currentTime);
+  fadeOutNode.onended = null;
+  try { fadeOutNode.stop(); } catch {}
+  try { fadeOutGain.disconnect(); } catch {}
+  fadeOutNode = null; fadeOutGain = null;
+}
+
+// Cancel a running spec crossfade and snap to the incoming canvas.
+function _cancelSpecFade() {
+  if (specFadeRAF) { cancelAnimationFrame(specFadeRAF); specFadeRAF = null; }
+  specFadeOldOff = null; specFadeNewOff = null; specFadeView = null;
+}
+
 // Start (or restart) playback at `atOffset` seconds into the current view's audio.
 function startPlayback(atOffset = 0) {
   if (!audioCtx) return;
   const pcm = currentAudio();
   if (!pcm) return;
+
+  _killFadeOut();
 
   // Tear down existing node without triggering onended → stopPlayback
   if (playNode) {
@@ -1178,6 +1221,7 @@ function startPlayback(atOffset = 0) {
     try { playNode.stop(); } catch {}
     playNode = null;
   }
+  if (playGain) { try { playGain.disconnect(); } catch {} playGain = null; }
   cancelAnimationFrame(phRAF);
 
   const preBuf = currentView === 'A' ? bufA : currentView === 'B' ? bufB : bufInterp;
@@ -1188,11 +1232,15 @@ function startPlayback(atOffset = 0) {
     buf = audioCtx.createBuffer(1, pcm.length, sourceSR);
     buf.copyToChannel(pcm, 0);
   }
+  playGain = audioCtx.createGain();
+  playGain.gain.value = 1;
+  playGain.connect(audioCtx.destination);
+
   playNode = audioCtx.createBufferSource();
   playNode.buffer  = buf;
   playNode.loop    = looping;
   playNode.onended = looping ? null : stopPlayback;
-  playNode.connect(audioCtx.destination);
+  playNode.connect(playGain);
 
   const offset = Math.max(0, Math.min(atOffset, pcm.length / sourceSR - 0.001));
   playNode.start(0, offset);
@@ -1206,20 +1254,61 @@ function startPlayback(atOffset = 0) {
   startPipelineTimer();
 }
 
-// Seamlessly swap the buffer when a new result for `view` arrives.
-// Calculates the current playhead position and restarts at the same offset.
-function swapIfPlaying(view) {
+// Crossfade audio from the current buffer to a newly arrived buffer for `view`.
+// If not playing the relevant view, does nothing.
+function crossfadeToNew(view) {
   if (!isPlaying || currentView !== view) return;
   const elapsed = audioCtx.currentTime - playStart;
   const pcm = currentAudio();   // already updated to new data by caller
   if (!pcm) return;
   const dur = pcm.length / sourceSR;
-  const offset = looping ? elapsed % dur : Math.min(elapsed, dur - 0.001);
-  startPlayback(Math.max(0, offset));
+  const offset = Math.max(0, looping ? elapsed % dur : Math.min(elapsed, dur - 0.001));
+
+  // Abort any previous unfinished fadeout
+  _killFadeOut();
+
+  // Demote current node to fadeout path
+  if (playNode) {
+    fadeOutNode = playNode;
+    fadeOutGain = playGain;
+    fadeOutGain.gain.cancelScheduledValues(audioCtx.currentTime);
+    fadeOutGain.gain.setValueAtTime(1, audioCtx.currentTime);
+    fadeOutGain.gain.linearRampToValueAtTime(0, audioCtx.currentTime + CROSSFADE_S);
+    const fn = fadeOutNode, fg = fadeOutGain;
+    setTimeout(() => {
+      fn.onended = null;
+      try { fn.stop(); } catch {}
+      try { fg.disconnect(); } catch {}
+    }, (CROSSFADE_S + 0.15) * 1000);
+    playNode = null; playGain = null;
+  }
+
+  // Start new node fading in
+  const preBuf = currentView === 'A' ? bufA : currentView === 'B' ? bufB : bufInterp;
+  let buf = preBuf;
+  if (!buf) {
+    buf = audioCtx.createBuffer(1, pcm.length, sourceSR);
+    buf.copyToChannel(pcm, 0);
+  }
+  playGain = audioCtx.createGain();
+  playGain.gain.setValueAtTime(0, audioCtx.currentTime);
+  playGain.gain.linearRampToValueAtTime(1, audioCtx.currentTime + CROSSFADE_S);
+  playGain.connect(audioCtx.destination);
+
+  playNode = audioCtx.createBufferSource();
+  playNode.buffer  = buf;
+  playNode.loop    = looping;
+  playNode.onended = looping ? null : stopPlayback;
+  playNode.connect(playGain);
+  playNode.start(0, offset);
+  playStart       = audioCtx.currentTime - offset;
+  playingDuration = dur;
 }
 
 function stopPlayback() {
+  _killFadeOut();
   if (playNode) { playNode.onended = null; try { playNode.stop(); } catch {} playNode = null; }
+  if (playGain) { try { playGain.disconnect(); } catch {} playGain = null; }
   isPlaying = false;
   playBtn.textContent = '▶';
   cancelAnimationFrame(phRAF);
@@ -1339,6 +1428,9 @@ function stftToOffscreen(stft, stops) {
 // ═══════════════════════════════════════════════════════════════════════
 
 function drawSpec() {
+  // If a crossfade animation is running for the current view, let it own the canvas.
+  if (specFadeRAF && specFadeView === currentView) return;
+
   const cvs = specCvs;
   const cW = Math.round(cvs.clientWidth  * dpr);
   const cH = Math.round(cvs.clientHeight * dpr);
@@ -1358,6 +1450,45 @@ function drawSpec() {
   if (off) ctx.drawImage(off, 0, 0, cW, cH);
 
   drawStrip();
+}
+
+// Animate a crossfade on specCvs from oldOff → newOff for the given view.
+// If oldOff is null (first load), just draws newOff immediately.
+function startSpecFade(oldOff, newOff, view) {
+  _cancelSpecFade();
+  if (!oldOff || !newOff || oldOff === newOff) { drawSpec(); return; }
+  specFadeOldOff = oldOff;
+  specFadeNewOff = newOff;
+  specFadeView   = view;
+  specFadeStart  = performance.now();
+
+  function tick() {
+    const t = Math.min((performance.now() - specFadeStart) / (CROSSFADE_S * 1000), 1);
+    if (currentView === specFadeView) {
+      const cvs = specCvs;
+      const cW = Math.round(cvs.clientWidth  * dpr);
+      const cH = Math.round(cvs.clientHeight * dpr);
+      if (cW && cH) {
+        cvs.width = cW; cvs.height = cH;
+        const ctx = cvs.getContext('2d');
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = 'high';
+        ctx.globalAlpha = 1 - t;
+        ctx.drawImage(specFadeOldOff, 0, 0, cW, cH);
+        ctx.globalAlpha = t;
+        ctx.drawImage(specFadeNewOff, 0, 0, cW, cH);
+        ctx.globalAlpha = 1;
+      }
+    }
+    if (t < 1) {
+      specFadeRAF = requestAnimationFrame(tick);
+    } else {
+      specFadeOldOff = null; specFadeNewOff = null; specFadeView = null;
+      specFadeRAF = null;
+      drawSpec();
+    }
+  }
+  specFadeRAF = requestAnimationFrame(tick);
 }
 
 function drawStrip() {
