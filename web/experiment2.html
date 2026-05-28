@@ -476,6 +476,10 @@ let decodedA     = null;   // Float32Array — after full pipeline
 let decodedB     = null;
 let interpAudio  = null;   // Float32Array — interpolated result
 
+let bufA     = null;   // pre-created AudioBuffer for instant tab switching
+let bufB     = null;
+let bufInterp = null;
+
 let stftA = null, stftB = null, stftInterp = null;
 let offA  = null, offB  = null, offInterp  = null;
 
@@ -669,9 +673,16 @@ document.querySelectorAll('.tab').forEach(tab => tab.addEventListener('click', (
   document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
   tab.classList.add('active');
   currentView = tab.dataset.view;
-  stopPlayback();   // user explicitly changed view — stop and let them re-trigger
-  updateLegend();
-  drawSpec();
+  if (isPlaying && audioCtx && currentAudio()) {
+    const elapsed = audioCtx.currentTime - playStart;
+    const dur = playingDuration || 1;
+    const offset = looping ? elapsed % dur : Math.min(elapsed, dur - 0.001);
+    startPlayback(Math.max(0, offset));
+  } else {
+    if (isPlaying) stopPlayback();
+    updateLegend();
+    drawSpec();
+  }
 }));
 
 // Internal view switch — does NOT stop playback (swapIfPlaying handles continuity).
@@ -940,6 +951,7 @@ function onWorkerMsg(e) {
     if (encodePhase === 'A') {
       decodedA = msg.decoded;
       sourceSR = modelSel.value === '24k' ? 24000 : 48000;
+      bufA = makeAudioBuf(decodedA);
       stftA = computeSTFT(decodedA); offA = null;
       swapIfPlaying('A');
       drawSpec();
@@ -949,6 +961,7 @@ function onWorkerMsg(e) {
 
     } else if (encodePhase === 'B') {
       decodedB = msg.decoded;
+      bufB = makeAudioBuf(decodedB);
       stftB = computeSTFT(decodedB); offB = null;
       encodePhase = null;
       interpSlider.disabled = false;
@@ -963,6 +976,7 @@ function onWorkerMsg(e) {
 
     } else if (encodePhase === 'interp') {
       interpAudio = msg.decoded;
+      bufInterp = makeAudioBuf(interpAudio);
       stftInterp = computeSTFT(interpAudio); offInterp = null;
       const a = parseInt(interpSlider.value) / 100;
       const modeLabel = interpPoint === 'vq_codes'
@@ -997,10 +1011,18 @@ function cancelCurrentJob() {
   }
 }
 
+function makeAudioBuf(pcm) {
+  if (!audioCtx || !pcm) return null;
+  const b = audioCtx.createBuffer(1, pcm.length, sourceSR);
+  b.copyToChannel(pcm, 0);
+  return b;
+}
+
 // Clear visualisers. interpOnly=true keeps decodedA/B intact (interp-only recalc).
 // Never stops playback — old audio keeps playing until new results swap in.
 function clearVisualizers(interpOnly) {
-  if (!interpOnly) { seekOffset = 0; currentScrubFrac = 0; }
+  if (!interpOnly) { seekOffset = 0; currentScrubFrac = 0; bufA = null; bufB = null; }
+  bufInterp = null;
   // Wipe stale interp result (A/B kept so playback continues uninterrupted)
   interpAudio = null; stftInterp = null; offInterp = null;
   if (!interpOnly) {
@@ -1158,8 +1180,14 @@ function startPlayback(atOffset = 0) {
   }
   cancelAnimationFrame(phRAF);
 
-  const buf = audioCtx.createBuffer(1, pcm.length, sourceSR);
-  buf.copyToChannel(pcm, 0);
+  const preBuf = currentView === 'A' ? bufA : currentView === 'B' ? bufB : bufInterp;
+  let buf;
+  if (preBuf) {
+    buf = preBuf;
+  } else {
+    buf = audioCtx.createBuffer(1, pcm.length, sourceSR);
+    buf.copyToChannel(pcm, 0);
+  }
   playNode = audioCtx.createBufferSource();
   playNode.buffer  = buf;
   playNode.loop    = looping;
@@ -1172,6 +1200,8 @@ function startPlayback(atOffset = 0) {
   playingDuration = pcm.length / sourceSR;
   isPlaying       = true;
   playBtn.textContent = '⏹';
+  updateLegend();
+  drawSpec();
   animatePlayhead();
   startPipelineTimer();
 }
