@@ -206,6 +206,15 @@ select:focus, input[type=number]:focus { outline: none; border-color: var(--acce
 #loopBtn { font-size: 20px; }
 #loopBtn.active { background: var(--accent); color: #000; }
 
+#levelMeter {
+  width: 10px; height: 28px; flex-shrink: 0;
+  border-radius: 2px; border: 1px solid var(--border2);
+  background: #111; display: block;
+}
+
+.vol-slider { flex: 1; accent-color: var(--accent); cursor: pointer; }
+.vol-val { width: 2.4em; flex-shrink: 0; text-align: right; color: var(--muted); font-size: 11px; }
+
 .tab-group {
   display: flex; gap: 2px;
   background: #1c1c1c; border: 1px solid var(--border2);
@@ -295,17 +304,36 @@ select:focus, input[type=number]:focus { outline: none; border-color: var(--acce
           <option value="sawtooth">Sawtooth</option>
           <option value="square">Square</option>
           <option value="sweep">Sweep</option>
+          <option value="silence">Silence</option>
           <option value="file">File</option>
         </select>
       </div>
       <div class="row" id="freqRowA">
         <span class="lbl">Freq</span>
-        <input type="number" id="freqA" value="440" min="20" max="20000" step="1">
+        <input type="number" id="freqA" value="440" min="1" max="20000" step="1">
         <span class="unit">Hz</span>
       </div>
       <div class="row" id="fileRowA" style="display:none">
         <button class="file-btn" id="fileBtnA">choose file…</button>
         <input type="file" id="fileInputA" accept="audio/*" style="display:none">
+      </div>
+      <div class="row">
+        <span class="lbl">Vol</span>
+        <input type="range" id="volA" class="vol-slider" min="0" max="1" step="0.01" value="0.8">
+      </div>
+      <div class="row">
+        <span class="lbl">Gate</span>
+        <button class="tog" id="gateTogA">Off</button>
+      </div>
+      <div class="row" id="gateRateRowA" style="display:none">
+        <span class="lbl">Rate</span>
+        <input type="number" id="gateFreqA" value="4" min="0.1" max="500" step="0.1">
+        <span class="unit">Hz</span>
+      </div>
+      <div class="row" id="gateDecayRowA" style="display:none">
+        <span class="lbl">Decay</span>
+        <input type="number" id="gateDecayA" value="50" min="0" max="2000" step="1">
+        <span class="unit">ms</span>
       </div>
     </div>
 
@@ -320,17 +348,36 @@ select:focus, input[type=number]:focus { outline: none; border-color: var(--acce
           <option value="sawtooth">Sawtooth</option>
           <option value="square">Square</option>
           <option value="sweep">Sweep</option>
+          <option value="silence">Silence</option>
           <option value="file">File</option>
         </select>
       </div>
       <div class="row" id="freqRowB">
         <span class="lbl">Freq</span>
-        <input type="number" id="freqB" value="880" min="20" max="20000" step="1">
+        <input type="number" id="freqB" value="880" min="1" max="20000" step="1">
         <span class="unit">Hz</span>
       </div>
       <div class="row" id="fileRowB" style="display:none">
         <button class="file-btn" id="fileBtnB">choose file…</button>
         <input type="file" id="fileInputB" accept="audio/*" style="display:none">
+      </div>
+      <div class="row">
+        <span class="lbl">Vol</span>
+        <input type="range" id="volB" class="vol-slider" min="0" max="1" step="0.01" value="0.8">
+      </div>
+      <div class="row">
+        <span class="lbl">Gate</span>
+        <button class="tog" id="gateTogB">Off</button>
+      </div>
+      <div class="row" id="gateRateRowB" style="display:none">
+        <span class="lbl">Rate</span>
+        <input type="number" id="gateFreqB" value="4" min="0.1" max="500" step="0.1">
+        <span class="unit">Hz</span>
+      </div>
+      <div class="row" id="gateDecayRowB" style="display:none">
+        <span class="lbl">Decay</span>
+        <input type="number" id="gateDecayB" value="50" min="0" max="2000" step="1">
+        <span class="unit">ms</span>
       </div>
     </div>
 
@@ -341,10 +388,6 @@ select:focus, input[type=number]:focus { outline: none; border-color: var(--acce
         <span class="lbl">Target</span>
         <input type="number" id="dur" value="2" min="0.1" max="10" step="0.1">
         <span class="unit">s</span>
-      </div>
-      <div class="row">
-        <span class="lbl">Levels</span>
-        <button class="tog active" id="togNorm" style="flex:1">Normalize</button>
       </div>
     </div>
 
@@ -393,6 +436,7 @@ select:focus, input[type=number]:focus { outline: none; border-color: var(--acce
     <div id="toolbar">
       <button id="playBtn" disabled>▶</button>
       <button id="loopBtn" disabled title="Loop">↺</button>
+      <canvas id="levelMeter" title="Output level"></canvas>
       <div class="tab-group">
         <button class="tab active" data-view="A">Source A</button>
         <button class="tab"        data-view="B">Source B</button>
@@ -530,7 +574,12 @@ let currentView  = 'A';   // 'A' | 'B' | 'interp'
 let streaming    = false;
 let interpPoint  = 'encoder_latents';
 let vqMode       = 'flat_swap';
-let normalizeLevel = true;
+let volumeA = 0.8;
+let volumeB = 0.8;
+let analyserNode    = null;
+let _levelCur       = 0;
+let _levelPeak      = 0;
+let _levelRAF       = null;
 
 const MAX_NQ         = 32;
 let levelAlphas      = new Array(MAX_NQ).fill(0);
@@ -598,6 +647,10 @@ const alphaDisplay = $('alphaDisplay');
 function ensureAudioCtx() {
   if (!audioCtx) {
     audioCtx = new AudioContext();
+    analyserNode = audioCtx.createAnalyser();
+    analyserNode.fftSize = 512;
+    analyserNode.smoothingTimeConstant = 0;
+    analyserNode.connect(audioCtx.destination);
     actOvl.style.display = 'none';
     scheduleFullRecalc();   // kick off generation now that audio is unlocked
   }
@@ -608,26 +661,47 @@ actOvl.addEventListener('click', ensureAudioCtx);
 // Source type visibility (A and B)
 // ═══════════════════════════════════════════════════════════════════════
 
+let gateEnabledA = false;
+let gateEnabledB = false;
+
 ['A', 'B'].forEach(id => {
-  const srcType  = $(`srcType${id}`);
-  const freqRow  = $(`freqRow${id}`);
-  const fileRow  = $(`fileRow${id}`);
-  const fileBtn  = $(`fileBtn${id}`);
-  const fileInput = $(`fileInput${id}`);
+  const srcType     = $(`srcType${id}`);
+  const freqRow     = $(`freqRow${id}`);
+  const fileRow     = $(`fileRow${id}`);
+  const fileBtn     = $(`fileBtn${id}`);
+  const fileInput   = $(`fileInput${id}`);
+  const volSlider   = $(`vol${id}`);
+  const gateTog     = $(`gateTog${id}`);
+  const gateRateRow = $(`gateRateRow${id}`);
+  const gateDecRow  = $(`gateDecayRow${id}`);
 
   srcType.addEventListener('change', () => {
     const v = srcType.value;
-    fileRow.style.display  = v === 'file'  ? '' : 'none';
-    freqRow.style.display  = (v === 'file' || v === 'sweep') ? 'none' : '';
+    fileRow.style.display = v === 'file'    ? '' : 'none';
+    freqRow.style.display = (v === 'file' || v === 'sweep' || v === 'silence') ? 'none' : '';
+    scheduleFullRecalc();
   });
   fileBtn.addEventListener('click', () => fileInput.click());
   fileInput.addEventListener('change', async () => {
     if (!fileInput.files[0]) return;
     fileBtn.textContent = fileInput.files[0].name;
-    // Bump the shared target duration if the file is longer
     const fileDur = await getAudioFileDuration(fileInput.files[0]);
     const current = parseFloat($('dur').value) || 2;
     if (fileDur > current) $('dur').value = fileDur.toFixed(2);
+    scheduleFullRecalc();
+  });
+  volSlider.addEventListener('input', () => {
+    const v = parseFloat(volSlider.value);
+    if (id === 'A') volumeA = v; else volumeB = v;
+    scheduleFullRecalc();
+  });
+  gateTog.addEventListener('click', () => {
+    const on = !(id === 'A' ? gateEnabledA : gateEnabledB);
+    if (id === 'A') gateEnabledA = on; else gateEnabledB = on;
+    gateTog.textContent = on ? 'On' : 'Off';
+    gateTog.classList.toggle('active', on);
+    gateRateRow.style.display = on ? '' : 'none';
+    gateDecRow.style.display  = on ? '' : 'none';
     scheduleFullRecalc();
   });
 });
@@ -670,13 +744,6 @@ populateBW();
 function updateFrameRowVisibility() {
   frameRow.style.display = (streaming && modelSel.value === '24k') ? '' : 'none';
 }
-
-// ── Normalize toggle ──────────────────────────────────────────────────────
-$('togNorm').addEventListener('click', () => {
-  normalizeLevel = !normalizeLevel;
-  $('togNorm').classList.toggle('active', normalizeLevel);
-  scheduleFullRecalc();
-});
 
 // ═══════════════════════════════════════════════════════════════════════
 // Interpolation point toggle
@@ -973,8 +1040,28 @@ function generateSource(srcId, durSecOverride) {
       }
       break;
     }
+    case 'silence':
+      break; // buf stays all zeros
   }
   return buf;
+}
+
+// Apply a pulse gate (amplitude envelope) to audio — used post-source.
+function applyPulseGate(audio, sr, freq, decayMs) {
+  const period = Math.max(1, Math.round(sr / Math.max(0.01, freq)));
+  const out    = new Float32Array(audio.length);
+  if (decayMs <= 0) {
+    // Pass only the first sample of each period (Dirac comb gate)
+    for (let i = 0; i < audio.length; i++)
+      out[i] = (i % period === 0) ? audio[i] : 0;
+  } else {
+    const tau = (decayMs / 1000) * sr / 5;
+    for (let i = 0; i < audio.length; i++) {
+      const phase = i % period;
+      out[i] = audio[i] * Math.exp(-phase / tau);
+    }
+  }
+  return out;
 }
 
 async function loadFile(file, sr) {
@@ -1064,10 +1151,13 @@ async function buildBothAudios(token) {
   try { audioB = await buildAligned('B', finalLen, sr); } catch (err) { throw err; }
   if (recalcToken !== token) return null;
 
-  if (normalizeLevel) {
-    audioA = normalizePeak(audioA);
-    audioB = normalizePeak(audioB);
-  }
+  // Apply per-source volume
+  if (volumeA !== 1) { const g = volumeA; audioA = audioA.map(x => x * g); }
+  if (volumeB !== 1) { const g = volumeB; audioB = audioB.map(x => x * g); }
+
+  // Apply pulse gate if enabled
+  if (gateEnabledA) audioA = applyPulseGate(audioA, sr, parseFloat($('gateFreqA').value) || 4, parseFloat($('gateDecayA').value) || 0);
+  if (gateEnabledB) audioB = applyPulseGate(audioB, sr, parseFloat($('gateFreqB').value) || 4, parseFloat($('gateDecayB').value) || 0);
 
   return { audioA, audioB };
 }
@@ -1370,7 +1460,7 @@ function startPlayback(atOffset = 0) {
   }
   playGain = audioCtx.createGain();
   playGain.gain.value = 1;
-  playGain.connect(audioCtx.destination);
+  playGain.connect(analyserNode || audioCtx.destination);
 
   playNode = audioCtx.createBufferSource();
   playNode.buffer  = buf;
@@ -1388,6 +1478,7 @@ function startPlayback(atOffset = 0) {
   drawSpec();
   animatePlayhead();
   startPipelineTimer();
+  startLevelMeter();
 }
 
 // Core audio crossfade: fade out current node, fade in currentView's audio at `offset`.
@@ -1425,7 +1516,7 @@ function _crossfadeAudioTo(offset) {
   playGain = audioCtx.createGain();
   playGain.gain.setValueAtTime(0, audioCtx.currentTime);
   playGain.gain.linearRampToValueAtTime(1, audioCtx.currentTime + CROSSFADE_S);
-  playGain.connect(audioCtx.destination);
+  playGain.connect(analyserNode || audioCtx.destination);
 
   playNode = audioCtx.createBufferSource();
   playNode.buffer  = buf;
@@ -1456,6 +1547,7 @@ function stopPlayback() {
   cancelAnimationFrame(phRAF);
   drawPlayhead(currentScrubFrac);
   stopPipelineTimer();
+  stopLevelMeter();
 }
 
 function animatePlayhead() {
@@ -2073,6 +2165,73 @@ function stopPipelineTimer() {
   drawPipeline();
 }
 
+// ── Level meter (live.gain~ style) ────────────────────────────────────────
+const _levelBuf = new Float32Array(512);
+
+function _drawLevelMeter() {
+  const cvs = $('levelMeter');
+  if (!cvs) return;
+  const dpr = window.devicePixelRatio || 1;
+  const W = 10, H = 28;
+  if (cvs.width !== Math.round(W * dpr) || cvs.height !== Math.round(H * dpr)) {
+    cvs.width  = Math.round(W * dpr);
+    cvs.height = Math.round(H * dpr);
+  }
+  const ctx = cvs.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = '#111';
+  ctx.fillRect(0, 0, W, H);
+
+  if (!analyserNode || !isPlaying) return;
+
+  analyserNode.getFloatTimeDomainData(_levelBuf);
+  let rms = 0;
+  const len = _levelBuf.length;
+  for (let i = 0; i < len; i++) rms += _levelBuf[i] * _levelBuf[i];
+  rms = Math.sqrt(rms / len);
+
+  // Ballistic: fast attack, moderate release
+  if (rms > _levelCur) _levelCur = rms * 0.9 + _levelCur * 0.1;
+  else                  _levelCur = _levelCur * 0.88;
+  if (_levelCur > _levelPeak) _levelPeak = _levelCur;
+  else                        _levelPeak = _levelPeak * 0.997;
+
+  // Map to 0-1 (linear amplitude; most signals are 0-1 range)
+  const level = Math.min(1, _levelCur);
+  const peak  = Math.min(1, _levelPeak);
+
+  const barH  = Math.round(level * H);
+  const peakY = Math.max(0, Math.round((1 - peak) * H) - 1);
+
+  // Color zones: green → yellow → red
+  const col = level > 0.85 ? '#cc4444' : level > 0.65 ? '#c8b828' : '#5cb85c';
+  ctx.fillStyle = col;
+  ctx.fillRect(1, H - barH, W - 2, barH);
+
+  // Peak hold tick
+  if (_levelPeak > 0.01) {
+    ctx.fillStyle = peak > 0.85 ? '#cc4444' : '#aaaaaa';
+    ctx.fillRect(1, peakY, W - 2, 2);
+  }
+}
+
+function startLevelMeter() {
+  if (_levelRAF) return;
+  function tick() {
+    _drawLevelMeter();
+    if (isPlaying) _levelRAF = requestAnimationFrame(tick);
+    else { _levelRAF = null; _levelCur = 0; _levelPeak = 0; _drawLevelMeter(); }
+  }
+  _levelRAF = requestAnimationFrame(tick);
+}
+
+function stopLevelMeter() {
+  if (_levelRAF) { cancelAnimationFrame(_levelRAF); _levelRAF = null; }
+  _levelCur = 0; _levelPeak = 0;
+  _drawLevelMeter();
+}
+
 // Click a VQ circle → navigate slider panel to that level and blink it
 $('pipelineCanvas').addEventListener('click', e => {
   if (interpPoint !== 'vq_codes') return;
@@ -2166,7 +2325,7 @@ new ResizeObserver(() => drawPipeline()).observe($('pipelinePanel'));
 });
 
 // Number inputs: debounce to avoid firing on every keystroke
-['freqA', 'freqB', 'dur'].forEach(id =>
+['freqA', 'freqB', 'dur', 'gateFreqA', 'gateFreqB', 'gateDecayA', 'gateDecayB'].forEach(id =>
   $(id).addEventListener('input', () => scheduleFullRecalc(500)));
 
 // (file input recalc is handled inside the async change handler in the forEach loop above)
