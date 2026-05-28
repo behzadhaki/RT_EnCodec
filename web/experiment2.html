@@ -147,33 +147,38 @@ select:focus, input[type=number]:focus { outline: none; border-color: var(--acce
 #alphaDisplay { text-align: center; font-size: 11px; color: var(--muted); white-space: nowrap; }
 #vqModeBar .toggle-row { gap: 3px; flex-wrap: nowrap; }
 
-/* ── Per-level slider grid ───────────────────────────────────────────── */
-#levelSlidersPanel {
+/* ── Level-alpha sliders panel ───────────────────────────────────────── */
+#multisliderPanel {
   flex-shrink: 0;
   background: var(--surface2); border-bottom: 1px solid var(--border);
-  padding: 5px 10px;
 }
-#levelSlidersGrid {
-  display: grid;
-  grid-template-columns: repeat(8, 1fr);
-  gap: 4px 8px;
+#scatterNav {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 1px 8px; border-bottom: 1px solid var(--border2);
+  font-size: 10px; color: var(--muted);
 }
-.level-cell {
-  display: flex; align-items: center; gap: 3px; min-width: 0;
+#scatterNav button {
+  background: none; border: none; color: var(--muted);
+  cursor: pointer; font-size: 14px; padding: 0 4px; line-height: 1.4;
 }
-.level-lbl {
-  flex-shrink: 0; color: var(--muted);
-  font-size: 10px; font-variant-numeric: tabular-nums;
-  width: 1.6em; text-align: right;
+#scatterNav button:hover:not(:disabled) { color: var(--text); }
+#scatterNav button:disabled { opacity: 0.25; cursor: default; }
+#scatterSliders { padding: 4px 8px 5px; }
+.scatter-row {
+  display: flex; align-items: center; gap: 6px; margin-bottom: 3px;
 }
-.level-slider {
-  flex: 1; min-width: 0; accent-color: var(--accent); cursor: pointer; height: 3px;
+.scatter-row:last-child { margin-bottom: 0; }
+.scatter-lbl {
+  width: 2.2em; flex-shrink: 0; text-align: right;
+  color: var(--muted); font-size: 11px;
 }
-.level-slider:disabled { opacity: 0.35; cursor: default; }
-.level-val {
-  flex-shrink: 0; color: var(--muted);
-  font-size: 10px; text-align: right; font-variant-numeric: tabular-nums;
-  width: 2.2em;
+.scatter-slider {
+  flex: 1; accent-color: var(--accent); cursor: pointer; height: 4px;
+}
+.scatter-slider:disabled { opacity: 0.35; cursor: default; }
+.scatter-val {
+  width: 2.6em; flex-shrink: 0; text-align: right;
+  color: var(--muted); font-size: 11px;
 }
 
 /* ── Right panel ────────────────────────────────────────────────────── */
@@ -400,9 +405,9 @@ select:focus, input[type=number]:focus { outline: none; border-color: var(--acce
     <div id="pipelinePanel">
       <!-- Interp-point labels — sit above the relevant diagram sections -->
       <div id="pipelineLabels">
-        <span class="ipt-label active" id="togEncLatents" data-point="encoder_latents">Interpolating Here</span>
-        <span class="ipt-label"        id="togVQCodes"    data-point="vq_codes">Click to Interpolate Here</span>
-        <span class="ipt-label"        id="togQuantEmb"   data-point="quantized_embeddings">Click to Interpolate Here</span>
+        <span class="ipt-label active" id="togEncLatents" data-point="encoder_latents"></span>
+        <span class="ipt-label"        id="togVQCodes"    data-point="vq_codes">Interpolate Here</span>
+        <span class="ipt-label"        id="togQuantEmb"   data-point="quantized_embeddings">Interpolate Here</span>
       </div>
       <canvas id="pipelineCanvas"></canvas>
       <!-- Control strip — contains α slider OR VQ mode row, positioned by JS -->
@@ -428,10 +433,8 @@ select:focus, input[type=number]:focus { outline: none; border-color: var(--acce
       </div>
     </div>
 
-    <!-- Per-level slider grid — shown below the diagram for level_swap / int_lerp -->
-    <div id="levelSlidersPanel" style="display:none">
-      <div id="levelSlidersGrid"></div>
-    </div>
+    <!-- Level-alpha sliders — shown below the diagram for level_swap / int_lerp -->
+    <div id="multisliderPanel" style="display:none"></div>
 
     <div id="specArea">
       <div id="stripWrap"><canvas id="stripCanvas"></canvas></div>
@@ -677,10 +680,10 @@ document.querySelectorAll('#pipelineLabels .ipt-label').forEach(btn => {
   btn.addEventListener('click', () => {
     document.querySelectorAll('#pipelineLabels .ipt-label').forEach(b => {
       b.classList.remove('active');
-      b.textContent = 'Click to Interpolate Here';
+      b.textContent = 'Interpolate Here';
     });
     btn.classList.add('active');
-    btn.textContent = 'Interpolating Here';
+    btn.textContent = '';
     interpPoint = btn.dataset.point;
     updateNotePanel();
     updateVqSectionVisibility();
@@ -768,72 +771,149 @@ function computeNq() {
 }
 
 function initLevelSliders() {
-  const grid = $('levelSlidersGrid');
-  grid.innerHTML = '';
+  levelAlphas.fill(0);
   levelSliderEls.length = 0;
   levelValEls.length = 0;
-  for (let k = 0; k < MAX_NQ; k++) {
-    const cell = document.createElement('div');
-    cell.className = 'level-cell';
-    cell.id = `levelRow${k}`;
-    cell.style.display = 'none';
-
-    const lbl = document.createElement('span');
-    lbl.className = 'level-lbl';
-    lbl.textContent = `L${k}`;
-
-    const slider = document.createElement('input');
-    slider.type = 'range'; slider.min = 0; slider.max = 100;
-    slider.value = 0; slider.step = 1;
-    slider.className = 'level-slider';
-    slider.disabled = true;
-
-    const val = document.createElement('span');
-    val.className = 'level-val';
-    val.textContent = '0.00';
-
-    const kk = k;
-    slider.addEventListener('input', () => {
-      const v = slider.value / 100;
-      levelAlphas[kk] = v;
-      val.textContent = v.toFixed(2);
-      if (shiftHeld) {
-        const nq = computeNq();
-        for (let i = 0; i < nq; i++) {
-          levelSliderEls[i].value = slider.value;
-          levelAlphas[i] = v;
-          levelValEls[i].textContent = v.toFixed(2);
-        }
-      }
-      drawPipeline();
-    });
-    slider.addEventListener('change', () => scheduleInterpRecalc());
-
-    cell.appendChild(lbl);
-    cell.appendChild(slider);
-    cell.appendChild(val);
-    grid.appendChild(cell);
-    levelSliderEls.push(slider);
-    levelValEls.push(val);
-  }
 }
 
 function updateLevelSliders() {
-  const nq      = computeNq();
-  const enabled = !!(decodedA && decodedB);
-  for (let k = 0; k < MAX_NQ; k++) {
-    $(`levelRow${k}`).style.display = k < nq ? '' : 'none';
-    levelSliderEls[k].disabled = !enabled;
+  drawMultislider();
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Level-alpha sliders — up to 4 visible, navigator for more.
+// Shift+input moves all levels (including hidden ones).
+// Moving a slider pulses the matching VQ circle via _activeLevel.
+// ═══════════════════════════════════════════════════════════════════════
+
+let _activeLevel   = null;   // level currently being moved (drives pipeline blink)
+let _scatterOffset = 0;      // index of first visible level
+let _scatterRAF    = null;
+
+function _startScatterLoop() {
+  if (_scatterRAF) return;
+  function tick() {
+    if (_activeLevel === null) { _scatterRAF = null; return; }
+    drawPipeline();
+    _scatterRAF = requestAnimationFrame(tick);
   }
+  _scatterRAF = requestAnimationFrame(tick);
+}
+
+function _stopScatterLoop() {
+  if (_scatterRAF) { cancelAnimationFrame(_scatterRAF); _scatterRAF = null; }
+  _activeLevel = null;
+  drawPipeline();
+}
+
+function drawMultislider() {
+  const nq    = computeNq();
+  const panel = $('multisliderPanel');
+  if (!panel || !nq) return;
+
+  _scatterOffset = Math.max(0, Math.min(_scatterOffset, Math.max(0, nq - 4)));
+  panel.innerHTML = '';
+
+  // ── navigator (only when nq > 4) ──
+  if (nq > 4) {
+    const end = Math.min(_scatterOffset + 3, nq - 1);
+    const nav = document.createElement('div');
+    nav.id = 'scatterNav';
+
+    const prev = document.createElement('button');
+    prev.textContent = '‹'; prev.disabled = (_scatterOffset === 0);
+    prev.addEventListener('click', () => {
+      _scatterOffset = Math.max(0, _scatterOffset - 4);
+      drawMultislider();
+    });
+
+    const lbl = document.createElement('span');
+    lbl.textContent = `L${_scatterOffset} – L${end}`;
+
+    const next = document.createElement('button');
+    next.textContent = '›'; next.disabled = (end >= nq - 1);
+    next.addEventListener('click', () => {
+      _scatterOffset = Math.min(nq - 4, _scatterOffset + 4);
+      drawMultislider();
+    });
+
+    nav.appendChild(prev); nav.appendChild(lbl); nav.appendChild(next);
+    panel.appendChild(nav);
+  }
+
+  // ── slider rows ──
+  const rows    = document.createElement('div');
+  rows.id       = 'scatterSliders';
+  const count   = Math.min(4, nq - _scatterOffset);
+  const enabled = !!(decodedA && decodedB);
+
+  for (let i = 0; i < count; i++) {
+    const k     = _scatterOffset + i;
+    const alpha = levelAlphas[k] ?? 0;
+
+    const row = document.createElement('div');
+    row.className = 'scatter-row';
+
+    const lbl = document.createElement('span');
+    lbl.className = 'scatter-lbl';
+    lbl.textContent = `L${k}`;
+
+    const slider = document.createElement('input');
+    slider.type = 'range'; slider.min = 0; slider.max = 100; slider.step = 1;
+    slider.value = Math.round(alpha * 100);
+    slider.className = 'scatter-slider';
+    slider.disabled = !enabled;
+
+    const valEl = document.createElement('span');
+    valEl.className = 'scatter-val';
+    valEl.textContent = alpha.toFixed(2);
+
+    const kk = k;
+    slider.addEventListener('input', () => {
+      const v  = slider.value / 100;
+      const nq2 = computeNq();
+      if (shiftHeld) {
+        for (let j = 0; j < nq2; j++) levelAlphas[j] = v;
+        // update all visible displays
+        rows.querySelectorAll('.scatter-slider').forEach(s  => { s.value = Math.round(v * 100); });
+        rows.querySelectorAll('.scatter-val')   .forEach(vd => { vd.textContent = v.toFixed(2); });
+      } else {
+        levelAlphas[kk] = v;
+        valEl.textContent = v.toFixed(2);
+      }
+      _activeLevel = kk;
+      _startScatterLoop();
+    });
+
+    slider.addEventListener('change', () => {
+      scheduleInterpRecalc();
+      setTimeout(() => { if (_activeLevel === kk) _stopScatterLoop(); }, 500);
+    });
+
+    row.addEventListener('mouseenter', () => {
+      _activeLevel = kk;
+      _startScatterLoop();
+    });
+    row.addEventListener('mouseleave', () => {
+      if (_activeLevel === kk) _stopScatterLoop();
+    });
+
+    row.appendChild(lbl);
+    row.appendChild(slider);
+    row.appendChild(valEl);
+    rows.appendChild(row);
+  }
+
+  panel.appendChild(rows);
 }
 
 function updateVqSectionVisibility() {
   const isVQ       = interpPoint === 'vq_codes';
   const usesLevels = isVQ && (vqMode === 'level_swap' || vqMode === 'int_lerp');
-  $('vqModeBar').style.display           = isVQ       ? '' : 'none';
-  $('levelSlidersPanel').style.display   = usesLevels ? '' : 'none';
-  $('mainSliderSection').style.display   = usesLevels ? 'none' : '';
-  if (usesLevels) updateLevelSliders();
+  $('vqModeBar').style.display          = isVQ       ? '' : 'none';
+  $('multisliderPanel').style.display   = usesLevels ? '' : 'none';
+  $('mainSliderSection').style.display  = usesLevels ? 'none' : '';
+  if (usesLevels) drawMultislider();
   positionPipelineControls();
 }
 
@@ -1629,7 +1709,6 @@ function positionPipelineControls() {
   const panelW = $('pipelinePanel').clientWidth;
   if (!panelW) return;
 
-  // Mirror the proportions used in drawPipeline()
   const pcts = [7, 2.5, 11, 2, 3, 2, 5, 2, 13, 2, 11, 2, 3, 2, 11, 2.5, 6];
   const tot  = pcts.reduce((a, b) => a + b, 0);
   const padX = 10;
@@ -1639,20 +1718,49 @@ function positionPipelineControls() {
   function secWidth(i)  { return pcts[i] / tot * usW; }
   function secCenter(i) { return secLeft(i) + secWidth(i) / 2; }
 
-  // α slider: center on active tensor section (4 = enc_latents, 12 = quant_emb)
-  const sliderW = Math.max(180, Math.min(260, secWidth(2) + secWidth(3) + secWidth(4) + secWidth(5) + secWidth(6)));
-  const sliderSec = interpPoint === 'quantized_embeddings' ? 12 : 4;
-  const sliderLeft = Math.max(0, secCenter(sliderSec) - sliderW / 2);
-  const sl = $('mainSliderSection');
-  sl.style.left  = sliderLeft + 'px';
-  sl.style.width = sliderW + 'px';
+  const isVQ       = interpPoint === 'vq_codes';
+  const usesLevels = isVQ && (vqMode === 'level_swap' || vqMode === 'int_lerp');
+  const stackedVQ  = isVQ && !usesLevels;  // flat_swap or frame_swap: both controls visible, stacked
 
-  // VQ mode row: span the circles section (8)
+  const ctrl = $('pipelineCtrl');
+  ctrl.style.height = stackedVQ ? '74px' : '42px';
+
+  const sl = $('mainSliderSection');
+  const vq = $('vqModeBar');
+
   const vqW    = Math.max(220, secWidth(8));
   const vqLeft = Math.max(0, secCenter(8) - vqW / 2);
-  const vq = $('vqModeBar');
   vq.style.left  = vqLeft + 'px';
   vq.style.width = vqW + 'px';
+
+  if (stackedVQ) {
+    // VQ mode buttons at top, α slider below — both centred on the circles section
+    vq.style.top       = '4px';
+    vq.style.transform = 'none';
+
+    sl.style.left      = vqLeft + 'px';
+    sl.style.width     = vqW + 'px';
+    sl.style.top       = '40px';
+    sl.style.transform = 'none';
+  } else {
+    // Default: each element vertically centred in the strip
+    vq.style.top       = '50%';
+    vq.style.transform = 'translateY(-50%)';
+
+    const sliderW   = Math.max(180, Math.min(260, secWidth(2) + secWidth(3) + secWidth(4) + secWidth(5) + secWidth(6)));
+    const sliderSec = interpPoint === 'quantized_embeddings' ? 12 : 4;
+    sl.style.left      = Math.max(0, secCenter(sliderSec) - sliderW / 2) + 'px';
+    sl.style.width     = sliderW + 'px';
+    sl.style.top       = '50%';
+    sl.style.transform = 'translateY(-50%)';
+  }
+
+  // Level slider panel — same width as VQ mode selector, centred on section 8
+  {
+    const ms = $('multisliderPanel');
+    ms.style.width      = vqW + 'px';
+    ms.style.marginLeft = vqLeft + 'px';
+  }
 
   // Interp-point labels above the diagram
   $('togEncLatents').style.left = secCenter(4)  + 'px';
@@ -1895,15 +2003,19 @@ function drawPipeline() {
     const gridX = dbX + (dbW - gridW) / 2;
     const gridY = dbY + padI;
 
+    const _pipeNow = performance.now();
     for (let k = 0; k < Nq; k++) {
       const col  = k % cols;
       const row  = Math.floor(k / cols);
       const cx2  = gridX + col * (circD + colGap) + circR;
       const cy2  = gridY + row * (circD + rowGap) + circR;
+      const isHL = k === _activeLevel;
+      const pulse = isHL ? 0.5 + 0.5 * Math.sin(2 * Math.PI * _pipeNow / 400) : 0;
       ctx.fillStyle = (vqActive && ready) ? getVQCircleColor(k, currentScrubFrac) : '#484848';
-      ctx.beginPath(); ctx.arc(cx2, cy2, circR, 0, 2 * Math.PI);
+      ctx.beginPath(); ctx.arc(cx2, cy2, isHL ? circR * (1 + 0.35 * pulse) : circR, 0, 2 * Math.PI);
       ctx.fill();
-      ctx.strokeStyle = '#1a1a1a'; ctx.lineWidth = 0.5;
+      ctx.strokeStyle = isHL ? `rgba(255,210,100,${0.5 + pulse * 0.5})` : '#1a1a1a';
+      ctx.lineWidth   = isHL ? 1.5 : 0.5;
       ctx.stroke();
     }
 
