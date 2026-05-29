@@ -1001,6 +1001,42 @@ async function deltaTransfer48k(capsA, capsB, applyPoint, mode, strength, startF
   return outBuf;
 }
 
+function runGetEmbDeltas(msg) {
+  const { applyPoint = 'encoder_latents' } = msg;
+  const capsB = captureCache.B;
+  if (!capsB) return;
+
+  // Collect all caps across modes
+  let caps;
+  if (capsB.mode === 'single')  caps = [capsB.cap];
+  else if (capsB.mode === 'ola48') caps = capsB.segments.map(s => s.cap);
+  else                             caps = capsB.chunks.map(c => c.cap);
+
+  const C  = getCapEmb(caps[0], applyPoint).dims[1];
+  const Ts = caps.map(cap => getCapEmb(cap, applyPoint).dims[2]);
+  const totalT = Ts.reduce((a, b) => a + b, 0);
+
+  // Concatenate embeddings along T
+  const full = new Float32Array(C * totalT);
+  let tOff = 0;
+  for (let i = 0; i < caps.length; i++) {
+    const { emb, dims } = getCapEmb(caps[i], applyPoint);
+    const T = dims[2];
+    for (let c = 0; c < C; c++)
+      for (let t = 0; t < T; t++)
+        full[c * totalT + tOff + t] = emb[c * T + t];
+    tOff += T;
+  }
+
+  // Compute frame deltas: delta[c,0] = 0, delta[c,t] = full[c,t] - full[c,t-1]
+  const deltas = new Float32Array(C * totalT);
+  for (let c = 0; c < C; c++)
+    for (let t = 1; t < totalT; t++)
+      deltas[c * totalT + t] = full[c * totalT + t] - full[c * totalT + t - 1];
+
+  self.postMessage({ type: 'emb_deltas', data: deltas, C, T: totalT }, [deltas.buffer]);
+}
+
 // ---------------------------------------------------------------------------
 // Message dispatcher
 // ---------------------------------------------------------------------------
@@ -1031,6 +1067,10 @@ self.onmessage = (e) => {
       // Experiment3: dynamics transfer using cached captures
       currentJobId = msg.jobId;
       runDeltaTransfer(msg);
+      break;
+    case 'get_emb_deltas':
+      // Experiment3: return B embedding frame deltas for visualization (does not cancel jobs)
+      runGetEmbDeltas(msg);
       break;
     case 'cancel':
       currentJobId = -1;

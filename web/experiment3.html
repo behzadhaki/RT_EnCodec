@@ -124,6 +124,7 @@
         <button class="tab active" data-view="A">Source A</button>
         <button class="tab"        data-view="B">Source B</button>
         <button class="tab"        data-view="interp">Modified</button>
+        <button class="tab"        data-view="delta_b">ΔB</button>
       </div>
       <span id="statusBar">Click to enable audio.</span>
       <div id="progressWrap"><div id="progressBar"></div></div>
@@ -132,7 +133,8 @@
     <div id="legend">
       <span id="lgA"><span class="ldot" style="background:#c87800"></span>Source A (plasma)</span>
       <span id="lgB" style="display:none"><span class="ldot" style="background:#2090c0"></span>Source B (ocean)</span>
-      <span id="lgI" style="display:none"><span class="ldot" style="background:#ff4400"></span>Modified (hot)</span>
+      <span id="lgI"  style="display:none"><span class="ldot" style="background:#ff4400"></span>Modified (hot)</span>
+      <span id="lgDB" style="display:none"><span class="ldot" style="background:#5090e0"></span>B deltas (diverging)</span>
     </div>
 
     <div id="pipelinePanel">
@@ -200,8 +202,11 @@ import {
   generateSource, applyPulseGate, loadFile, getAudioFileDuration, loopToLength, MAX_S,
 } from './lib/audio-utils.js';
 import {
-  computeSTFT, stftToOffscreen, drawStrip as _drawStrip, PLASMA, OCEAN, HOT,
+  computeSTFT, stftToOffscreen, drawStrip as _drawStrip, PLASMA, OCEAN, HOT, cmap,
 } from './lib/stft.js';
+
+// Diverging colormap for embedding deltas: blue (negative) → black (zero) → orange (positive)
+const DELTA = [[0,80,220],[0,20,60],[12,12,12],[60,20,0],[220,90,0]];
 
 // ═══════════════════════════════════════════════════════════════════════
 // Config
@@ -303,7 +308,8 @@ let modAudio  = null;
 
 let bufA = null, bufB = null, bufMod = null;
 let stftA = null, stftB = null, stftMod = null;
-let offA  = null, offB  = null, offMod  = null;
+let offA  = null, offB  = null, offMod  = null, offDeltaB = null;
+let deltaBRaw = null;  // { data: Float32Array, C, T }
 
 let currentView  = 'A';
 let applyPoint   = 'encoder_latents';
@@ -369,7 +375,7 @@ const phCvs          = $('playheadCanvas');
 const stripCvs       = $('stripCanvas');
 const actOvl         = $('activationOverlay');
 const notePanel      = $('notePanel');
-const lgA = $('lgA'), lgB = $('lgB'), lgI = $('lgI');
+const lgA = $('lgA'), lgB = $('lgB'), lgI = $('lgI'), lgDB = $('lgDB');
 const strengthSlider  = $('strengthSlider');
 const strengthDisplay = $('strengthDisplay');
 const onsetSlider     = $('onsetSlider');
@@ -410,6 +416,8 @@ document.querySelectorAll('#pipelineLabels .ipt-label').forEach(btn => {
     positionPipelineControls();
     drawPipeline();
     scheduleDeltaRecalc();
+    offDeltaB = null;
+    requestEmbDeltas();
   });
 });
 
@@ -478,8 +486,9 @@ document.querySelectorAll('.tab').forEach(tab => tab.addEventListener('click', (
   if (stftA && !offA) offA = makeOffscreen(stftA, PLASMA);
   if (stftB && !offB) offB = makeOffscreen(stftB, OCEAN);
   if (stftMod && !offMod) offMod = makeOffscreen(stftMod, HOT);
-  const oldOff = currentView === 'A' ? offA : currentView === 'B' ? offB : offMod;
-  const newOff = newView    === 'A' ? offA : newView    === 'B' ? offB : offMod;
+  if (deltaBRaw && !offDeltaB) offDeltaB = makeDeltaOffscreen(deltaBRaw);
+  const oldOff = viewToOff(currentView);
+  const newOff = viewToOff(newView);
 
   document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.view === newView));
   currentView = newView;
@@ -502,9 +511,10 @@ function setView(v) {
 }
 
 function updateLegend() {
-  lgA.style.display = currentView === 'A'      ? '' : 'none';
-  lgB.style.display = currentView === 'B'      ? '' : 'none';
-  lgI.style.display = currentView === 'interp' ? '' : 'none';
+  lgA.style.display  = currentView === 'A'       ? '' : 'none';
+  lgB.style.display  = currentView === 'B'       ? '' : 'none';
+  lgI.style.display  = currentView === 'interp'  ? '' : 'none';
+  lgDB.style.display = currentView === 'delta_b' ? '' : 'none';
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -532,13 +542,26 @@ function updateNotePanel() {
 
 function initWorker() {
   if (worker) worker.terminate();
-  worker = new Worker('encodec-worker.js?v=8');
+  worker = new Worker('encodec-worker.js?v=9');
   worker.postMessage({ type: 'init', modelsBaseUrl: MODELS_BASE });
   worker.onmessage = onWorkerMsg;
 }
 
+function requestEmbDeltas() {
+  if (!worker) return;
+  worker.postMessage({ type: 'get_emb_deltas', applyPoint });
+}
+
 function onWorkerMsg(e) {
   const msg = e.data;
+
+  if (msg.type === 'emb_deltas') {
+    deltaBRaw = { data: msg.data, C: msg.C, T: msg.T };
+    offDeltaB = makeDeltaOffscreen(deltaBRaw);
+    if (currentView === 'delta_b') drawSpec();
+    return;
+  }
+
   if (msg.jobId !== activeJobId) return;
 
   if (msg.type === 'progress') {
@@ -579,6 +602,7 @@ function onWorkerMsg(e) {
       else drawSpec();
       if (!isPlaying) setView('A');
       triggerDeltaTransfer();
+      requestEmbDeltas();
 
     } else if (encodePhase === 'delta') {
       const prevOff = offMod;
@@ -928,6 +952,55 @@ function makeOffscreen(stft, stops) {
                : stftToOffscreen(stft, stops);
 }
 
+function makeDeltaOffscreen({ data, C, T }) {
+  let maxAbs = 0;
+  for (let i = 0; i < data.length; i++) { const a = Math.abs(data[i]); if (a > maxAbs) maxAbs = a; }
+  if (maxAbs === 0) maxAbs = 1;
+  const off = document.createElement('canvas');
+  off.width = T; off.height = C;
+  const ctx = off.getContext('2d');
+  const img = ctx.createImageData(T, C);
+  for (let c = 0; c < C; c++) {
+    for (let t = 0; t < T; t++) {
+      const u = (data[c * T + t] / maxAbs + 1) / 2;  // map [-1,1] → [0,1]
+      const [r, g, b] = cmap(u, DELTA);
+      const px = ((C - 1 - c) * T + t) * 4;
+      img.data[px] = r; img.data[px+1] = g; img.data[px+2] = b; img.data[px+3] = 255;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  return off;
+}
+
+function drawDeltaStrip() {
+  if (!deltaBRaw) return;
+  const { data, C, T } = deltaBRaw;
+  const cW = Math.round(stripCvs.clientWidth  * dpr) || Math.round(2.5 * 16 * dpr);
+  const cH = Math.round(stripCvs.clientHeight * dpr) || 400;
+  stripCvs.width = cW; stripCvs.height = cH;
+  const ctx = stripCvs.getContext('2d');
+  ctx.clearRect(0, 0, cW, cH);
+  // Compute mean |delta| per channel for the bar profile.
+  let maxMean = 0;
+  const means = new Float32Array(C);
+  for (let c = 0; c < C; c++) {
+    let sum = 0;
+    for (let t = 0; t < T; t++) sum += Math.abs(data[c * T + t]);
+    means[c] = sum / T;
+    if (means[c] > maxMean) maxMean = means[c];
+  }
+  if (maxMean === 0) maxMean = 1;
+  for (let c = 0; c < C; c++) {
+    const t    = means[c] / maxMean;
+    const [r, g, b] = cmap(t, DELTA.slice().reverse());  // use warm end for activity
+    const y    = (1 - (c + 0.5) / C) * cH;
+    const barH = Math.ceil(cH / C) + 1;
+    const barW = Math.max(1, t * cW * 0.85);
+    ctx.fillStyle = `rgb(${r},${g},${b})`;
+    ctx.fillRect(cW - barW, y, barW, barH);
+  }
+}
+
 function drawSpec() {
   if (specFadeRAF && specFadeView === currentView) return;
 
@@ -941,17 +1014,26 @@ function drawSpec() {
   if (stftA   && !offA)   offA   = makeOffscreen(stftA,   PLASMA);
   if (stftB   && !offB)   offB   = makeOffscreen(stftB,   OCEAN);
   if (stftMod && !offMod) offMod = makeOffscreen(stftMod, HOT);
+  if (deltaBRaw && !offDeltaB) offDeltaB = makeDeltaOffscreen(deltaBRaw);
 
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = 'high';
 
-  const off = currentView === 'A' ? offA : currentView === 'B' ? offB : offMod;
+  const off = viewToOff(currentView);
   if (off) ctx.drawImage(off, 0, 0, cW, cH);
 
   drawStrip();
 }
 
+function viewToOff(v) {
+  if (v === 'A')       return offA;
+  if (v === 'B')       return offB;
+  if (v === 'delta_b') return offDeltaB;
+  return offMod;
+}
+
 function drawStrip() {
+  if (currentView === 'delta_b') { drawDeltaStrip(); return; }
   const stft  = currentView === 'A' ? stftA : currentView === 'B' ? stftB : stftMod;
   const stops = currentView === 'A' ? PLASMA : currentView === 'B' ? OCEAN : HOT;
   _drawStrip(stripCvs, stft, stops, dpr);
