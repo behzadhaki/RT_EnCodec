@@ -43,10 +43,10 @@
 /* ── Pipeline panel ──────────────────────────────────────────────────── */
 #pipelinePanel {
   flex-shrink: 0; position: relative;
-  background: var(--surface2); border-bottom: 1px solid var(--border); overflow: hidden;
+  background: var(--surface2); border-bottom: 1px solid var(--border);
 }
 #pipelineCanvas { display: block; width: 100%; height: 75px; }
-#pipelineCtrl { position: relative; height: 84px; border-top: 1px solid var(--border2); }
+#pipelineCtrl { position: relative; height: 128px; border-top: 1px solid var(--border2); }
 
 /* ── Delta controls ──────────────────────────────────────────────────── */
 #deltaCtrlSection {
@@ -94,6 +94,27 @@
 .dual-range-wrap input[type=range]::-moz-range-thumb {
   pointer-events: auto; width: 12px; height: 12px; border-radius: 50%;
   background: var(--accent); cursor: pointer; border: none;
+}
+
+/* ── SVD scree panel ─────────────────────────────────────────────────── */
+#svdScreeWrap {
+  display: none;
+  height: 46px;
+  border-top: 1px solid var(--border2);
+  position: relative;
+  background: var(--surface2);
+}
+#svdScreeCanvas {
+  display: block; width: 100%; height: 100%; cursor: pointer;
+}
+#svdScreeLabel {
+  position: absolute; top: 3px; left: 6px;
+  font-size: 9px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--muted); pointer-events: none;
+}
+#svdActiveCount {
+  position: absolute; top: 3px; right: 8px;
+  font-size: 9px; color: var(--muted); pointer-events: none;
 }
 
 /* ── Norm toggle ─────────────────────────────────────────────────────── */
@@ -163,16 +184,42 @@
             <input type="range" id="onsetSlider" min="0" max="100" value="0" step="1">
             <span class="delta-val" id="onsetDisplay">0 %</span>
           </div>
-          <div class="delta-row">
-            <span class="delta-lbl">Dims</span>
-            <div class="dual-range-wrap" id="dimsWrap">
-              <div class="dual-range-track"><div class="dual-range-fill" id="dimsFill"></div></div>
-              <input type="range" id="dimsLo" min="0" max="127" value="0"   step="1">
-              <input type="range" id="dimsHi" min="0" max="127" value="127" step="1">
+          <div class="delta-row" id="methodRow">
+            <span class="delta-lbl">Method</span>
+            <div class="toggle-row" id="methodToggleRow" style="flex:1">
+              <button class="tog active" data-method="raw">Raw</button>
+              <button class="tog"        data-method="svd">SVD</button>
             </div>
-            <span class="delta-val" id="dimsDisplay">all</span>
+          </div>
+          <div class="delta-row" id="meanRow">
+            <span class="delta-lbl">|Δ| range</span>
+            <div class="dual-range-wrap" id="meanWrap">
+              <div class="dual-range-track"><div class="dual-range-fill" id="meanFill"></div></div>
+              <input type="range" id="meanLo" min="0" max="100" value="0"   step="1">
+              <input type="range" id="meanHi" min="0" max="100" value="100" step="1">
+            </div>
+            <span class="delta-val" id="meanDisplay">all</span>
+          </div>
+          <div class="delta-row" id="varRow">
+            <span class="delta-lbl">Var range</span>
+            <div class="dual-range-wrap" id="varWrap">
+              <div class="dual-range-track"><div class="dual-range-fill" id="varFill"></div></div>
+              <input type="range" id="varLo" min="0" max="100" value="0"   step="1">
+              <input type="range" id="varHi" min="0" max="100" value="100" step="1">
+            </div>
+            <span class="delta-val" id="varDisplay">all</span>
+          </div>
+          <div class="delta-row" id="compsRow" style="display:none">
+            <span class="delta-lbl">Comps</span>
+            <input type="range" id="compsSlider" min="1" max="128" value="8" step="1" style="flex:1;accent-color:var(--accent);cursor:pointer;height:4px">
+            <span class="delta-val" id="compsDisplay">8</span>
           </div>
         </div>
+      </div>
+      <div id="svdScreeWrap">
+        <span id="svdScreeLabel">Components</span>
+        <span id="svdActiveCount"></span>
+        <canvas id="svdScreeCanvas"></canvas>
       </div>
       <label id="normToggle" title="Shared scale: use same dB range for all spectrograms">
         <input type="checkbox" id="sharedScaleChk"> Shared scale
@@ -233,9 +280,9 @@ const MODE_NOTES = {
     'out[t] = A[t] + strength × Σ ΔB. ' +
     "A's embeddings drift along B's trajectory in the latent space.",
   anchored:
-    '<strong>Anchored.</strong> A is frozen at the onset frame; B drives from that same point: ' +
-    'out[t] = A[onset] + strength × (B[t] − B[onset]). ' +
-    "The output follows B's shape but is anchored to A's timbre at onset.",
+    '<strong>Anchored.</strong> A continues naturally; B\'s displacement from its onset is added on top: ' +
+    'out[t] = A[t] + strength × (B[t] − B[onset]). ' +
+    "When B is silent the output is unchanged A. When B is active, A is shifted along B's trajectory from its onset.",
 };
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -316,8 +363,16 @@ let applyPoint   = 'encoder_latents';
 let transferMode = 'per_frame';
 let strengthVal  = 1.0;
 let onsetFrac    = 0.0;
-let dimLo        = 0;
-let dimHi        = 127;
+let meanLoPct    = 0;
+let meanHiPct    = 100;
+let varLoPct     = 0;
+let varHiPct     = 100;
+let perChanMeanDelta = null;  // Float32Array(C)
+let perChanVariance  = null;  // Float32Array(C)
+let svdMode           = false;
+let nComponents       = 8;
+let svdSingularValues = null; // Float32Array(C)
+let compMask          = null; // Uint8Array(C) — per-component on/off in SVD mode
 let sharedScale  = false;
 let shiftHeld    = false;
 
@@ -380,11 +435,23 @@ const strengthSlider  = $('strengthSlider');
 const strengthDisplay = $('strengthDisplay');
 const onsetSlider     = $('onsetSlider');
 const onsetDisplay    = $('onsetDisplay');
-const dimsLoInput     = $('dimsLo');
-const dimsHiInput     = $('dimsHi');
-const dimsFill        = $('dimsFill');
-const dimsDisplay     = $('dimsDisplay');
+const meanLoInput  = $('meanLo');
+const meanHiInput  = $('meanHi');
+const meanFillEl   = $('meanFill');
+const meanDisplay  = $('meanDisplay');
+const varLoInput   = $('varLo');
+const varHiInput   = $('varHi');
+const varFillEl    = $('varFill');
+const varDisplay   = $('varDisplay');
 const sharedScaleChk  = $('sharedScaleChk');
+const meanRow        = $('meanRow');
+const varRow         = $('varRow');
+const compsRow       = $('compsRow');
+const compsSlider    = $('compsSlider');
+const compsDisplay   = $('compsDisplay');
+const svdScreeWrap   = $('svdScreeWrap');
+const svdScreeCvs    = $('svdScreeCanvas');
+const svdActiveCount = $('svdActiveCount');
 
 // ═══════════════════════════════════════════════════════════════════════
 // Audio context (user-gesture gated)
@@ -449,31 +516,130 @@ onsetSlider.addEventListener('input', () => {
 });
 onsetSlider.addEventListener('change', () => scheduleDeltaRecalc());
 
-function updateDimsUI() {
-  const lo = parseInt(dimsLoInput.value);
-  const hi = parseInt(dimsHiInput.value);
-  const pct = v => (v / 127) * 100;
-  dimsFill.style.left  = pct(lo) + '%';
-  dimsFill.style.width = (pct(hi) - pct(lo)) + '%';
-  dimsDisplay.textContent = (lo === 0 && hi === 127) ? 'all' : `${lo}–${hi}`;
-  // When handles overlap at max, bring lo on top so it can be dragged left.
-  dimsLoInput.style.zIndex = (lo >= hi) ? 2 : 1;
+function fmt(v) { return parseFloat(v.toPrecision(3)).toString(); }
+
+function updateDimDisplays() {
+  if (perChanMeanDelta) {
+    const maxMean = perChanMeanDelta.reduce((m, v) => Math.max(m, v), 0);
+    meanDisplay.textContent = `(${fmt(meanLoPct/100*maxMean)}, ${fmt(meanHiPct/100*maxMean)})`;
+  } else {
+    meanDisplay.textContent = 'all';
+  }
+  if (perChanVariance) {
+    const maxVar = perChanVariance.reduce((m, v) => Math.max(m, v), 0);
+    varDisplay.textContent = `(${fmt(varLoPct/100*maxVar)}, ${fmt(varHiPct/100*maxVar)})`;
+  } else {
+    varDisplay.textContent = 'all';
+  }
 }
-dimsLoInput.addEventListener('input', () => {
-  if (parseInt(dimsLoInput.value) > parseInt(dimsHiInput.value))
-    dimsLoInput.value = dimsHiInput.value;
-  dimLo = parseInt(dimsLoInput.value);
-  updateDimsUI();
+
+function updateDualRange(loInput, hiInput, fillEl, setLo, setHi) {
+  const lo = parseInt(loInput.value);
+  const hi = parseInt(hiInput.value);
+  fillEl.style.left    = lo + '%';
+  fillEl.style.width   = (hi - lo) + '%';
+  loInput.style.zIndex = (lo >= hi) ? 2 : 1;
+  setLo(lo); setHi(hi);
+  updateDimDisplays();
+}
+
+function setupDualRange(loInput, hiInput, fillEl, setLo, setHi) {
+  loInput.addEventListener('input', () => {
+    if (parseInt(loInput.value) > parseInt(hiInput.value)) loInput.value = hiInput.value;
+    updateDualRange(loInput, hiInput, fillEl, setLo, setHi);
+    refreshDeltaViz();
+  });
+  hiInput.addEventListener('input', () => {
+    if (parseInt(hiInput.value) < parseInt(loInput.value)) hiInput.value = loInput.value;
+    updateDualRange(loInput, hiInput, fillEl, setLo, setHi);
+    refreshDeltaViz();
+  });
+  loInput.addEventListener('change', () => scheduleDeltaRecalc());
+  hiInput.addEventListener('change', () => scheduleDeltaRecalc());
+}
+
+function computeDimMask() {
+  if (!perChanMeanDelta || !perChanVariance) return null;
+  const C = perChanMeanDelta.length;
+  const maxMean = perChanMeanDelta.reduce((m, v) => Math.max(m, v), 0) || 1;
+  const maxVar  = perChanVariance.reduce((m, v) => Math.max(m, v), 0) || 1;
+  const mask = new Uint8Array(C);
+  for (let c = 0; c < C; c++) {
+    const mPct = (perChanMeanDelta[c] / maxMean) * 100;
+    const vPct = (perChanVariance[c]  / maxVar)  * 100;
+    mask[c] = (mPct >= meanLoPct && mPct <= meanHiPct &&
+               vPct >= varLoPct  && vPct <= varHiPct) ? 1 : 0;
+  }
+  return mask;
+}
+
+setupDualRange(meanLoInput, meanHiInput, meanFillEl, v => meanLoPct = v, v => meanHiPct = v);
+setupDualRange(varLoInput,  varHiInput,  varFillEl,  v => varLoPct  = v, v => varHiPct  = v);
+updateDualRange(meanLoInput, meanHiInput, meanFillEl, v => meanLoPct = v, v => meanHiPct = v);
+updateDualRange(varLoInput,  varHiInput,  varFillEl,  v => varLoPct  = v, v => varHiPct  = v);
+
+function applyMethodVisibility() {
+  meanRow.style.display    = svdMode ? 'none' : '';
+  varRow.style.display     = svdMode ? 'none' : '';
+  compsRow.style.display   = svdMode ? '' : 'none';
+  svdScreeWrap.style.display = svdMode ? 'block' : 'none';
+  if (svdMode) drawSvdScree();
+  if (deltaBRaw) {
+    offDeltaB = makeDeltaOffscreen(deltaBRaw, svdMode ? null : computeDimMask());
+    if (currentView === 'delta_b') drawSpec();
+  }
+  if (currentView === 'delta_b') drawStrip();
+}
+
+function drawSvdScree() {
+  if (!svdSingularValues) return;
+  const C   = svdSingularValues.length;
+  const cW  = Math.round(svdScreeCvs.clientWidth  * dpr);
+  const cH  = Math.round(svdScreeCvs.clientHeight * dpr);
+  if (!cW || !cH) return;
+  svdScreeCvs.width = cW; svdScreeCvs.height = cH;
+  const ctx = svdScreeCvs.getContext('2d');
+  ctx.clearRect(0, 0, cW, cH);
+
+  const maxS   = svdSingularValues[0] || 1;
+  const barW   = cW / C;
+  let activeN  = 0;
+  for (let k = 0; k < C; k++) {
+    const active = compMask ? compMask[k] : (k < nComponents);
+    if (active) activeN++;
+    const barH = Math.max(1, (svdSingularValues[k] / maxS) * (cH - 2));
+    ctx.fillStyle = active ? '#c8902a' : '#333';
+    ctx.fillRect(k * barW, cH - barH, Math.max(1, barW - 1), barH);
+    // bright top cap on active bars
+    if (active) {
+      ctx.fillStyle = 'rgba(255,200,80,0.7)';
+      ctx.fillRect(k * barW, cH - barH, Math.max(1, barW - 1), Math.min(2 * dpr, barH));
+    }
+  }
+  svdActiveCount.textContent = `${activeN} / ${C}`;
+}
+
+document.querySelectorAll('#methodToggleRow .tog').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('#methodToggleRow .tog').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    svdMode = btn.dataset.method === 'svd';
+    applyMethodVisibility();
+    scheduleDeltaRecalc();
+  });
 });
-dimsHiInput.addEventListener('input', () => {
-  if (parseInt(dimsHiInput.value) < parseInt(dimsLoInput.value))
-    dimsHiInput.value = dimsLoInput.value;
-  dimHi = parseInt(dimsHiInput.value);
-  updateDimsUI();
+
+compsSlider.addEventListener('input', () => {
+  nComponents = parseInt(compsSlider.value);
+  compsDisplay.textContent = nComponents;
+  if (compMask) {
+    compMask.fill(0);
+    for (let k = 0; k < nComponents && k < compMask.length; k++) compMask[k] = 1;
+  }
+  drawSvdScree();
+  if (currentView === 'delta_b') drawStrip();
 });
-dimsLoInput.addEventListener('change', () => scheduleDeltaRecalc());
-dimsHiInput.addEventListener('change', () => scheduleDeltaRecalc());
-updateDimsUI();
+compsSlider.addEventListener('change', () => scheduleDeltaRecalc());
 
 // ═══════════════════════════════════════════════════════════════════════
 // View tabs
@@ -486,7 +652,7 @@ document.querySelectorAll('.tab').forEach(tab => tab.addEventListener('click', (
   if (stftA && !offA) offA = makeOffscreen(stftA, PLASMA);
   if (stftB && !offB) offB = makeOffscreen(stftB, OCEAN);
   if (stftMod && !offMod) offMod = makeOffscreen(stftMod, HOT);
-  if (deltaBRaw && !offDeltaB) offDeltaB = makeDeltaOffscreen(deltaBRaw);
+  if (deltaBRaw && !offDeltaB) offDeltaB = makeDeltaOffscreen(deltaBRaw, computeDimMask());
   const oldOff = viewToOff(currentView);
   const newOff = viewToOff(newView);
 
@@ -542,7 +708,7 @@ function updateNotePanel() {
 
 function initWorker() {
   if (worker) worker.terminate();
-  worker = new Worker('encodec-worker.js?v=9');
+  worker = new Worker('encodec-worker.js?v=20');
   worker.postMessage({ type: 'init', modelsBaseUrl: MODELS_BASE });
   worker.onmessage = onWorkerMsg;
 }
@@ -556,8 +722,23 @@ function onWorkerMsg(e) {
   const msg = e.data;
 
   if (msg.type === 'emb_deltas') {
-    deltaBRaw = { data: msg.data, C: msg.C, T: msg.T };
-    offDeltaB = makeDeltaOffscreen(deltaBRaw);
+    const { data, variance, C, T, svdS } = msg;
+    deltaBRaw = { data, variance, C, T };
+    perChanMeanDelta = new Float32Array(C);
+    for (let c = 0; c < C; c++) {
+      let sum = 0;
+      for (let t = 0; t < T; t++) sum += Math.abs(data[c * T + t]);
+      perChanMeanDelta[c] = sum / T;
+    }
+    perChanVariance  = variance;
+    svdSingularValues = svdS || null;
+    if (svdS) {
+      compMask = new Uint8Array(svdS.length);
+      for (let k = 0; k < nComponents && k < compMask.length; k++) compMask[k] = 1;
+      if (svdMode) drawSvdScree();
+    }
+    offDeltaB = makeDeltaOffscreen(deltaBRaw, computeDimMask());
+    updateDimDisplays();
     if (currentView === 'delta_b') drawSpec();
     return;
   }
@@ -756,18 +937,20 @@ function triggerDeltaTransfer() {
   setStatus(`Applying ${transferMode.replace(/_/g,' ')} delta…`);
 
   worker.postMessage({
-    type:       'delta_transfer',
-    jobId:      activeJobId,
-    modelHz:    mp.getModelHz(),
-    bwKbps:     mp.getBwKbps(),
-    streaming:  mp.isStreaming(),
-    frameSize:  mp.getFrameSize(),
+    type:        'delta_transfer',
+    jobId:       activeJobId,
+    modelHz:     mp.getModelHz(),
+    bwKbps:      mp.getBwKbps(),
+    streaming:   mp.isStreaming(),
+    frameSize:   mp.getFrameSize(),
     applyPoint,
-    mode:       transferMode,
-    strength:   strengthVal,
-    startFrac:  onsetFrac,
-    dimLo,
-    dimHi,
+    mode:        transferMode,
+    strength:    strengthVal,
+    startFrac:   onsetFrac,
+    dimMask:     svdMode ? null : computeDimMask(),
+    svdMode,
+    nComponents,
+    svdCompMask: svdMode ? compMask : null,
   });
 }
 
@@ -953,9 +1136,13 @@ function makeOffscreen(stft, stops) {
                : stftToOffscreen(stft, stops);
 }
 
-function makeDeltaOffscreen({ data, C, T }) {
+function makeDeltaOffscreen({ data, C, T }, mask) {
+  // Normalise using only active channels so the colormap fills the selected range.
   let maxAbs = 0;
-  for (let i = 0; i < data.length; i++) { const a = Math.abs(data[i]); if (a > maxAbs) maxAbs = a; }
+  for (let c = 0; c < C; c++) {
+    if (mask && !mask[c]) continue;
+    for (let t = 0; t < T; t++) { const a = Math.abs(data[c * T + t]); if (a > maxAbs) maxAbs = a; }
+  }
   if (maxAbs === 0) maxAbs = 1;
   const off = document.createElement('canvas');
   off.width = T; off.height = C;
@@ -963,43 +1150,70 @@ function makeDeltaOffscreen({ data, C, T }) {
   const img = ctx.createImageData(T, C);
   for (let c = 0; c < C; c++) {
     for (let t = 0; t < T; t++) {
-      const u = (data[c * T + t] / maxAbs + 1) / 2;  // map [-1,1] → [0,1]
-      const [r, g, b] = cmap(u, DELTA);
       const px = ((C - 1 - c) * T + t) * 4;
-      img.data[px] = r; img.data[px+1] = g; img.data[px+2] = b; img.data[px+3] = 255;
+      if (mask && !mask[c]) {
+        img.data[px] = 255; img.data[px+1] = 255; img.data[px+2] = 255; img.data[px+3] = 255;
+      } else {
+        const u = (data[c * T + t] / maxAbs + 1) / 2;
+        const [r, g, b] = cmap(u, DELTA);
+        img.data[px] = r; img.data[px+1] = g; img.data[px+2] = b; img.data[px+3] = 255;
+      }
     }
   }
   ctx.putImageData(img, 0, 0);
   return off;
 }
 
+function refreshDeltaViz() {
+  if (!deltaBRaw) return;
+  offDeltaB = makeDeltaOffscreen(deltaBRaw, computeDimMask());
+  if (currentView === 'delta_b') drawSpec();
+}
+
 function drawDeltaStrip() {
   if (!deltaBRaw) return;
-  const { data, C, T } = deltaBRaw;
   const cW = Math.round(stripCvs.clientWidth  * dpr) || Math.round(2.5 * 16 * dpr);
   const cH = Math.round(stripCvs.clientHeight * dpr) || 400;
   stripCvs.width = cW; stripCvs.height = cH;
   const ctx = stripCvs.getContext('2d');
   ctx.clearRect(0, 0, cW, cH);
-  // Compute mean |delta| per channel for the bar profile.
-  let maxMean = 0;
-  const means = new Float32Array(C);
+
+  // Left=mean|Δ|, right=variance (always shown regardless of SVD mode).
+  const { data, variance, C, T } = deltaBRaw;
+  const meanDelta = new Float32Array(C);
+  let maxDelta = 0;
   for (let c = 0; c < C; c++) {
     let sum = 0;
     for (let t = 0; t < T; t++) sum += Math.abs(data[c * T + t]);
-    means[c] = sum / T;
-    if (means[c] > maxMean) maxMean = means[c];
+    meanDelta[c] = sum / T;
+    if (meanDelta[c] > maxDelta) maxDelta = meanDelta[c];
   }
-  if (maxMean === 0) maxMean = 1;
+  if (maxDelta === 0) maxDelta = 1;
+
+  let maxVar = 0;
+  if (variance) for (let c = 0; c < C; c++) if (variance[c] > maxVar) maxVar = variance[c];
+  if (maxVar === 0) maxVar = 1;
+
+  const half = cW / 2;
   for (let c = 0; c < C; c++) {
-    const t    = means[c] / maxMean;
-    const [r, g, b] = cmap(t, DELTA.slice().reverse());  // use warm end for activity
     const y    = (1 - (c + 0.5) / C) * cH;
     const barH = Math.ceil(cH / C) + 1;
-    const barW = Math.max(1, t * cW * 0.85);
-    ctx.fillStyle = `rgb(${r},${g},${b})`;
-    ctx.fillRect(cW - barW, y, barW, barH);
+
+    const td = meanDelta[c] / maxDelta;
+    const [rd, gd, bd] = cmap(0.5 + td * 0.5, DELTA);
+    ctx.fillStyle = `rgb(${rd},${gd},${bd})`;
+    ctx.fillRect(0, y, Math.max(1, td * half), barH);
+
+    if (variance) {
+      const tv = variance[c] / maxVar;
+      const [rv, gv, bv] = cmap(0.5 - tv * 0.5, DELTA);
+      ctx.fillStyle = `rgb(${rv},${gv},${bv})`;
+      ctx.fillRect(half, y, Math.max(1, tv * half), barH);
+    }
   }
+
+  ctx.fillStyle = 'rgba(255,255,255,0.15)';
+  ctx.fillRect(half - 1, 0, 1, cH);
 }
 
 function drawSpec() {
@@ -1015,7 +1229,7 @@ function drawSpec() {
   if (stftA   && !offA)   offA   = makeOffscreen(stftA,   PLASMA);
   if (stftB   && !offB)   offB   = makeOffscreen(stftB,   OCEAN);
   if (stftMod && !offMod) offMod = makeOffscreen(stftMod, HOT);
-  if (deltaBRaw && !offDeltaB) offDeltaB = makeDeltaOffscreen(deltaBRaw);
+  if (deltaBRaw && !offDeltaB) offDeltaB = makeDeltaOffscreen(deltaBRaw, computeDimMask());
 
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = 'high';
@@ -1107,7 +1321,20 @@ function clearPlayhead() {
 // ═══════════════════════════════════════════════════════════════════════
 
 new ResizeObserver(() => { offA = offB = offMod = null; drawSpec(); }).observe($('specWrap'));
-new ResizeObserver(() => positionPipelineControls()).observe($('pipelinePanel'));
+new ResizeObserver(() => { positionPipelineControls(); if (svdMode) drawSvdScree(); }).observe($('pipelinePanel'));
+
+// SVD scree canvas: click to toggle a component on/off.
+svdScreeCvs.addEventListener('click', e => {
+  if (!svdSingularValues || !compMask) return;
+  const rect = svdScreeCvs.getBoundingClientRect();
+  const xFrac = (e.clientX - rect.left) / rect.width;
+  const C = svdSingularValues.length;
+  const k = Math.floor(xFrac * C);
+  if (k < 0 || k >= C) return;
+  compMask[k] = compMask[k] ? 0 : 1;
+  drawSvdScree();
+  scheduleDeltaRecalc();
+});
 
 // ═══════════════════════════════════════════════════════════════════════
 // Pipeline control positioning

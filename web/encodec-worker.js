@@ -585,13 +585,17 @@ async function encodeAndCapture24k(audio, streaming, frameSize, jobId) {
   return [outBuf, { mode: 'ola24', stride, seg, win, totalLen, chunks }];
 }
 
-// 48k is always stateless per segment (matches interpRun48k behaviour).
+// 48k uses stateful encoder and decoder so that LSTM context is continuous across
+// segment boundaries, eliminating embedding jumps at every STRIDE_48 boundary.
 async function encodeAndCapture48k(audio, jobId) {
   const totalLen = audio.length;
   const outBuf   = new Float32Array(totalLen);
   const wgtBuf   = new Float32Array(totalLen);
   const numSegs  = Math.ceil(totalLen / STRIDE_48);
   const segments = [];
+
+  let hEnc = zeroState(1), cEnc = zeroState(1);
+  let hDec = zeroState(1), cDec = zeroState(1);
 
   for (let s = 0; s < numSegs; s++) {
     if (currentJobId !== jobId) return [null, null];
@@ -600,10 +604,13 @@ async function encodeAndCapture48k(audio, jobId) {
     const chunk  = new Float32Array(SEG_48);
     chunk.set(audio.subarray(offset, offset + SEG_48));
 
-    const cap = await encodeCapture(chunk, '48k', zeroState(1), zeroState(1));
+    const cap = await encodeCapture(chunk, '48k', hEnc, cEnc);
+    hEnc = cap.hEncNew; cEnc = cap.cEncNew;
+
     const dec = await decodeFromLatents(
       cap.emb_quant, cap.embQuantDims, cap.scale, cap.scaleDims,
-      '48k', zeroState(1), zeroState(1));
+      '48k', hDec, cDec);
+    hDec = dec.hDecNew; cDec = dec.cDecNew;
 
     const validEnd = Math.min(offset + SEG_48, totalLen);
     segments.push({ cap, offset, validEnd });
@@ -756,14 +763,17 @@ async function interpFromCached48k(capsA, capsB, alpha, interpPoint, vqMode, lev
 // anchorAFrame, anchorBFrame: Float32Array(C), pre-populated by caller for 'anchored' mode.
 //   anchorAFrame[c] = A's embedding at the global onset frame.
 //   anchorBFrame[c] = B's embedding at the global onset frame.
-function applyDeltaTransfer(embA, embB, C, TA, TB, mode, strength, startFrame, accumState, anchorAFrame, anchorBFrame, dimLo, dimHi) {
+// filtDelta: optional Float32Array(C × TB) of pre-computed SVD-projected deltas.
+// When provided, replaces per-frame B delta computation in all modes.
+// For anchored mode with filtDelta, uses cumulative integration from onset rather than
+// absolute B value difference (since filtDelta is already expressed as deltas, not absolutes).
+function applyDeltaTransfer(embA, embB, C, TA, TB, mode, strength, startFrame, accumState, anchorAFrame, anchorBFrame, dimMask, filtDelta = null) {
   const out = new Float32Array(C * TA);
   for (let c = 0; c < C; c++) {
-    // Channels outside the selected dim range: in anchored mode freeze to A[onset]
-    // after onset, otherwise pass A through unchanged.
-    if (c < dimLo || c > dimHi) {
+    // Inactive channels always pass A through unchanged (all modes).
+    if (dimMask && !dimMask[c]) {
       for (let t = 0; t < TA; t++)
-        out[c * TA + t] = (mode === 'anchored' && t >= startFrame) ? anchorAFrame[c] : embA[c * TA + t];
+        out[c * TA + t] = embA[c * TA + t];
       continue;
     }
     for (let t = 0; t < TA; t++) {
@@ -772,17 +782,26 @@ function applyDeltaTransfer(embA, embB, C, TA, TB, mode, strength, startFrame, a
         continue;
       }
       const tRelB = (t - startFrame) % TB;
-      // delta[0] = 0 (no prior B frame at the start of each B cycle)
-      const delta = tRelB === 0 ? 0
-                  : embB[c * TB + tRelB] - embB[c * TB + (tRelB - 1)];
+      const delta = filtDelta ? filtDelta[c * TB + tRelB]
+                  : (tRelB === 0 ? 0 : embB[c * TB + tRelB] - embB[c * TB + (tRelB - 1)]);
       if (mode === 'per_frame') {
         out[c * TA + t] = embA[c * TA + t] + strength * delta;
       } else if (mode === 'cumulative') {
         accumState[c] += delta;
         out[c * TA + t] = embA[c * TA + t] + strength * accumState[c];
       } else {
-        // anchored: out[t] = A[onset] + strength × (B[t] − B[onset])
-        out[c * TA + t] = anchorAFrame[c] + strength * (embB[c * TB + tRelB] - anchorBFrame[c]);
+        // anchored: freeze A at its onset embedding, then follow B's trajectory from
+        // B's onset value.
+        // out[t] = A[onset] + strength × (B[t] − B[onset])
+        // A's motion is completely replaced by B's dynamics starting from onset.
+        // When B is silent (B[t] ≈ B[onset]) the output is a static A-onset embedding —
+        // this is expected behaviour; use per_frame if you want A to continue when B is quiet.
+        if (filtDelta) {
+          accumState[c] += delta;
+          out[c * TA + t] = anchorAFrame[c] + strength * accumState[c];
+        } else {
+          out[c * TA + t] = anchorAFrame[c] + strength * (embB[c * TB + tRelB] - anchorBFrame[c]);
+        }
       }
     }
   }
@@ -791,11 +810,11 @@ function applyDeltaTransfer(embA, embB, C, TA, TB, mode, strength, startFrame, a
 
 async function decodeWithDelta(embA, dimsA, embB, dimsB,
                                mode, strength, startFrame, accumState, anchorAFrame, anchorBFrame,
-                               dimLo, dimHi,
+                               dimMask, filtDelta,
                                applyPoint, modelHz, scale, scaleDims, hDec, cDec) {
   const [, C, TA] = dimsA;
   const [, , TB]  = dimsB;
-  const outEmb = applyDeltaTransfer(embA, embB, C, TA, TB, mode, strength, startFrame, accumState, anchorAFrame, anchorBFrame, dimLo, dimHi);
+  const outEmb = applyDeltaTransfer(embA, embB, C, TA, TB, mode, strength, startFrame, accumState, anchorAFrame, anchorBFrame, dimMask, filtDelta);
 
   let finalEmb = outEmb, finalDims = dimsA.slice();
   if (applyPoint === 'encoder_latents') {
@@ -816,7 +835,7 @@ function getCapEmb(cap, applyPoint) {
 async function runDeltaTransfer(msg) {
   const { jobId, modelHz, bwKbps, streaming, frameSize,
           applyPoint, mode, strength, startFrac,
-          dimLo = 0, dimHi = 127 } = msg;
+          dimMask = null, svdMode = false, nComponents = 8, svdCompMask = null } = msg;
 
   try {
     self.postMessage({ type: 'progress', jobId, value: 0, status: 'Loading models…' });
@@ -829,9 +848,30 @@ async function runDeltaTransfer(msg) {
       return;
     }
 
+    const svd = capsB.svd;
+    let filtDeltaFull = null;
+    if (svdMode && svd) {
+      // Convert component mask to sorted index list
+      const activeComps = [];
+      if (svdCompMask) {
+        for (let k = 0; k < svdCompMask.length; k++)
+          if (svdCompMask[k]) activeComps.push(k);
+      } else {
+        for (let k = 0; k < Math.min(nComponents, svd.C); k++) activeComps.push(k);
+      }
+      // Always set filtDeltaFull in SVD mode so applyDeltaTransfer never falls back
+      // to raw B deltas. Zero array = no B influence when nothing is selected.
+      filtDeltaFull = activeComps.length > 0
+        ? computeFiltDeltaFull(svd.U, svd.deltas, svd.C, svd.totalT, activeComps)
+        : new Float32Array(svd.C * svd.totalT);
+    }
+    const svdTotalT = svd ? svd.totalT : 0;
+    // SVD mode handles all channels via projection — per-channel mask is irrelevant
+    const activeMask = svdMode ? null : dimMask;
+
     const decoded = capsA.mode === 'ola48'
-      ? await deltaTransfer48k(capsA, capsB, applyPoint, mode, strength, startFrac, dimLo, dimHi, jobId)
-      : await deltaTransfer24k(capsA, capsB, applyPoint, mode, strength, startFrac, dimLo, dimHi, jobId);
+      ? await deltaTransfer48k(capsA, capsB, applyPoint, mode, strength, startFrac, activeMask, filtDeltaFull, svdTotalT, jobId)
+      : await deltaTransfer24k(capsA, capsB, applyPoint, mode, strength, startFrac, activeMask, filtDeltaFull, svdTotalT, jobId);
 
     if (decoded === null) return;
     self.postMessage({ type: 'result', jobId, decoded }, [decoded.buffer]);
@@ -844,7 +884,7 @@ async function runDeltaTransfer(msg) {
 // Both 24k (75 fr/s) and 48k (150 fr/s) encode one frame per 320 audio samples.
 const SAMPLES_PER_EMB_FRAME = 320;
 
-async function deltaTransfer24k(capsA, capsB, applyPoint, mode, strength, startFrac, dimLo, dimHi, jobId) {
+async function deltaTransfer24k(capsA, capsB, applyPoint, mode, strength, startFrac, dimMask, filtDeltaFull, svdTotalT, jobId) {
   if (capsA.mode === 'single') {
     const { emb: embA, dims: dimsA } = getCapEmb(capsA.cap, applyPoint);
     const { emb: embB, dims: dimsB } = getCapEmb(capsB.cap, applyPoint);
@@ -863,9 +903,10 @@ async function deltaTransfer24k(capsA, capsB, applyPoint, mode, strength, startF
     }
 
     self.postMessage({ type: 'progress', jobId, value: 0.5, status: 'Applying delta…' });
+    // In single mode filtDeltaFull spans the full B sequence (same as TB), use directly
     const dec = await decodeWithDelta(
       embA, dimsA, embB, dimsB, mode, strength, startFrame, accum, anchorAFrame, anchorBFrame,
-      dimLo, dimHi,
+      dimMask, filtDeltaFull,
       applyPoint, '24k', capsA.cap.scale, capsA.cap.scaleDims, zeroState(1), zeroState(1));
     if (currentJobId !== jobId) return null;
 
@@ -886,6 +927,7 @@ async function deltaTransfer24k(capsA, capsB, applyPoint, mode, strength, startF
   const anchorBFrame = new Float32Array(C);
   const totalFramesA = Math.round(totalLen / SAMPLES_PER_EMB_FRAME);
   let globalFrameA = 0;
+  let bGlobalOff   = 0;
   let anchorSet = false;
   let hDec = zeroState(1), cDec = zeroState(1);
 
@@ -914,9 +956,14 @@ async function deltaTransfer24k(capsA, capsB, applyPoint, mode, strength, startF
       anchorSet = true;
     }
 
+    const filtDeltaChunk = filtDeltaFull
+      ? sliceFiltDelta(filtDeltaFull, C, svdTotalT, bGlobalOff, TB)
+      : null;
+    bGlobalOff = svdTotalT > 0 ? (bGlobalOff + TB) % svdTotalT : 0;
+
     const dec = await decodeWithDelta(
       embA, dimsA, embB, dimsB, mode, strength, chunkStartFrame, accum, anchorAFrame, anchorBFrame,
-      dimLo, dimHi,
+      dimMask, filtDeltaChunk,
       applyPoint, '24k', capA.scale, capA.scaleDims, hDec, cDec);
     hDec = dec.hDecNew; cDec = dec.cDecNew;
 
@@ -939,7 +986,7 @@ async function deltaTransfer24k(capsA, capsB, applyPoint, mode, strength, startF
   return outBuf;
 }
 
-async function deltaTransfer48k(capsA, capsB, applyPoint, mode, strength, startFrac, dimLo, dimHi, jobId) {
+async function deltaTransfer48k(capsA, capsB, applyPoint, mode, strength, startFrac, dimMask, filtDeltaFull, svdTotalT, jobId) {
   const { totalLen, segments: segsA } = capsA;
   const { segments: segsB } = capsB;
   const outBuf = new Float32Array(totalLen);
@@ -951,7 +998,12 @@ async function deltaTransfer48k(capsA, capsB, applyPoint, mode, strength, startF
   const anchorBFrame = new Float32Array(C);
   const totalFramesA = Math.round(totalLen / SAMPLES_PER_EMB_FRAME);
   let globalFrameA = 0;
+  let bGlobalOff   = 0;
   let anchorSet = false;
+  // Carry decoder LSTM state across segments (matches deltaTransfer24k behaviour).
+  // Without this, each segment cold-starts, causing periodic transient artefacts
+  // at every segment boundary (every STRIDE_48 = 43200 samples ≈ 0.9 s).
+  let hDec = zeroState(1), cDec = zeroState(1);
 
   for (let s = 0; s < segsA.length; s++) {
     if (currentJobId !== jobId) return null;
@@ -978,10 +1030,16 @@ async function deltaTransfer48k(capsA, capsB, applyPoint, mode, strength, startF
       anchorSet = true;
     }
 
+    const filtDeltaChunk = filtDeltaFull
+      ? sliceFiltDelta(filtDeltaFull, C, svdTotalT, bGlobalOff, TB)
+      : null;
+    bGlobalOff = svdTotalT > 0 ? (bGlobalOff + TB) % svdTotalT : 0;
+
     const dec = await decodeWithDelta(
       embA, dimsA, embB, dimsB, mode, strength, chunkStartFrame, accum, anchorAFrame, anchorBFrame,
-      dimLo, dimHi,
-      applyPoint, '48k', capA.scale, capA.scaleDims, zeroState(1), zeroState(1));
+      dimMask, filtDeltaChunk,
+      applyPoint, '48k', capA.scale, capA.scaleDims, hDec, cDec);
+    hDec = dec.hDecNew; cDec = dec.cDecNew;
 
     for (let i = 0; i < validEnd - offset; i++) {
       outBuf[offset + i] += TRI_WIN_48[i] * dec.outAudio[i];
@@ -999,6 +1057,87 @@ async function deltaTransfer48k(capsA, capsB, applyPoint, mode, strength, startF
     if (wgtBuf[i] > 0) outBuf[i] /= wgtBuf[i];
   }
   return outBuf;
+}
+
+// ---------------------------------------------------------------------------
+// SVD helpers (experiment3)
+// ---------------------------------------------------------------------------
+
+// Jacobi cyclic eigendecomposition for a real symmetric n×n matrix.
+// Returns { eigenvalues: Float32Array(n), eigenvectors: Float32Array(n×n) }
+// sorted by descending eigenvalue. eigenvectors[:,k] is the k-th eigenvector.
+function symmetricEigen(flatA, n) {
+  const A = flatA.slice();
+  const V = new Float32Array(n * n);
+  for (let i = 0; i < n; i++) V[i * n + i] = 1.0;
+
+  for (let sweep = 0; sweep < 30; sweep++) {
+    let offNorm = 0;
+    for (let p = 0; p < n; p++)
+      for (let q = p + 1; q < n; q++)
+        offNorm += A[p*n+q] * A[p*n+q];
+    if (offNorm < 1e-20) break;
+
+    for (let p = 0; p < n - 1; p++) {
+      for (let q = p + 1; q < n; q++) {
+        const Apq = A[p*n+q];
+        if (Math.abs(Apq) < 1e-12) continue;
+        const App = A[p*n+p], Aqq = A[q*n+q];
+        const tau = (Aqq - App) / (2 * Apq);
+        const t   = (tau >= 0 ? 1 : -1) / (Math.abs(tau) + Math.sqrt(1 + tau*tau));
+        const c   = 1 / Math.sqrt(1 + t*t), s = t * c;
+        A[p*n+p] = App - t*Apq; A[q*n+q] = Aqq + t*Apq;
+        A[p*n+q] = A[q*n+p] = 0;
+        for (let r = 0; r < n; r++) {
+          if (r === p || r === q) continue;
+          const Arp = A[r*n+p], Arq = A[r*n+q];
+          A[r*n+p] = A[p*n+r] = c*Arp - s*Arq;
+          A[r*n+q] = A[q*n+r] = s*Arp + c*Arq;
+        }
+        for (let r = 0; r < n; r++) {
+          const Vrp = V[r*n+p], Vrq = V[r*n+q];
+          V[r*n+p] = c*Vrp - s*Vrq;
+          V[r*n+q] = s*Vrp + c*Vrq;
+        }
+      }
+    }
+  }
+
+  const order = Array.from({ length: n }, (_, i) => i).sort((a, b) => A[b*n+b] - A[a*n+a]);
+  const eigenvalues  = new Float32Array(n);
+  const eigenvectors = new Float32Array(n * n);
+  for (let k = 0; k < n; k++) {
+    eigenvalues[k] = Math.max(0, A[order[k]*n+order[k]]);
+    for (let r = 0; r < n; r++) eigenvectors[r*n+k] = V[r*n+order[k]];
+  }
+  return { eigenvalues, eigenvectors };
+}
+
+// Project delta sequence onto selected eigenvectors and reconstruct.
+// U: Float32Array(C×C) eigenvectors column-major (each column = one direction)
+// deltas: Float32Array(C×totalT)
+// activeComps: number[] — sorted list of component indices to include
+// Returns filtered Float32Array(C×totalT).
+function computeFiltDeltaFull(U, deltas, C, totalT, activeComps) {
+  const filt = new Float32Array(C * totalT);
+  for (const k of activeComps) {
+    if (k < 0 || k >= C) continue;
+    for (let t = 0; t < totalT; t++) {
+      let coeff = 0;
+      for (let c = 0; c < C; c++) coeff += U[c*C+k] * deltas[c*totalT+t];
+      for (let c = 0; c < C; c++) filt[c*totalT+t] += U[c*C+k] * coeff;
+    }
+  }
+  return filt;
+}
+
+// Extract a TB-wide chunk of filtDeltaFull starting at bOff (wrapping at svdTotalT).
+function sliceFiltDelta(filtDeltaFull, C, svdTotalT, bOff, TB) {
+  const chunk = new Float32Array(C * TB);
+  for (let c = 0; c < C; c++)
+    for (let t = 0; t < TB; t++)
+      chunk[c * TB + t] = filtDeltaFull[c * svdTotalT + (bOff + t) % svdTotalT];
+  return chunk;
 }
 
 function runGetEmbDeltas(msg) {
@@ -1034,7 +1173,51 @@ function runGetEmbDeltas(msg) {
     for (let t = 1; t < totalT; t++)
       deltas[c * totalT + t] = full[c * totalT + t] - full[c * totalT + t - 1];
 
-  self.postMessage({ type: 'emb_deltas', data: deltas, C, T: totalT }, [deltas.buffer]);
+  // For OLA modes, each segment is encoded independently (stateless), so the
+  // embedding value at t=T_segment_end and t=T_segment_start+1 are unrelated.
+  // The resulting cross-segment delta would be a large artificial jump that
+  // corrupts the covariance/SVD and shows up as periodic banding artefacts.
+  // Zero them out so SVD components only capture within-segment dynamics.
+  if (capsB.mode === 'ola48' || capsB.mode === 'ola24') {
+    let tBoundary = 0;
+    for (let i = 0; i < caps.length - 1; i++) {
+      tBoundary += Ts[i];
+      for (let c = 0; c < C; c++)
+        deltas[c * totalT + tBoundary] = 0;
+    }
+  }
+
+  // Compute per-channel variance of the raw embeddings.
+  const variance = new Float32Array(C);
+  for (let c = 0; c < C; c++) {
+    let sum = 0;
+    for (let t = 0; t < totalT; t++) sum += full[c * totalT + t];
+    const mean = sum / totalT;
+    let sq = 0;
+    for (let t = 0; t < totalT; t++) { const d = full[c * totalT + t] - mean; sq += d * d; }
+    variance[c] = sq / totalT;
+  }
+
+  // Covariance of deltas: cov[i,j] = Σ_t delta[i,t]·delta[j,t] / totalT
+  const cov = new Float32Array(C * C);
+  for (let i = 0; i < C; i++) {
+    for (let j = i; j < C; j++) {
+      let s = 0;
+      for (let t = 0; t < totalT; t++) s += deltas[i*totalT+t] * deltas[j*totalT+t];
+      cov[i*C+j] = cov[j*C+i] = s / totalT;
+    }
+  }
+  const { eigenvalues, eigenvectors } = symmetricEigen(cov, C);
+  const svdS = new Float32Array(C);
+  for (let k = 0; k < C; k++) svdS[k] = Math.sqrt(eigenvalues[k]);
+
+  // Cache for SVD-mode transfer (deltas NOT transferred so worker retains the reference)
+  captureCache.B.svd = { U: eigenvectors, deltas, C, totalT };
+
+  self.postMessage(
+    { type: 'emb_deltas', data: deltas, variance, C, T: totalT, svdS },
+    [variance.buffer, svdS.buffer]
+  );
 }
 
 // ---------------------------------------------------------------------------
