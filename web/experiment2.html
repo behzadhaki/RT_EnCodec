@@ -4,153 +4,90 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>EnCodec — Latent Space Interpolation</title>
+<link rel="stylesheet" href="encodec.css">
 <style>
-/* ── Design tokens ───────────────────────────────────────────────────── */
-:root {
-  --bg:        #1a1a1a;
-  --surface:   #222222;
-  --surface2:  #282828;
-  --border:    #333333;
-  --border2:   #3a3a3a;
-  --accent:    #c8902a;
-  --accent-lo: #7a5418;
-  --text:      #d0d0d0;
-  --muted:     #aaaaaa;
-  --red:       #cc4444;
-  --lbl-w:     4.8em;
-}
-* { box-sizing: border-box; margin: 0; padding: 0; }
-html, body { height: 100%; background: var(--bg); color: var(--text);
-             font: 13px/1.4 system-ui, sans-serif; overflow: hidden; }
+/* ── experiment2-specific overrides & additions ─────────────────────── */
+:root { --lbl-w: 4.8em; }
+#frame { grid-template-columns: 230px 1fr; }
 
-/* ── Top-level layout ───────────────────────────────────────────────── */
-#frame {
-  display: grid;
-  grid-template-columns: 230px 1fr;
-  height: 100vh;
+#loopBtn {
+  width: 28px; height: 28px; border-radius: 4px; cursor: pointer;
+  background: var(--accent-lo); border: 1px solid var(--accent);
+  color: var(--text); font-size: 20px;
+  display: flex; align-items: center; justify-content: center;
 }
+#loopBtn:hover { filter: brightness(1.2); }
+#loopBtn:disabled { opacity: 0.4; cursor: default; filter: none; }
+#loopBtn.active { background: var(--accent); color: #000; }
 
-/* ── Left panel ─────────────────────────────────────────────────────── */
-#controls {
-  background: var(--surface);
-  border-right: 1px solid var(--border);
-  overflow-y: auto;
-  display: flex;
-  flex-direction: column;
+#levelMeter {
+  width: 10px; height: 28px; flex-shrink: 0;
+  border-radius: 2px; border: 1px solid var(--border2);
+  background: #111; display: block;
 }
-.section {
-  padding: 0.5em 0.7em;
-  border-bottom: 1px solid var(--border);
-}
-.section-title {
-  font-size: 10px; font-weight: 700; letter-spacing: 0.1em;
-  text-transform: uppercase; color: var(--muted); margin-bottom: 0.45em;
-}
-.row {
-  display: flex; align-items: center; gap: 0.4em; margin-bottom: 0.28em;
-}
-.row:last-child { margin-bottom: 0; }
-.lbl { width: var(--lbl-w); flex-shrink: 0; color: var(--muted); font-size: 12px; }
-.unit { color: var(--muted); font-size: 11px; }
-
-select, input[type=number] {
-  flex: 1; min-width: 0;
-  background: #1c1c1c; border: 1px solid var(--border2);
-  color: var(--text); padding: 2px 4px; border-radius: 3px;
-  font-size: 12px; box-shadow: inset 0 1px 2px rgba(0,0,0,.4);
-}
-select:focus, input[type=number]:focus { outline: none; border-color: var(--accent); }
-
-.file-btn {
-  flex: 1; background: #1c1c1c; border: 1px solid var(--border2);
-  color: var(--muted); padding: 2px 6px; border-radius: 3px;
-  font-size: 11px; cursor: pointer; text-align: left;
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-}
-.file-btn:hover { border-color: var(--accent); color: var(--text); }
-
-.toggle-row { display: flex; gap: 3px; }
-.tog {
-  flex: 1; background: #1c1c1c; border: 1px solid var(--border2);
-  color: var(--muted); padding: 3px 0; border-radius: 3px;
-  font-size: 10px; cursor: pointer; text-align: center;
-}
-.tog.active { background: var(--accent-lo); border-color: var(--accent); color: var(--text); }
-.tog:hover:not(.active) { color: var(--text); }
-.tog:disabled { opacity: 0.4; cursor: default; }
-.tog:disabled:hover { color: var(--muted); }
-
 
 /* ── Interpolation slider ────────────────────────────────────────────── */
 .interp-slider-row {
-  display: flex; align-items: center; gap: 0.5em;
-  margin-bottom: 0.3em;
+  display: flex; align-items: center; gap: 0.5em; margin-bottom: 0.3em;
 }
-.interp-end {
-  font-size: 11px; font-weight: 700; color: var(--text);
-  flex-shrink: 0;
-}
-#interpSlider {
-  flex: 1; accent-color: var(--accent); cursor: pointer;
-  height: 4px;
-}
+.interp-end { font-size: 11px; font-weight: 700; color: var(--text); flex-shrink: 0; }
+#interpSlider, #scaleSlider { flex: 1; accent-color: var(--accent); cursor: pointer; height: 4px; }
 #interpSlider:disabled { opacity: 0.35; cursor: default; }
-#alphaDisplay {
-  text-align: center; font-size: 11px; color: var(--muted);
-}
+#alphaDisplay { text-align: center; font-size: 11px; color: var(--muted); }
+#scaleSliderRow { position: absolute; gap: 6px; margin: 0; }
 
-/* ── Interp-point labels (above pipeline diagram) ────────────────────── */
-/* Labels float over the top of the pipeline canvas, inside the panel */
+/* ── Interp-point labels ─────────────────────────────────────────────── */
 #pipelineLabels {
-  position: absolute;
-  top: 4px; left: 0; right: 0;
+  position: absolute; top: 4px; left: 0; right: 0;
   z-index: 1; pointer-events: none;
 }
 .ipt-label {
-  position: absolute;
-  top: 0; transform: translateX(-50%);
+  position: absolute; top: 0; transform: translateX(-50%);
   font-size: 10px; font-weight: 600; letter-spacing: 0.04em;
   white-space: nowrap; cursor: pointer; user-select: none;
-  pointer-events: auto;
-  color: var(--muted);
-  transition: color 0.15s;
+  pointer-events: auto; color: var(--muted); transition: color 0.15s;
 }
 .ipt-label.active { color: var(--accent); }
 .ipt-label:not(.active):hover { color: var(--text); }
 
 /* ── Pipeline panel ─────────────────────────────────────────────────── */
 #pipelinePanel {
-  flex-shrink: 0;
-  position: relative;
-  background: var(--surface2);
-  border-bottom: 1px solid var(--border);
-  overflow: hidden;
+  flex-shrink: 0; position: relative;
+  background: var(--surface2); border-bottom: 1px solid var(--border); overflow: hidden;
 }
 #pipelineCanvas { display: block; width: 100%; height: 75px; }
+#pipelineCtrl { position: relative; height: 42px; border-top: 1px solid var(--border2); }
 
-/* Strip below the canvas that holds the positioned α slider / VQ mode row */
-#pipelineCtrl {
-  position: relative;
-  height: 42px;
-  border-top: 1px solid var(--border2);
-}
-
-/* Both overlays sit inside #pipelineCtrl, absolutely positioned by JS */
 #mainSliderSection, #vqModeBar {
-  position: absolute;
-  top: 50%;
-  transform: translateY(-50%);
-  /* left + width set by positionPipelineControls() */
+  position: absolute; top: 50%; transform: translateY(-50%);
 }
 #mainSliderSection { min-width: 180px; }
 #mainSliderSection .interp-slider-row { display: flex; align-items: center; gap: 6px; margin-bottom: 2px; }
 #alphaDisplay { text-align: center; font-size: 11px; color: var(--muted); white-space: nowrap; }
 #vqModeBar .toggle-row { gap: 3px; flex-wrap: nowrap; }
 
+/* ── VQ hash toggle ──────────────────────────────────────────────────── */
+#vqHashToggle {
+  position: absolute; right: 6px; top: 50%; transform: translateY(-50%);
+  display: flex; align-items: center; gap: 3px;
+  font-size: 10px; color: var(--muted); cursor: pointer;
+  user-select: none; background: rgba(0,0,0,0.35); border-radius: 3px; padding: 2px 5px;
+  z-index: 2;
+}
+#vqHashToggle input { cursor: pointer; accent-color: var(--accent); margin: 0; }
+
+/* ── Norm toggle ─────────────────────────────────────────────────────── */
+#normToggle {
+  position: absolute; top: 6px; right: 8px; z-index: 2;
+  display: flex; align-items: center; gap: 4px;
+  font-size: 10px; color: var(--muted); cursor: pointer;
+  user-select: none; background: rgba(0,0,0,0.45); border-radius: 3px; padding: 2px 6px;
+}
+#normToggle input { cursor: pointer; accent-color: var(--accent); margin: 0; }
+
 /* ── Level-alpha sliders panel ───────────────────────────────────────── */
 #multisliderPanel {
-  flex-shrink: 0;
-  background: var(--surface2); border-bottom: 1px solid var(--border);
+  flex-shrink: 0; background: var(--surface2); border-bottom: 1px solid var(--border);
 }
 #scatterNav {
   display: flex; align-items: center; justify-content: space-between;
@@ -166,269 +103,22 @@ select:focus, input[type=number]:focus { outline: none; border-color: var(--acce
 #scatterSliders { padding: 4px 8px 5px; }
 @keyframes rowBlink {
   0%, 100% { background: transparent; }
-  30%, 70% { background: rgba(255, 210, 100, 0.18); }
+  30%, 70%  { background: rgba(255, 210, 100, 0.18); }
 }
-.scatter-row {
-  display: flex; align-items: center; gap: 6px; margin-bottom: 3px;
-  border-radius: 3px;
-}
+.scatter-row { display: flex; align-items: center; gap: 6px; margin-bottom: 3px; border-radius: 3px; }
 .scatter-row:last-child { margin-bottom: 0; }
 .scatter-row.blinking { animation: rowBlink 350ms ease-in-out 3; }
-.scatter-lbl {
-  width: 2.2em; flex-shrink: 0; text-align: right;
-  color: var(--muted); font-size: 11px;
-}
-.scatter-slider {
-  flex: 1; accent-color: var(--accent); cursor: pointer; height: 4px;
-}
+.scatter-lbl  { width: 2.2em; flex-shrink: 0; text-align: right; color: var(--muted); font-size: 11px; }
+.scatter-slider { flex: 1; accent-color: var(--accent); cursor: pointer; height: 4px; }
 .scatter-slider:disabled { opacity: 0.35; cursor: default; }
-.scatter-val {
-  width: 2.6em; flex-shrink: 0; text-align: right;
-  color: var(--muted); font-size: 11px;
-}
-
-/* ── Right panel ────────────────────────────────────────────────────── */
-#right { display: flex; flex-direction: column; min-width: 0; }
-
-#toolbar {
-  display: flex; align-items: center; gap: 0.5em;
-  padding: 0.4em 0.7em; border-bottom: 1px solid var(--border);
-  background: var(--surface); flex-shrink: 0;
-}
-#playBtn, #loopBtn {
-  width: 28px; height: 28px; border-radius: 4px; cursor: pointer;
-  background: var(--accent-lo); border: 1px solid var(--accent);
-  color: var(--text); font-size: 14px;
-  display: flex; align-items: center; justify-content: center;
-}
-#playBtn:hover, #loopBtn:hover { filter: brightness(1.2); }
-#playBtn:disabled, #loopBtn:disabled { opacity: 0.4; cursor: default; filter: none; }
-#loopBtn { font-size: 20px; }
-#loopBtn.active { background: var(--accent); color: #000; }
-
-#levelMeter {
-  width: 10px; height: 28px; flex-shrink: 0;
-  border-radius: 2px; border: 1px solid var(--border2);
-  background: #111; display: block;
-}
-
-.vol-slider { flex: 1; accent-color: var(--accent); cursor: pointer; }
-.vol-val { width: 2.4em; flex-shrink: 0; text-align: right; color: var(--muted); font-size: 11px; }
-
-.tab-group {
-  display: flex; gap: 2px;
-  background: #1c1c1c; border: 1px solid var(--border2);
-  border-radius: 4px; padding: 2px;
-}
-.tab {
-  padding: 2px 10px; border-radius: 3px; font-size: 11px; cursor: pointer;
-  color: var(--muted); border: none; background: none;
-}
-.tab.active  { background: var(--accent-lo); color: var(--text); }
-.tab:hover:not(.active) { color: var(--text); }
-
-#statusBar { flex: 1; font-size: 11px; color: var(--muted); min-width: 0;
-             white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-
-#progressWrap {
-  width: 70px; height: 3px; background: var(--border2);
-  border-radius: 2px; overflow: hidden; display: none;
-}
-#progressBar { height: 100%; background: var(--accent); width: 0; transition: width 0.08s; }
-
-
-/* ── Spectrogram area ───────────────────────────────────────────────── */
-#specArea { flex: 1; display: flex; min-height: 0; }
-
-/* ── Note panel ─────────────────────────────────────────────────────── */
-#notePanel {
-  flex-shrink: 0;
-  padding: 0.45em 0.75em 0.45em calc(2.5em + 0.75em);
-  border-top: 1px solid var(--border);
-  background: var(--surface2);
-  font-size: 11px; line-height: 1.5; color: var(--muted);
-}
-#notePanel strong { color: var(--text); font-weight: 600; }
-
-#stripWrap {
-  width: 2.5em; flex-shrink: 0;
-  background: var(--surface2); border-right: 1px solid var(--border);
-  position: relative;
-}
-#stripCanvas { position: absolute; inset: 0; width: 100%; height: 100%; }
-
-#specWrap { flex: 1; position: relative; overflow: hidden; }
-#specCanvas, #playheadCanvas {
-  position: absolute; inset: 0; width: 100%; height: 100%;
-}
-#playheadCanvas { pointer-events: none; }
-
-/* ── Activation overlay ─────────────────────────────────────────────── */
-#activationOverlay {
-  position: absolute; inset: 0;
-  background: rgba(0,0,0,0.72);
-  display: flex; align-items: center; justify-content: center;
-  cursor: pointer; z-index: 10;
-}
-#activationOverlay span {
-  background: var(--surface); border: 1px solid var(--border2);
-  color: var(--text); padding: 0.5em 1.2em; border-radius: 4px; font-size: 13px;
-}
-
-/* ── Legend ─────────────────────────────────────────────────────────── */
-#legend {
-  display: flex; gap: 1.2em; padding: 0 0.7em 0 calc(2.5em + 0.7em);
-  font-size: 10px; color: var(--muted); flex-shrink: 0; height: 1.6em;
-  align-items: center;
-}
-.ldot {
-  display: inline-block; width: 8px; height: 8px;
-  border-radius: 50%; margin-right: 3px; vertical-align: middle;
-}
+.scatter-val { width: 2.6em; flex-shrink: 0; text-align: right; color: var(--muted); font-size: 11px; }
 </style>
 </head>
 <body>
 <div id="frame">
 
-  <!-- ─────────── LEFT CONTROLS ─────────── -->
-  <div id="controls">
-
-    <!-- Source A -->
-    <div class="section">
-      <div class="section-title">Source A</div>
-      <div class="row">
-        <span class="lbl">Type</span>
-        <select id="srcTypeA">
-          <option value="sine">Sine</option>
-          <option value="triangle">Triangle</option>
-          <option value="sawtooth">Sawtooth</option>
-          <option value="square">Square</option>
-          <option value="sweep">Sweep</option>
-          <option value="silence">Silence</option>
-          <option value="file">File</option>
-        </select>
-      </div>
-      <div class="row" id="freqRowA">
-        <span class="lbl">Freq</span>
-        <input type="number" id="freqA" value="440" min="1" max="20000" step="1">
-        <span class="unit">Hz</span>
-      </div>
-      <div class="row" id="fileRowA" style="display:none">
-        <button class="file-btn" id="fileBtnA">choose file…</button>
-        <input type="file" id="fileInputA" accept="audio/*" style="display:none">
-      </div>
-      <div class="row">
-        <span class="lbl">Vol</span>
-        <input type="range" id="volA" class="vol-slider" min="0" max="1" step="0.01" value="0.8">
-      </div>
-      <div class="row">
-        <span class="lbl">Gate</span>
-        <button class="tog" id="gateTogA">Off</button>
-      </div>
-      <div class="row" id="gateRateRowA" style="display:none">
-        <span class="lbl">Rate</span>
-        <input type="number" id="gateFreqA" value="4" min="0.1" max="500" step="0.1">
-        <span class="unit">Hz</span>
-      </div>
-      <div class="row" id="gateDecayRowA" style="display:none">
-        <span class="lbl">Decay</span>
-        <input type="number" id="gateDecayA" value="50" min="0" max="2000" step="1">
-        <span class="unit">ms</span>
-      </div>
-    </div>
-
-    <!-- Source B -->
-    <div class="section">
-      <div class="section-title">Source B</div>
-      <div class="row">
-        <span class="lbl">Type</span>
-        <select id="srcTypeB">
-          <option value="sine">Sine</option>
-          <option value="triangle">Triangle</option>
-          <option value="sawtooth">Sawtooth</option>
-          <option value="square">Square</option>
-          <option value="sweep">Sweep</option>
-          <option value="silence">Silence</option>
-          <option value="file">File</option>
-        </select>
-      </div>
-      <div class="row" id="freqRowB">
-        <span class="lbl">Freq</span>
-        <input type="number" id="freqB" value="880" min="1" max="20000" step="1">
-        <span class="unit">Hz</span>
-      </div>
-      <div class="row" id="fileRowB" style="display:none">
-        <button class="file-btn" id="fileBtnB">choose file…</button>
-        <input type="file" id="fileInputB" accept="audio/*" style="display:none">
-      </div>
-      <div class="row">
-        <span class="lbl">Vol</span>
-        <input type="range" id="volB" class="vol-slider" min="0" max="1" step="0.01" value="0.8">
-      </div>
-      <div class="row">
-        <span class="lbl">Gate</span>
-        <button class="tog" id="gateTogB">Off</button>
-      </div>
-      <div class="row" id="gateRateRowB" style="display:none">
-        <span class="lbl">Rate</span>
-        <input type="number" id="gateFreqB" value="4" min="0.1" max="500" step="0.1">
-        <span class="unit">Hz</span>
-      </div>
-      <div class="row" id="gateDecayRowB" style="display:none">
-        <span class="lbl">Decay</span>
-        <input type="number" id="gateDecayB" value="50" min="0" max="2000" step="1">
-        <span class="unit">ms</span>
-      </div>
-    </div>
-
-    <!-- Duration -->
-    <div class="section">
-      <div class="section-title">Duration</div>
-      <div class="row">
-        <span class="lbl">Target</span>
-        <input type="number" id="dur" value="2" min="0.1" max="10" step="0.1">
-        <span class="unit">s</span>
-      </div>
-    </div>
-
-    <!-- Model -->
-    <div class="section">
-      <div class="section-title">Model</div>
-      <div class="row">
-        <span class="lbl">Model</span>
-        <select id="modelSel">
-          <option value="24k">24 kHz</option>
-          <option value="48k">48 kHz</option>
-        </select>
-      </div>
-      <div class="row">
-        <span class="lbl">Bandwidth</span>
-        <select id="bwSel"></select>
-        <span class="unit">kbps</span>
-      </div>
-    </div>
-
-    <!-- Mode -->
-    <div class="section">
-      <div class="section-title">Mode</div>
-      <div class="toggle-row" id="modeToggleRow" style="margin-bottom:0.45em">
-        <button class="tog active" id="togNS">Non-streaming</button>
-        <button class="tog"        id="togS">Streaming</button>
-      </div>
-      <div class="row" id="frameRow" style="display:none">
-        <span class="lbl">Frame</span>
-        <select id="frameSel">
-          <option value="320">320 smp · 13 ms</option>
-          <option value="640">640 smp · 27 ms</option>
-          <option value="1280">1280 smp · 53 ms</option>
-          <option value="2560">2560 smp · 107 ms</option>
-          <option value="4800">4800 smp · 200 ms</option>
-          <option value="9600">9600 smp · 400 ms</option>
-        </select>
-      </div>
-    </div>
-
-  </div><!-- #controls -->
+  <!-- ─────────── LEFT CONTROLS (populated by JS) ─────────── -->
+  <div id="controls"></div>
 
   <!-- ─────────── RIGHT PANEL ─────────── -->
   <div id="right">
@@ -453,16 +143,13 @@ select:focus, input[type=number]:focus { outline: none; border-color: var(--acce
     </div>
 
     <div id="pipelinePanel">
-      <!-- Interp-point labels — sit above the relevant diagram sections -->
       <div id="pipelineLabels">
         <span class="ipt-label active" id="togEncLatents" data-point="encoder_latents"></span>
         <span class="ipt-label"        id="togVQCodes"    data-point="vq_codes">Interpolate Here</span>
         <span class="ipt-label"        id="togQuantEmb"   data-point="quantized_embeddings">Interpolate Here</span>
       </div>
       <canvas id="pipelineCanvas"></canvas>
-      <!-- Control strip — contains α slider OR VQ mode row, positioned by JS -->
       <div id="pipelineCtrl">
-        <!-- α slider — shown for enc_latents, quant_emb, and flat/frame vq modes -->
         <div id="mainSliderSection">
           <div class="interp-slider-row">
             <span class="interp-end">A</span>
@@ -471,7 +158,11 @@ select:focus, input[type=number]:focus { outline: none; border-color: var(--acce
           </div>
           <div id="alphaDisplay">α = 0.50  (50 % A · 50 % B)</div>
         </div>
-        <!-- VQ mode row — shown when VQ Codes is active -->
+        <div id="scaleSliderRow" class="interp-slider-row" style="display:none">
+          <span class="interp-end">A</span>
+          <input type="range" id="scaleSlider" min="0" max="100" value="50" step="1">
+          <span class="interp-end">B</span>
+        </div>
         <div id="vqModeBar" style="display:none">
           <div class="toggle-row" id="vqModeRow">
             <button class="tog active" data-vqmode="flat_swap">Flat Swap</button>
@@ -480,10 +171,13 @@ select:focus, input[type=number]:focus { outline: none; border-color: var(--acce
             <button class="tog"        data-vqmode="int_lerp">Int. Lerp</button>
           </div>
         </div>
+        <label id="vqHashToggle" style="display:none" title="Deterministic golden-ratio hash — same seed always gives same split">
+          <input type="checkbox" id="deterministicChk" checked>
+          <span>Det.</span>
+        </label>
       </div>
     </div>
 
-    <!-- Level-alpha sliders — shown below the diagram for level_swap / int_lerp -->
     <div id="multisliderPanel" style="display:none"></div>
 
     <div id="specArea">
@@ -492,6 +186,9 @@ select:focus, input[type=number]:focus { outline: none; border-color: var(--acce
         <canvas id="specCanvas"></canvas>
         <canvas id="playheadCanvas"></canvas>
         <div id="activationOverlay"><span>Click to enable audio</span></div>
+        <label id="normToggle" title="Shared scale: use same dB range for all spectrograms">
+          <input type="checkbox" id="sharedScaleChk"> Shared scale
+        </label>
       </div>
     </div>
 
@@ -500,22 +197,23 @@ select:focus, input[type=number]:focus { outline: none; border-color: var(--acce
   </div>
 </div><!-- #frame -->
 
-<script>
+<script type="module">
 'use strict';
+
+import { createSourcePanel }    from './lib/source-panel.js';
+import { createModelPanel }     from './lib/model-panel.js';
+import {
+  generateSource, applyPulseGate, loadFile, getAudioFileDuration, loopToLength, MAX_S,
+} from './lib/audio-utils.js';
+import {
+  computeSTFT, stftToOffscreen, drawStrip as _drawStrip, PLASMA, OCEAN, HOT,
+} from './lib/stft.js';
 
 // ═══════════════════════════════════════════════════════════════════════
 // Config
 // ═══════════════════════════════════════════════════════════════════════
 
 const MODELS_BASE = new URL('../serialization/encodec_onnx_exports', location.href).href;
-const BW_OPTIONS  = { '24k': [1.5, 3, 6, 12, 24], '48k': [3, 6, 12, 24] };
-const FFT_N  = 2048;
-const HOP    = 512;
-const MAX_S  = 10;
-
-const PLASMA = [[5,5,25],[100,0,150],[200,50,100],[255,140,20],[255,255,100]];
-const OCEAN  = [[5,10,40],[0,60,120],[0,140,180],[40,200,220],[180,240,255]];
-const HOT    = [[0,0,0],[191,0,0],[255,128,0],[255,255,64],[255,255,255]];
 
 const VQ_MODE_NOTES = {
   flat_swap:
@@ -551,31 +249,82 @@ const INTERP_NOTES = {
 };
 
 // ═══════════════════════════════════════════════════════════════════════
+// Build left-panel controls
+// ═══════════════════════════════════════════════════════════════════════
+
+const controls = document.getElementById('controls');
+
+const panelA = createSourcePanel({
+  title: 'Source A', defaultFreq: 440,
+  showVol: true, showGate: true, showSilence: true,
+  onChange: (delay) => scheduleFullRecalc(delay),
+  onFilePicked: async (file) => {
+    const fileDur = await getAudioFileDuration(file);
+    const current = parseFloat(durEl.value) || 2;
+    if (fileDur > current) durEl.value = fileDur.toFixed(2);
+  },
+});
+controls.appendChild(panelA.element);
+
+const panelB = createSourcePanel({
+  title: 'Source B', defaultFreq: 880,
+  showVol: true, showGate: true, showSilence: true,
+  onChange: (delay) => scheduleFullRecalc(delay),
+  onFilePicked: async (file) => {
+    const fileDur = await getAudioFileDuration(file);
+    const current = parseFloat(durEl.value) || 2;
+    if (fileDur > current) durEl.value = fileDur.toFixed(2);
+  },
+});
+controls.appendChild(panelB.element);
+
+// Duration section
+const durSection = document.createElement('div');
+durSection.className = 'section';
+durSection.innerHTML = `
+  <div class="section-title">Duration</div>
+  <div class="row">
+    <span class="lbl">Target</span>
+    <input type="number" value="2" min="0.1" max="10" step="0.1">
+    <span class="unit">s</span>
+  </div>
+`.trim();
+controls.appendChild(durSection);
+const durEl = durSection.querySelector('input');
+durEl.addEventListener('input', () => scheduleFullRecalc(500));
+
+// Model + Mode sections
+const mp = createModelPanel({
+  onChange() {
+    updateLevelSliders();
+    updateScaleSliderVisibility();
+    drawPipeline();
+    scheduleFullRecalc(0);
+  },
+});
+controls.appendChild(mp.modelSection);
+controls.appendChild(mp.modeSection);
+
+// ═══════════════════════════════════════════════════════════════════════
 // State
 // ═══════════════════════════════════════════════════════════════════════
 
 let audioCtx     = null;
 let sourceSR     = 24000;
 
-let rawAudioA    = null;   // Float32Array — source audio before EnCodec
+let rawAudioA    = null;
 let rawAudioB    = null;
-let decodedA     = null;   // Float32Array — after full pipeline
+let decodedA     = null;
 let decodedB     = null;
-let interpAudio  = null;   // Float32Array — interpolated result
+let interpAudio  = null;
 
-let bufA     = null;   // pre-created AudioBuffer for instant tab switching
-let bufB     = null;
-let bufInterp = null;
-
+let bufA = null, bufB = null, bufInterp = null;
 let stftA = null, stftB = null, stftInterp = null;
 let offA  = null, offB  = null, offInterp  = null;
 
-let currentView  = 'A';   // 'A' | 'B' | 'interp'
-let streaming    = false;
+let currentView  = 'A';
 let interpPoint  = 'encoder_latents';
 let vqMode       = 'flat_swap';
-let volumeA = 0.8;
-let volumeB = 0.8;
 let analyserNode    = null;
 let _levelCur       = 0;
 let _levelPeak      = 0;
@@ -583,33 +332,46 @@ let _levelRAF       = null;
 
 const MAX_NQ         = 32;
 let levelAlphas      = new Array(MAX_NQ).fill(0);
+let scaleAlpha       = 0.5;
 let shiftHeld        = false;
-const levelSliderEls = [];
-const levelValEls    = [];
+let sharedScale      = false;
+let deterministicHash = true;
 
-let worker       = null;
-let jobSeq       = 0;
-let activeJobId  = -1;
-let encodePhase  = null;   // 'A' | 'B' | 'interp' | null
-let recalcTimer  = null;   // debounce handle
-let recalcToken  = 0;      // incremented on every new pipeline start, guards async file loads
+let worker          = null;
+let jobSeq          = 0;
+let activeJobId     = -1;
+let encodePhase     = null;
+let fullRecalcTimer = null;
+let interpTimer     = null;
+let recalcToken     = 0;
+let capturesDirty   = true;  // true until both A and B are encoded with current settings
 
 let isPlaying       = false;
 let looping         = true;
 let playNode        = null;
-let playGain        = null;   // GainNode routing playNode → destination
-let fadeOutNode     = null;   // old BufferSourceNode being crossfaded out
-let fadeOutGain     = null;   // GainNode for fadeOutNode
-const CROSSFADE_S   = 1.5;    // audio + visual crossfade duration (seconds)
+let playGain        = null;
+let fadeOutNode     = null;
+let fadeOutGain     = null;
+const CROSSFADE_S   = 1.5;
 let playStart       = 0;
-let playingDuration = 0;   // duration of the buffer currently in playNode
+let playingDuration = 0;
 let phRAF           = null;
 
-let specFadeOldOff  = null;   // offscreen canvas being faded out
-let specFadeNewOff  = null;   // offscreen canvas being faded in
-let specFadeView    = null;   // which view is fading ('A'|'B'|'interp')
-let specFadeStart   = 0;      // performance.now() when spec fade started
+let specFadeOldOff  = null;
+let specFadeNewOff  = null;
+let specFadeView    = null;
+let specFadeStart   = 0;
 let specFadeRAF     = null;
+
+let seekOffset          = 0;
+let isDraggingPlayhead  = false;
+let currentScrubFrac    = 0;
+let pipelineTimer       = null;
+
+let _activeLevel   = null;
+let _scatterOffset = 0;
+let _scatterRAF    = null;
+let _vqCircleGrid  = null;
 
 const dpr = devicePixelRatio || 1;
 
@@ -619,26 +381,22 @@ const dpr = devicePixelRatio || 1;
 
 const $ = id => document.getElementById(id);
 
-const modelSel  = $('modelSel');
-const bwSel     = $('bwSel');
-const togNS     = $('togNS');
-const togS      = $('togS');
-const modeToggleRow = $('modeToggleRow');
-const frameRow  = $('frameRow');
-const frameSel  = $('frameSel');
-const playBtn   = $('playBtn');
-const loopBtn   = $('loopBtn');
-const statusBar = $('statusBar');
-const progWrap  = $('progressWrap');
-const progBar   = $('progressBar');
-const specCvs   = $('specCanvas');
-const phCvs     = $('playheadCanvas');
-const stripCvs  = $('stripCanvas');
-const actOvl    = $('activationOverlay');
-const notePanel = $('notePanel');
+const playBtn      = $('playBtn');
+const loopBtn      = $('loopBtn');
+const statusBar    = $('statusBar');
+const progWrap     = $('progressWrap');
+const progBar      = $('progressBar');
+const specCvs      = $('specCanvas');
+const phCvs        = $('playheadCanvas');
+const stripCvs     = $('stripCanvas');
+const actOvl       = $('activationOverlay');
+const notePanel    = $('notePanel');
 const lgA = $('lgA'), lgB = $('lgB'), lgI = $('lgI');
-const interpSlider = $('interpSlider');
-const alphaDisplay = $('alphaDisplay');
+const interpSlider   = $('interpSlider');
+const alphaDisplay   = $('alphaDisplay');
+const scaleSlider    = $('scaleSlider');
+const scaleSliderRow = $('scaleSliderRow');
+const sharedScaleChk = $('sharedScaleChk');
 
 // ═══════════════════════════════════════════════════════════════════════
 // Audio context (user-gesture gated)
@@ -652,98 +410,10 @@ function ensureAudioCtx() {
     analyserNode.smoothingTimeConstant = 0;
     analyserNode.connect(audioCtx.destination);
     actOvl.style.display = 'none';
-    scheduleFullRecalc();   // kick off generation now that audio is unlocked
+    scheduleFullRecalc();
   }
 }
 actOvl.addEventListener('click', ensureAudioCtx);
-
-// ═══════════════════════════════════════════════════════════════════════
-// Source type visibility (A and B)
-// ═══════════════════════════════════════════════════════════════════════
-
-let gateEnabledA = false;
-let gateEnabledB = false;
-
-['A', 'B'].forEach(id => {
-  const srcType     = $(`srcType${id}`);
-  const freqRow     = $(`freqRow${id}`);
-  const fileRow     = $(`fileRow${id}`);
-  const fileBtn     = $(`fileBtn${id}`);
-  const fileInput   = $(`fileInput${id}`);
-  const volSlider   = $(`vol${id}`);
-  const gateTog     = $(`gateTog${id}`);
-  const gateRateRow = $(`gateRateRow${id}`);
-  const gateDecRow  = $(`gateDecayRow${id}`);
-
-  srcType.addEventListener('change', () => {
-    const v = srcType.value;
-    fileRow.style.display = v === 'file'    ? '' : 'none';
-    freqRow.style.display = (v === 'file' || v === 'sweep' || v === 'silence') ? 'none' : '';
-    scheduleFullRecalc();
-  });
-  fileBtn.addEventListener('click', () => fileInput.click());
-  fileInput.addEventListener('change', async () => {
-    if (!fileInput.files[0]) return;
-    fileBtn.textContent = fileInput.files[0].name;
-    const fileDur = await getAudioFileDuration(fileInput.files[0]);
-    const current = parseFloat($('dur').value) || 2;
-    if (fileDur > current) $('dur').value = fileDur.toFixed(2);
-    scheduleFullRecalc();
-  });
-  volSlider.addEventListener('input', () => {
-    const v = parseFloat(volSlider.value);
-    if (id === 'A') volumeA = v; else volumeB = v;
-    scheduleFullRecalc();
-  });
-  gateTog.addEventListener('click', () => {
-    const on = !(id === 'A' ? gateEnabledA : gateEnabledB);
-    if (id === 'A') gateEnabledA = on; else gateEnabledB = on;
-    gateTog.textContent = on ? 'On' : 'Off';
-    gateTog.classList.toggle('active', on);
-    gateRateRow.style.display = on ? '' : 'none';
-    gateDecRow.style.display  = on ? '' : 'none';
-    scheduleFullRecalc();
-  });
-});
-
-// ═══════════════════════════════════════════════════════════════════════
-// Bandwidth / model selector
-// ═══════════════════════════════════════════════════════════════════════
-
-function populateBW() {
-  bwSel.innerHTML = '';
-  BW_OPTIONS[modelSel.value].forEach(bw => {
-    const o = document.createElement('option');
-    o.value = bw; o.textContent = bw;
-    if (bw === 6) o.selected = true;
-    bwSel.appendChild(o);
-  });
-  const is48 = modelSel.value === '48k';
-  modeToggleRow.style.display = is48 ? 'none' : '';
-  if (is48) {
-    streaming = false;
-    togNS.classList.add('active');
-    togS.classList.remove('active');
-  }
-  updateFrameRowVisibility();
-}
-modelSel.addEventListener('change', populateBW);
-populateBW();
-
-// ═══════════════════════════════════════════════════════════════════════
-// Mode toggle
-// ═══════════════════════════════════════════════════════════════════════
-
-[togNS, togS].forEach(btn => btn.addEventListener('click', () => {
-  togNS.classList.toggle('active', btn === togNS);
-  togS .classList.toggle('active', btn === togS);
-  streaming = btn === togS;
-  updateFrameRowVisibility();
-}));
-
-function updateFrameRowVisibility() {
-  frameRow.style.display = (streaming && modelSel.value === '24k') ? '' : 'none';
-}
 
 // ═══════════════════════════════════════════════════════════════════════
 // Interpolation point toggle
@@ -777,17 +447,61 @@ document.querySelectorAll('#vqModeRow .tog').forEach(btn => {
   });
 });
 
+$('deterministicChk').addEventListener('change', () => {
+  deterministicHash = $('deterministicChk').checked;
+  scheduleInterpRecalc();
+});
+
 // ═══════════════════════════════════════════════════════════════════════
 // Interpolation slider
 // ═══════════════════════════════════════════════════════════════════════
 
 interpSlider.addEventListener('input', () => {
-  const a = parseInt(interpSlider.value) / 100;
-  alphaDisplay.textContent = `α = ${a.toFixed(2)}  (${Math.round((1-a)*100)} % A · ${Math.round(a*100)} % B)`;
+  const v = parseInt(interpSlider.value) / 100;
+  if (shiftHeld) {
+    scaleAlpha = v;
+    scaleSlider.value = Math.round(v * 100);
+    const nq = computeNq();
+    for (let j = 0; j < nq; j++) levelAlphas[j] = v;
+    drawMultislider();
+  }
+  updateAlphaDisplay();
   drawPipeline();
 });
-
 interpSlider.addEventListener('change', () => scheduleInterpRecalc());
+
+scaleSlider.addEventListener('input', () => {
+  const v = parseInt(scaleSlider.value) / 100;
+  if (shiftHeld) {
+    // Gang: set alpha and all level sliders to the same value
+    scaleAlpha = v;
+    interpSlider.value = Math.round(v * 100);
+    const nq = computeNq();
+    for (let j = 0; j < nq; j++) levelAlphas[j] = v;
+    drawMultislider();
+  } else {
+    scaleAlpha = v;
+  }
+  updateAlphaDisplay();
+  drawPipeline();
+});
+scaleSlider.addEventListener('change', () => scheduleInterpRecalc());
+
+function updateAlphaDisplay() {
+  const a = parseInt(interpSlider.value) / 100;
+  if (mp.getModelHz() === '48k') {
+    alphaDisplay.textContent = `α = ${a.toFixed(2)}  ·  sc = ${scaleAlpha.toFixed(2)}`;
+  } else {
+    alphaDisplay.textContent = `α = ${a.toFixed(2)}  (${Math.round((1-a)*100)} % A · ${Math.round(a*100)} % B)`;
+  }
+}
+
+function updateScaleSliderVisibility() {
+  const is48 = mp.getModelHz() === '48k';
+  scaleSliderRow.style.display = is48 ? '' : 'none';
+  updateAlphaDisplay();
+  positionPipelineControls();
+}
 
 // ═══════════════════════════════════════════════════════════════════════
 // View tabs
@@ -797,30 +511,25 @@ document.querySelectorAll('.tab').forEach(tab => tab.addEventListener('click', (
   const newView = tab.dataset.view;
   if (newView === currentView) return;
 
-  // Capture old spec canvas before switching
-  if (stftA && !offA) offA = stftToOffscreen(stftA, PLASMA);
-  if (stftB && !offB) offB = stftToOffscreen(stftB, OCEAN);
-  if (stftInterp && !offInterp) offInterp = stftToOffscreen(stftInterp, HOT);
+  if (stftA && !offA) offA = makeOffscreen(stftA, PLASMA);
+  if (stftB && !offB) offB = makeOffscreen(stftB, OCEAN);
+  if (stftInterp && !offInterp) offInterp = makeOffscreen(stftInterp, HOT);
   const oldOff = currentView === 'A' ? offA : currentView === 'B' ? offB : offInterp;
-  const newOff  = newView    === 'A' ? offA : newView    === 'B' ? offB : offInterp;
+  const newOff = newView    === 'A' ? offA : newView    === 'B' ? offB : offInterp;
 
   document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.view === newView));
   currentView = newView;
   updateLegend();
-
-  // Visual crossfade
   startSpecFade(oldOff, newOff, newView);
 
-  // Audio crossfade (or stop if new view has no audio yet)
   if (isPlaying && audioCtx) {
     const elapsed = audioCtx.currentTime - playStart;
-    const dur = playingDuration || 1;
-    const offset = looping ? elapsed % dur : Math.min(elapsed, dur - 0.001);
+    const dur     = playingDuration || 1;
+    const offset  = looping ? elapsed % dur : Math.min(elapsed, dur - 0.001);
     _crossfadeAudioTo(Math.max(0, offset));
   }
 }));
 
-// Internal view switch — does NOT stop playback.
 function setView(v) {
   currentView = v;
   document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.view === v));
@@ -829,8 +538,8 @@ function setView(v) {
 }
 
 function updateLegend() {
-  lgA.style.display = currentView === 'A'     ? '' : 'none';
-  lgB.style.display = currentView === 'B'     ? '' : 'none';
+  lgA.style.display = currentView === 'A'      ? '' : 'none';
+  lgB.style.display = currentView === 'B'      ? '' : 'none';
   lgI.style.display = currentView === 'interp' ? '' : 'none';
 }
 
@@ -839,30 +548,15 @@ function updateLegend() {
 // ═══════════════════════════════════════════════════════════════════════
 
 function computeNq() {
-  const framesPerSec = modelSel.value === '24k' ? 75 : 150;
-  return Math.round(parseFloat(bwSel.value) * 1000 / (framesPerSec * 10));
+  const framesPerSec = mp.getModelHz() === '24k' ? 75 : 150;
+  return Math.round(mp.getBwKbps() * 1000 / (framesPerSec * 10));
 }
 
-function initLevelSliders() {
-  levelAlphas.fill(0);
-  levelSliderEls.length = 0;
-  levelValEls.length = 0;
-}
+function initLevelSliders() { levelAlphas.fill(0); }
 
-function updateLevelSliders() {
-  drawMultislider();
-}
+function updateLevelSliders() { drawMultislider(); }
 
-// ═══════════════════════════════════════════════════════════════════════
-// Level-alpha sliders — up to 4 visible, navigator for more.
-// Shift+input moves all levels (including hidden ones).
-// Moving a slider pulses the matching VQ circle via _activeLevel.
-// ═══════════════════════════════════════════════════════════════════════
-
-let _activeLevel   = null;   // level currently being moved (drives pipeline blink)
-let _scatterOffset = 0;      // index of first visible level
-let _scatterRAF    = null;
-let _vqCircleGrid  = null;   // cached circle geometry for canvas hit-testing
+let _vqCircleGrid_local = null;
 
 function _startScatterLoop() {
   if (_scatterRAF) return;
@@ -888,7 +582,6 @@ function drawMultislider() {
   _scatterOffset = Math.max(0, Math.min(_scatterOffset, Math.max(0, nq - 4)));
   panel.innerHTML = '';
 
-  // ── navigator (only when nq > 4) ──
   if (nq > 4) {
     const end = Math.min(_scatterOffset + 3, nq - 1);
     const nav = document.createElement('div');
@@ -896,26 +589,19 @@ function drawMultislider() {
 
     const prev = document.createElement('button');
     prev.textContent = '‹'; prev.disabled = (_scatterOffset === 0);
-    prev.addEventListener('click', () => {
-      _scatterOffset = Math.max(0, _scatterOffset - 4);
-      drawMultislider();
-    });
+    prev.addEventListener('click', () => { _scatterOffset = Math.max(0, _scatterOffset - 4); drawMultislider(); });
 
     const lbl = document.createElement('span');
     lbl.textContent = `L${_scatterOffset} – L${end}`;
 
     const next = document.createElement('button');
     next.textContent = '›'; next.disabled = (end >= nq - 1);
-    next.addEventListener('click', () => {
-      _scatterOffset = Math.min(nq - 4, _scatterOffset + 4);
-      drawMultislider();
-    });
+    next.addEventListener('click', () => { _scatterOffset = Math.min(nq - 4, _scatterOffset + 4); drawMultislider(); });
 
     nav.appendChild(prev); nav.appendChild(lbl); nav.appendChild(next);
     panel.appendChild(nav);
   }
 
-  // ── slider rows ──
   const rows    = document.createElement('div');
   rows.id       = 'scatterSliders';
   const count   = Math.min(4, nq - _scatterOffset);
@@ -944,13 +630,15 @@ function drawMultislider() {
 
     const kk = k;
     slider.addEventListener('input', () => {
-      const v  = slider.value / 100;
+      const v   = slider.value / 100;
       const nq2 = computeNq();
       if (shiftHeld) {
         for (let j = 0; j < nq2; j++) levelAlphas[j] = v;
-        // update all visible displays
         rows.querySelectorAll('.scatter-slider').forEach(s  => { s.value = Math.round(v * 100); });
         rows.querySelectorAll('.scatter-val')   .forEach(vd => { vd.textContent = v.toFixed(2); });
+        interpSlider.value = Math.round(v * 100);
+        scaleAlpha = v; scaleSlider.value = Math.round(v * 100);
+        updateAlphaDisplay();
       } else {
         levelAlphas[kk] = v;
         valEl.textContent = v.toFixed(2);
@@ -958,35 +646,27 @@ function drawMultislider() {
       _activeLevel = kk;
       _startScatterLoop();
     });
-
     slider.addEventListener('change', () => {
       scheduleInterpRecalc();
       setTimeout(() => { if (_activeLevel === kk) _stopScatterLoop(); }, 500);
     });
+    row.addEventListener('mouseenter', () => { _activeLevel = kk; _startScatterLoop(); });
+    row.addEventListener('mouseleave', () => { if (_activeLevel === kk) _stopScatterLoop(); });
 
-    row.addEventListener('mouseenter', () => {
-      _activeLevel = kk;
-      _startScatterLoop();
-    });
-    row.addEventListener('mouseleave', () => {
-      if (_activeLevel === kk) _stopScatterLoop();
-    });
-
-    row.appendChild(lbl);
-    row.appendChild(slider);
-    row.appendChild(valEl);
+    row.appendChild(lbl); row.appendChild(slider); row.appendChild(valEl);
     rows.appendChild(row);
   }
-
   panel.appendChild(rows);
 }
 
 function updateVqSectionVisibility() {
   const isVQ       = interpPoint === 'vq_codes';
   const usesLevels = isVQ && (vqMode === 'level_swap' || vqMode === 'int_lerp');
-  $('vqModeBar').style.display          = isVQ       ? '' : 'none';
-  $('multisliderPanel').style.display   = usesLevels ? '' : 'none';
-  $('mainSliderSection').style.display  = usesLevels ? 'none' : '';
+  const usesHash   = isVQ && vqMode !== 'int_lerp';
+  $('vqModeBar').style.display         = isVQ       ? '' : 'none';
+  $('vqHashToggle').style.display      = usesHash   ? '' : 'none';
+  $('multisliderPanel').style.display  = usesLevels ? '' : 'none';
+  $('mainSliderSection').style.display = usesLevels ? 'none' : '';
   if (usesLevels) drawMultislider();
   positionPipelineControls();
 }
@@ -997,167 +677,51 @@ function updateVqSectionVisibility() {
 
 function updateNotePanel() {
   let html = INTERP_NOTES[interpPoint] || '';
-  if (interpPoint === 'vq_codes' && VQ_MODE_NOTES[vqMode]) {
+  if (interpPoint === 'vq_codes' && VQ_MODE_NOTES[vqMode])
     html += '<br>' + VQ_MODE_NOTES[vqMode];
-  }
   notePanel.innerHTML = html;
 }
-updateNotePanel();
 
 // ═══════════════════════════════════════════════════════════════════════
-// Audio generation
+// Audio generation helpers
 // ═══════════════════════════════════════════════════════════════════════
 
-function generateSource(srcId, durSecOverride) {
-  const sr    = modelSel.value === '24k' ? 24000 : 48000;
-  const dur   = durSecOverride !== undefined
-    ? Math.min(durSecOverride, MAX_S)
-    : Math.min(parseFloat($('dur').value) || 2, MAX_S);
-  const n     = Math.round(dur * sr);
-  const type  = $(`srcType${srcId}`).value;
-  const f     = parseFloat($(`freq${srcId}`).value) || 440;
-  const buf   = new Float32Array(n);
-  const τ     = 2 * Math.PI;
-
-  switch (type) {
-    case 'sine':
-      for (let i = 0; i < n; i++) buf[i] = Math.sin(τ * f * i / sr);
-      break;
-    case 'triangle':
-      for (let i = 0; i < n; i++) buf[i] = (2 / Math.PI) * Math.asin(Math.sin(τ * f * i / sr));
-      break;
-    case 'sawtooth':
-      for (let i = 0; i < n; i++) buf[i] = 2 * ((f * i / sr) % 1) - 1;
-      break;
-    case 'square':
-      for (let i = 0; i < n; i++) buf[i] = Math.sign(Math.sin(τ * f * i / sr));
-      break;
-    case 'sweep': {
-      const f0 = 20, f1 = sr / 2 * 0.9;
-      for (let i = 0; i < n; i++) {
-        const t = i / sr;
-        buf[i] = Math.sin(τ * (f0 * t + (f1 - f0) * t * t / (2 * dur)));
-      }
-      break;
-    }
-    case 'silence':
-      break; // buf stays all zeros
-  }
-  return buf;
-}
-
-// Apply a pulse gate (amplitude envelope) to audio — used post-source.
-function applyPulseGate(audio, sr, freq, decayMs) {
-  const period = Math.max(1, Math.round(sr / Math.max(0.01, freq)));
-  const out    = new Float32Array(audio.length);
-  if (decayMs <= 0) {
-    // Pass only the first sample of each period (Dirac comb gate)
-    for (let i = 0; i < audio.length; i++)
-      out[i] = (i % period === 0) ? audio[i] : 0;
-  } else {
-    const tau = (decayMs / 1000) * sr / 5;
-    for (let i = 0; i < audio.length; i++) {
-      const phase = i % period;
-      out[i] = audio[i] * Math.exp(-phase / tau);
-    }
-  }
-  return out;
-}
-
-async function loadFile(file, sr) {
-  const arrBuf  = await file.arrayBuffer();
-  const tmpCtx  = new OfflineAudioContext(1, 1, sr);
-  const decoded = await tmpCtx.decodeAudioData(arrBuf);
-  // Trim to MAX_S at the original sample rate, then resample to target sr
-  const trimLen = Math.min(decoded.length, Math.round(MAX_S * decoded.sampleRate));
-  const outLen  = Math.round(trimLen / decoded.sampleRate * sr);
-  const offCtx  = new OfflineAudioContext(1, outLen, sr);
-  const src     = offCtx.createBufferSource();
-  const trimBuf = new AudioBuffer({
-    numberOfChannels: decoded.numberOfChannels,
-    length: trimLen, sampleRate: decoded.sampleRate,
-  });
-  for (let ch = 0; ch < decoded.numberOfChannels; ch++)
-    trimBuf.copyToChannel(decoded.getChannelData(ch).slice(0, trimLen), ch);
-  src.buffer = trimBuf;
-  src.connect(offCtx.destination);
-  src.start(0);
-  const rendered = await offCtx.startRendering();
-  const mono = new Float32Array(rendered.length);
-  for (let ch = 0; ch < rendered.numberOfChannels; ch++) {
-    const d = rendered.getChannelData(ch);
-    for (let i = 0; i < rendered.length; i++) mono[i] += d[i] / rendered.numberOfChannels;
-  }
-  return mono;
-}
-
-// Return the duration (seconds) of an audio file, capped at MAX_S.
-async function getAudioFileDuration(file) {
-  const arrBuf = await file.arrayBuffer();
-  const tmpCtx = new OfflineAudioContext(1, 1, 44100);
-  const decoded = await tmpCtx.decodeAudioData(arrBuf);
-  return Math.min(decoded.duration, MAX_S);
-}
-
-// Scale audio so its peak magnitude is `target` (default 0.8). Returns a new array.
-function normalizePeak(audio, target = 0.8) {
-  let peak = 0;
-  for (let i = 0; i < audio.length; i++) { const a = Math.abs(audio[i]); if (a > peak) peak = a; }
-  if (peak < 1e-9) return audio; // silence — nothing to do
-  const scale = target / peak;
-  const out = new Float32Array(audio.length);
-  for (let i = 0; i < audio.length; i++) out[i] = audio[i] * scale;
-  return out;
-}
-
-// Loop `audio` to exactly `targetLen` samples (wraps around).
-function loopToLength(audio, targetLen) {
-  if (audio.length >= targetLen) return audio.slice(0, targetLen);
-  const out = new Float32Array(targetLen);
-  for (let i = 0; i < targetLen; i++) out[i] = audio[i % audio.length];
-  return out;
-}
-
-// Build one source aligned to exactly `finalLen` samples at sample-rate `sr`.
-// Generated signals are produced directly at the right duration — never looped.
-// File signals are loaded, then looped if shorter than finalLen, trimmed if longer.
-async function buildAligned(srcId, finalLen, sr) {
-  const type = $(`srcType${srcId}`).value;
+async function buildAligned(panel, finalLen, sr) {
+  const type = panel.getType();
   if (type !== 'file') {
-    // Generate at exactly the target duration — no looping needed.
-    return generateSource(srcId, finalLen / sr);
+    return generateSource(type, panel.getFreq(), finalLen / sr, sr);
   }
-  const f = $(`fileInput${srcId}`).files[0];
-  if (!f) throw new Error(`No file selected for Source ${srcId}.`);
+  const f = panel.getFile();
+  if (!f) throw new Error(`No file selected for "${panel.element.querySelector('.section-title').textContent}".`);
   const raw = await loadFile(f, sr);
   if (raw.length === finalLen) return raw;
   if (raw.length >  finalLen) return raw.slice(0, finalLen);
   return loopToLength(raw, finalLen);
 }
 
-// Load both sources aligned to the shared target duration.
 async function buildBothAudios(token) {
-  const sr        = modelSel.value === '24k' ? 24000 : 48000;
-  const targetSec = Math.min(parseFloat($('dur').value) || 2, MAX_S);
+  const sr        = mp.getSampleRate();
+  const targetSec = Math.min(parseFloat(durEl.value) || 2, MAX_S);
   const finalLen  = Math.round(targetSec * sr);
 
   setStatus('Loading A…');
   let audioA;
-  try { audioA = await buildAligned('A', finalLen, sr); } catch (err) { throw err; }
+  try { audioA = await buildAligned(panelA, finalLen, sr); }
+  catch (err) { throw err; }
   if (recalcToken !== token) return null;
 
   setStatus('Loading B…');
   let audioB;
-  try { audioB = await buildAligned('B', finalLen, sr); } catch (err) { throw err; }
+  try { audioB = await buildAligned(panelB, finalLen, sr); }
+  catch (err) { throw err; }
   if (recalcToken !== token) return null;
 
-  // Apply per-source volume
-  if (volumeA !== 1) { const g = volumeA; audioA = audioA.map(x => x * g); }
-  if (volumeB !== 1) { const g = volumeB; audioB = audioB.map(x => x * g); }
+  const volA = panelA.getVolume(), volB = panelB.getVolume();
+  if (volA !== 1) audioA = audioA.map(x => x * volA);
+  if (volB !== 1) audioB = audioB.map(x => x * volB);
 
-  // Apply pulse gate if enabled
-  if (gateEnabledA) audioA = applyPulseGate(audioA, sr, parseFloat($('gateFreqA').value) || 4, parseFloat($('gateDecayA').value) || 0);
-  if (gateEnabledB) audioB = applyPulseGate(audioB, sr, parseFloat($('gateFreqB').value) || 4, parseFloat($('gateDecayB').value) || 0);
+  if (panelA.isGateEnabled()) audioA = applyPulseGate(audioA, sr, panelA.getGateFreq(), panelA.getGateDecay());
+  if (panelB.isGateEnabled()) audioB = applyPulseGate(audioB, sr, panelB.getGateFreq(), panelB.getGateDecay());
 
   return { audioA, audioB };
 }
@@ -1187,14 +751,13 @@ function onWorkerMsg(e) {
     if (encodePhase === 'A') {
       const prevOff = offA;
       decodedA = msg.decoded;
-      sourceSR = modelSel.value === '24k' ? 24000 : 48000;
+      sourceSR = mp.getSampleRate();
       bufA = makeAudioBuf(decodedA);
       stftA = computeSTFT(decodedA);
-      offA = stftToOffscreen(stftA, PLASMA);
+      offA = makeOffscreen(stftA, PLASMA);
       crossfadeToNew('A');
       drawPipeline();
       setStatus('Source A encoded — encoding B…');
-      // Start spec fade before any setView call so its RAF guard blocks drawSpec
       if (currentView === 'A') startSpecFade(prevOff, offA, 'A');
       else drawSpec();
       startEncodeB();
@@ -1204,7 +767,9 @@ function onWorkerMsg(e) {
       decodedB = msg.decoded;
       bufB = makeAudioBuf(decodedB);
       stftB = computeSTFT(decodedB);
-      offB = stftToOffscreen(stftB, OCEAN);
+      offB = makeOffscreen(stftB, OCEAN);
+      if (sharedScale) offA = null; // invalidate A so it redraws with updated global range
+      capturesDirty = false;   // both A and B encoded with current settings
       encodePhase = null;
       interpSlider.disabled = false;
       playBtn.disabled = false;
@@ -1212,7 +777,6 @@ function onWorkerMsg(e) {
       updateLevelSliders();
       crossfadeToNew('B');
       drawPipeline();
-      // If on B and playing, fade spec; then auto-switch to A if not playing
       if (currentView === 'B') startSpecFade(prevOff, offB, 'B');
       else drawSpec();
       if (!isPlaying) setView('A');
@@ -1223,17 +787,16 @@ function onWorkerMsg(e) {
       interpAudio = msg.decoded;
       bufInterp = makeAudioBuf(interpAudio);
       stftInterp = computeSTFT(interpAudio);
-      offInterp = stftToOffscreen(stftInterp, HOT);
+      offInterp = makeOffscreen(stftInterp, HOT);
+      if (sharedScale) { offA = null; offB = null; } // invalidate A+B for updated global range
       const a = parseInt(interpSlider.value) / 100;
-      const modeLabel = interpPoint === 'vq_codes'
-        ? ` · ${vqMode.replace(/_/g,' ')}` : '';
+      const modeLabel = interpPoint === 'vq_codes' ? ` · ${vqMode.replace(/_/g,' ')}` : '';
       setStatus(`α = ${a.toFixed(2)}  ·  ${interpPoint.replace(/_/g,' ')}${modeLabel}`);
       encodePhase = null;
       playBtn.disabled = false;
       loopBtn.disabled = false;
       crossfadeToNew('interp');
       drawPipeline();
-      // Start fade first so the RAF guard blocks drawSpec inside setView
       if (currentView === 'interp' || !isPlaying) startSpecFade(prevOff, offInterp, 'interp');
       else drawSpec();
       if (!isPlaying) setView('interp');
@@ -1247,15 +810,16 @@ function onWorkerMsg(e) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Recalculation scheduling + cancellation
+// Recalculation scheduling
 // ═══════════════════════════════════════════════════════════════════════
 
-// Cancel the currently running worker job and reset phase state.
 function cancelCurrentJob() {
   if (encodePhase !== null) {
+    const phase = encodePhase;
     worker.postMessage({ type: 'cancel', jobId: activeJobId });
-    activeJobId = ++jobSeq;   // invalidate any in-flight result messages
+    activeJobId = ++jobSeq;
     encodePhase = null;
+    if (phase === 'A' || phase === 'B') capturesDirty = true;
   }
 }
 
@@ -1266,20 +830,15 @@ function makeAudioBuf(pcm) {
   return b;
 }
 
-// Clear visualisers. interpOnly=true keeps decodedA/B intact (interp-only recalc).
-// Never stops playback — old audio keeps playing until new results crossfade in.
-// Spec canvases are intentionally kept so the display stays live during recalc.
 function clearVisualizers(interpOnly) {
   _cancelSpecFade();
   if (!interpOnly) { seekOffset = 0; currentScrubFrac = 0; bufA = null; bufB = null; }
   bufInterp = null;
   interpAudio = null;
-  // stftInterp / offInterp kept so spectrogram stays visible during recalc
   if (!interpOnly) {
-    rawAudioA = rawAudioB = null;   // will be reloaded by startFullPipeline
+    rawAudioA = rawAudioB = null;
     interpSlider.disabled = true;
     updateLevelSliders();
-    // decodedA/B, stftA/B/offA/B, stftInterp/offInterp all kept for display continuity
   }
   progWrap.style.display = 'block';
   progBar.style.width = '0%';
@@ -1287,45 +846,48 @@ function clearVisualizers(interpOnly) {
   drawSpec();
 }
 
-// Trigger a full pipeline recalc (encode A + B + interpolate), debounced.
 function scheduleFullRecalc(delay = 0) {
-  clearTimeout(recalcTimer);
-  recalcTimer = setTimeout(() => {
-    if (!audioCtx) return;   // wait for user to click the overlay first
+  capturesDirty = true;
+  clearTimeout(fullRecalcTimer);
+  clearTimeout(interpTimer);
+  fullRecalcTimer = setTimeout(() => {
+    if (!audioCtx) return;
     cancelCurrentJob();
     clearVisualizers(false);
     startFullPipeline();
   }, delay);
 }
 
-// Trigger an interpolation-only recalc (reuses cached rawAudio), immediate.
 function scheduleInterpRecalc() {
-  clearTimeout(recalcTimer);
-  recalcTimer = setTimeout(() => {
-    if (!rawAudioA || !rawAudioB) return;
+  // If captures are dirty or missing, a full recalc is needed instead.
+  if (capturesDirty || !rawAudioA || !rawAudioB) {
+    scheduleFullRecalc(0);
+    return;
+  }
+  clearTimeout(interpTimer);
+  interpTimer = setTimeout(() => {
+    if (capturesDirty || !rawAudioA || !rawAudioB) { scheduleFullRecalc(0); return; }
     cancelCurrentJob();
     clearVisualizers(true);
     triggerInterpolation();
   }, 0);
 }
 
-// Load both source audios then kick off encode A.
 async function startFullPipeline() {
   const token = ++recalcToken;
   if (!worker) initWorker();
 
   let result;
-  try {
-    result = await buildBothAudios(token);
-  } catch (err) {
+  try { result = await buildBothAudios(token); }
+  catch (err) {
     if (recalcToken === token) { setStatus(err.message, true); progWrap.style.display = 'none'; }
     return;
   }
-  if (!result) return; // superseded
+  if (!result) return;
 
   rawAudioA = result.audioA;
   rawAudioB = result.audioB;
-  sourceSR  = modelSel.value === '24k' ? 24000 : 48000;
+  sourceSR  = mp.getSampleRate();
 
   encodePhase = 'A';
   activeJobId = ++jobSeq;
@@ -1336,14 +898,13 @@ async function startFullPipeline() {
     source:    'A',
     jobId:     activeJobId,
     audio:     rawAudioA.slice(),
-    modelHz:   modelSel.value,
-    bwKbps:    parseFloat(bwSel.value),
-    streaming,
-    frameSize: parseInt(frameSel.value),
+    modelHz:   mp.getModelHz(),
+    bwKbps:    mp.getBwKbps(),
+    streaming: mp.isStreaming(),
+    frameSize: mp.getFrameSize(),
   });
 }
 
-// Encode B with already-loaded rawAudioB (called after A result arrives).
 function startEncodeB() {
   encodePhase = 'B';
   activeJobId = ++jobSeq;
@@ -1356,15 +917,15 @@ function startEncodeB() {
     source:    'B',
     jobId:     activeJobId,
     audio:     rawAudioB.slice(),
-    modelHz:   modelSel.value,
-    bwKbps:    parseFloat(bwSel.value),
-    streaming,
-    frameSize: parseInt(frameSel.value),
+    modelHz:   mp.getModelHz(),
+    bwKbps:    mp.getBwKbps(),
+    streaming: mp.isStreaming(),
+    frameSize: mp.getFrameSize(),
   });
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Interpolation trigger (on slider release or interp point change)
+// Interpolation trigger
 // ═══════════════════════════════════════════════════════════════════════
 
 function triggerInterpolation() {
@@ -1377,15 +938,17 @@ function triggerInterpolation() {
   setStatus(`Interpolating at α = ${alpha.toFixed(2)}…`);
 
   const msg = {
-    type:       'interpolate',
-    jobId:      activeJobId,
-    modelHz:    modelSel.value,
-    bwKbps:     parseFloat(bwSel.value),
-    streaming,
-    frameSize:  parseInt(frameSel.value),
+    type:          'interpolate',
+    jobId:         activeJobId,
+    modelHz:       mp.getModelHz(),
+    bwKbps:        mp.getBwKbps(),
+    streaming:     mp.isStreaming(),
+    frameSize:     mp.getFrameSize(),
     alpha,
     interpPoint,
     vqMode,
+    scaleAlpha,
+    deterministic: deterministicHash,
   };
   if (vqMode === 'level_swap' || vqMode === 'int_lerp') {
     const nq = computeNq();
@@ -1403,10 +966,9 @@ playBtn.addEventListener('click', () => { isPlaying ? stopPlayback() : startPlay
 loopBtn.addEventListener('click', () => {
   looping = !looping;
   loopBtn.classList.toggle('active', looping);
-  // Apply to the currently running node immediately
   if (playNode) playNode.loop = looping;
   if (playNode && !looping) playNode.onended = stopPlayback;
-  if (playNode && looping)  playNode.onended = null;
+  if (playNode &&  looping) playNode.onended = null;
 });
 
 function currentAudio() {
@@ -1416,7 +978,6 @@ function currentAudio() {
   return null;
 }
 
-// Kill any in-progress audio fadeout immediately.
 function _killFadeOut() {
   if (!fadeOutNode) return;
   fadeOutGain.gain.cancelScheduledValues(audioCtx.currentTime);
@@ -1427,13 +988,11 @@ function _killFadeOut() {
   fadeOutNode = null; fadeOutGain = null;
 }
 
-// Cancel a running spec crossfade and snap to the incoming canvas.
 function _cancelSpecFade() {
   if (specFadeRAF) { cancelAnimationFrame(specFadeRAF); specFadeRAF = null; }
   specFadeOldOff = null; specFadeNewOff = null; specFadeView = null;
 }
 
-// Start (or restart) playback at `atOffset` seconds into the current view's audio.
 function startPlayback(atOffset = 0) {
   if (!audioCtx) return;
   const pcm = currentAudio();
@@ -1441,7 +1000,6 @@ function startPlayback(atOffset = 0) {
 
   _killFadeOut();
 
-  // Tear down existing node without triggering onended → stopPlayback
   if (playNode) {
     playNode.onended = null;
     try { playNode.stop(); } catch {}
@@ -1451,13 +1009,12 @@ function startPlayback(atOffset = 0) {
   cancelAnimationFrame(phRAF);
 
   const preBuf = currentView === 'A' ? bufA : currentView === 'B' ? bufB : bufInterp;
-  let buf;
-  if (preBuf) {
-    buf = preBuf;
-  } else {
-    buf = audioCtx.createBuffer(1, pcm.length, sourceSR);
-    buf.copyToChannel(pcm, 0);
-  }
+  const buf = preBuf || (() => {
+    const b = audioCtx.createBuffer(1, pcm.length, sourceSR);
+    b.copyToChannel(pcm, 0);
+    return b;
+  })();
+
   playGain = audioCtx.createGain();
   playGain.gain.value = 1;
   playGain.connect(analyserNode || audioCtx.destination);
@@ -1481,8 +1038,6 @@ function startPlayback(atOffset = 0) {
   startLevelMeter();
 }
 
-// Core audio crossfade: fade out current node, fade in currentView's audio at `offset`.
-// Assumes currentView is already set to the desired target. Stops playback if no audio.
 function _crossfadeAudioTo(offset) {
   if (!audioCtx) return;
   const pcm = currentAudio();
@@ -1505,14 +1060,15 @@ function _crossfadeAudioTo(offset) {
     playNode = null; playGain = null;
   }
 
-  const dur = pcm.length / sourceSR;
+  const dur     = pcm.length / sourceSR;
   const safeOff = Math.max(0, Math.min(offset, dur - 0.001));
-  const preBuf = currentView === 'A' ? bufA : currentView === 'B' ? bufB : bufInterp;
-  let buf = preBuf;
-  if (!buf) {
-    buf = audioCtx.createBuffer(1, pcm.length, sourceSR);
-    buf.copyToChannel(pcm, 0);
-  }
+  const preBuf  = currentView === 'A' ? bufA : currentView === 'B' ? bufB : bufInterp;
+  const buf     = preBuf || (() => {
+    const b = audioCtx.createBuffer(1, pcm.length, sourceSR);
+    b.copyToChannel(pcm, 0);
+    return b;
+  })();
+
   playGain = audioCtx.createGain();
   playGain.gain.setValueAtTime(0, audioCtx.currentTime);
   playGain.gain.linearRampToValueAtTime(1, audioCtx.currentTime + CROSSFADE_S);
@@ -1528,7 +1084,6 @@ function _crossfadeAudioTo(offset) {
   playingDuration = dur;
 }
 
-// Crossfade audio when a new result arrives for the currently playing view.
 function crossfadeToNew(view) {
   if (!isPlaying || currentView !== view) return;
   const elapsed = audioCtx.currentTime - playStart;
@@ -1553,8 +1108,6 @@ function stopPlayback() {
 function animatePlayhead() {
   function tick() {
     if (!isPlaying) return;
-    // Use playingDuration (the actual buffer length) not currentAudio(),
-    // which may be null while a recalc is in flight.
     const dur     = playingDuration || 1;
     const elapsed = audioCtx.currentTime - playStart;
     const frac    = looping ? (elapsed % dur) / dur : elapsed / dur;
@@ -1565,117 +1118,45 @@ function animatePlayhead() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// STFT
-// ═══════════════════════════════════════════════════════════════════════
-
-function hann(n) {
-  const w = new Float32Array(n);
-  for (let i = 0; i < n; i++) w[i] = 0.5 * (1 - Math.cos(2 * Math.PI * i / (n - 1)));
-  return w;
-}
-const WINDOW = hann(FFT_N);
-
-function fft(re, im) {
-  const n = re.length;
-  for (let i = 1, j = 0; i < n; i++) {
-    let b = n >> 1;
-    for (; j & b; b >>= 1) j ^= b;
-    j ^= b;
-    if (i < j) {
-      let t=re[i]; re[i]=re[j]; re[j]=t;
-          t=im[i]; im[i]=im[j]; im[j]=t;
-    }
-  }
-  for (let len = 2; len <= n; len <<= 1) {
-    const ang = -2 * Math.PI / len;
-    const wr = Math.cos(ang), wi = Math.sin(ang);
-    for (let i = 0; i < n; i += len) {
-      let cr = 1, ci = 0;
-      for (let j = 0; j < len >> 1; j++) {
-        const ur=re[i+j], ui=im[i+j];
-        const vr=re[i+j+len/2]*cr - im[i+j+len/2]*ci;
-        const vi=re[i+j+len/2]*ci + im[i+j+len/2]*cr;
-        re[i+j]=ur+vr; im[i+j]=ui+vi;
-        re[i+j+len/2]=ur-vr; im[i+j+len/2]=ui-vi;
-        const nr=cr*wr-ci*wi; ci=cr*wi+ci*wr; cr=nr;
-      }
-    }
-  }
-}
-
-function computeSTFT(samples) {
-  const nBins   = FFT_N >> 1;
-  const nFrames = Math.max(1, Math.floor((samples.length - FFT_N) / HOP) + 1);
-  const magDB   = new Float32Array(nFrames * nBins);
-  const re = new Float32Array(FFT_N), im = new Float32Array(FFT_N);
-  let dBmax = -Infinity;
-
-  for (let f = 0; f < nFrames; f++) {
-    const s = f * HOP;
-    re.fill(0); im.fill(0);
-    for (let i = 0; i < FFT_N; i++) re[i] = (samples[s + i] || 0) * WINDOW[i];
-    fft(re, im);
-    for (let k = 0; k < nBins; k++) {
-      const m  = Math.sqrt(re[k]*re[k] + im[k]*im[k]);
-      const db = m > 1e-9 ? 20 * Math.log10(m) : -120;
-      magDB[f * nBins + k] = db;
-      if (db > dBmax) dBmax = db;
-    }
-  }
-  return { magDB, nFrames, nBins, dBmin: Math.max(dBmax - 100, -120), dBmax };
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// Colormap
-// ═══════════════════════════════════════════════════════════════════════
-
-function cmap(t, stops) {
-  t = Math.max(0, Math.min(1, t));
-  const n = stops.length - 1;
-  const i = Math.min(Math.floor(t * n), n - 1);
-  const f = t * n - i;
-  const a = stops[i], b = stops[i + 1];
-  return [a[0]+f*(b[0]-a[0])|0, a[1]+f*(b[1]-a[1])|0, a[2]+f*(b[2]-a[2])|0];
-}
-
-function stftToOffscreen(stft, stops) {
-  const { magDB, nFrames, nBins, dBmin, dBmax } = stft;
-  const range = dBmax - dBmin || 1;
-  const off = document.createElement('canvas');
-  off.width = nFrames; off.height = nBins;
-  const ctx = off.getContext('2d');
-  const img = ctx.createImageData(nFrames, nBins);
-  for (let f = 0; f < nFrames; f++) {
-    for (let k = 0; k < nBins; k++) {
-      const t  = (magDB[f * nBins + k] - dBmin) / range;
-      const [r, g, b] = cmap(t, stops);
-      const px = ((nBins - 1 - k) * nFrames + f) * 4;
-      img.data[px]=r; img.data[px+1]=g; img.data[px+2]=b; img.data[px+3]=255;
-    }
-  }
-  ctx.putImageData(img, 0, 0);
-  return off;
-}
-
-// ═══════════════════════════════════════════════════════════════════════
 // Spectrogram draw
 // ═══════════════════════════════════════════════════════════════════════
 
+sharedScaleChk.addEventListener('change', () => {
+  sharedScale = sharedScaleChk.checked;
+  offA = offB = offInterp = null;
+  drawSpec();
+});
+
+function globalStftRange() {
+  const stfts = [stftA, stftB, stftInterp].filter(Boolean);
+  if (!stfts.length) return null;
+  return {
+    dBmin: Math.min(...stfts.map(s => s.dBmin)),
+    dBmax: Math.max(...stfts.map(s => s.dBmax)),
+  };
+}
+
+function makeOffscreen(stft, stops) {
+  if (!stft) return null;
+  if (!sharedScale) return stftToOffscreen(stft, stops);
+  const range = globalStftRange();
+  return range ? stftToOffscreen({ ...stft, dBmin: range.dBmin, dBmax: range.dBmax }, stops)
+               : stftToOffscreen(stft, stops);
+}
+
 function drawSpec() {
-  // If a crossfade animation is running for the current view, let it own the canvas.
   if (specFadeRAF && specFadeView === currentView) return;
 
-  const cvs = specCvs;
-  const cW = Math.round(cvs.clientWidth  * dpr);
-  const cH = Math.round(cvs.clientHeight * dpr);
+  const cW = Math.round(specCvs.clientWidth  * dpr);
+  const cH = Math.round(specCvs.clientHeight * dpr);
   if (!cW || !cH) return;
-  cvs.width = cW; cvs.height = cH;
-  const ctx = cvs.getContext('2d');
+  specCvs.width = cW; specCvs.height = cH;
+  const ctx = specCvs.getContext('2d');
   ctx.clearRect(0, 0, cW, cH);
 
-  if (stftA && !offA) offA = stftToOffscreen(stftA, PLASMA);
-  if (stftB && !offB) offB = stftToOffscreen(stftB, OCEAN);
-  if (stftInterp && !offInterp) offInterp = stftToOffscreen(stftInterp, HOT);
+  if (stftA && !offA) offA = makeOffscreen(stftA, PLASMA);
+  if (stftB && !offB) offB = makeOffscreen(stftB, OCEAN);
+  if (stftInterp && !offInterp) offInterp = makeOffscreen(stftInterp, HOT);
 
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = 'high';
@@ -1686,8 +1167,12 @@ function drawSpec() {
   drawStrip();
 }
 
-// Animate a crossfade on specCvs from oldOff → newOff for the given view.
-// If oldOff is null (first load), just draws newOff immediately.
+function drawStrip() {
+  const stft  = currentView === 'A' ? stftA : currentView === 'B' ? stftB : stftInterp;
+  const stops = currentView === 'A' ? PLASMA : currentView === 'B' ? OCEAN : HOT;
+  _drawStrip(stripCvs, stft, stops, dpr);
+}
+
 function startSpecFade(oldOff, newOff, view) {
   _cancelSpecFade();
   if (!oldOff || !newOff || oldOff === newOff) { drawSpec(); return; }
@@ -1699,109 +1184,66 @@ function startSpecFade(oldOff, newOff, view) {
   function tick() {
     const t = Math.min((performance.now() - specFadeStart) / (CROSSFADE_S * 1000), 1);
     if (currentView === specFadeView) {
-      const cvs = specCvs;
-      const cW = Math.round(cvs.clientWidth  * dpr);
-      const cH = Math.round(cvs.clientHeight * dpr);
+      const cW = Math.round(specCvs.clientWidth  * dpr);
+      const cH = Math.round(specCvs.clientHeight * dpr);
       if (cW && cH) {
-        cvs.width = cW; cvs.height = cH;
-        const ctx = cvs.getContext('2d');
+        specCvs.width = cW; specCvs.height = cH;
+        const ctx = specCvs.getContext('2d');
         ctx.imageSmoothingEnabled = true;
         ctx.imageSmoothingQuality = 'high';
-        ctx.globalAlpha = 1 - t;
-        ctx.drawImage(specFadeOldOff, 0, 0, cW, cH);
-        ctx.globalAlpha = t;
-        ctx.drawImage(specFadeNewOff, 0, 0, cW, cH);
+        ctx.globalAlpha = 1 - t; ctx.drawImage(specFadeOldOff, 0, 0, cW, cH);
+        ctx.globalAlpha = t;     ctx.drawImage(specFadeNewOff, 0, 0, cW, cH);
         ctx.globalAlpha = 1;
       }
     }
     if (t < 1) {
       specFadeRAF = requestAnimationFrame(tick);
     } else {
-      specFadeOldOff = null; specFadeNewOff = null; specFadeView = null;
-      specFadeRAF = null;
+      specFadeOldOff = null; specFadeNewOff = null; specFadeView = null; specFadeRAF = null;
       drawSpec();
     }
   }
   specFadeRAF = requestAnimationFrame(tick);
 }
 
-function drawStrip() {
-  const stft  = currentView === 'A' ? stftA : currentView === 'B' ? stftB : stftInterp;
-  const stops = currentView === 'A' ? PLASMA : currentView === 'B' ? OCEAN  : HOT;
-  if (!stft) return;
-
-  const cvs = stripCvs;
-  const cW  = Math.round(cvs.clientWidth  * dpr) || Math.round(2.5 * 16 * dpr);
-  const cH  = Math.round(cvs.clientHeight * dpr) || 400;
-  cvs.width = cW; cvs.height = cH;
-  const ctx = cvs.getContext('2d');
-  ctx.clearRect(0, 0, cW, cH);
-
-  const { magDB, nFrames, nBins, dBmin, dBmax } = stft;
-  const range = dBmax - dBmin || 1;
-  const f     = Math.floor(nFrames / 2);
-  for (let k = 0; k < nBins; k++) {
-    const t    = (magDB[f * nBins + k] - dBmin) / range;
-    const [r, g, b] = cmap(t, stops);
-    const y    = (1 - (k + 0.5) / nBins) * cH;
-    const barH = Math.ceil(cH / nBins) + 1;
-    const barW = Math.max(1, t * cW * 0.85);
-    ctx.fillStyle = `rgb(${r},${g},${b})`;
-    ctx.fillRect(cW - barW, y, barW, barH);
-  }
-}
-
 // ═══════════════════════════════════════════════════════════════════════
 // Playhead
 // ═══════════════════════════════════════════════════════════════════════
 
-const HANDLE_R = 7;   // logical px radius of drag handle
+const HANDLE_R = 7;
 
 function drawPlayhead(frac) {
-  const cvs = phCvs;
-  const cW = Math.round(cvs.clientWidth  * dpr);
-  const cH = Math.round(cvs.clientHeight * dpr);
-  cvs.width = cW; cvs.height = cH;
+  const cW = Math.round(phCvs.clientWidth  * dpr);
+  const cH = Math.round(phCvs.clientHeight * dpr);
+  phCvs.width = cW; phCvs.height = cH;
   if (frac < 0 || frac > 1.001) return;
-  const ctx = cvs.getContext('2d');
+  const ctx = phCvs.getContext('2d');
   const x   = Math.round(Math.min(frac, 1) * cW);
   const hr  = HANDLE_R * dpr;
 
-  // Vertical line (starts below the handle)
   ctx.strokeStyle = 'rgba(255,255,255,0.80)';
   ctx.lineWidth   = dpr;
   ctx.beginPath(); ctx.moveTo(x, hr * 2); ctx.lineTo(x, cH); ctx.stroke();
 
-  // Drag handle circle at top
   ctx.beginPath(); ctx.arc(x, hr, hr, 0, 2 * Math.PI);
-  ctx.fillStyle   = 'rgba(255,255,255,0.90)';
-  ctx.fill();
-  ctx.strokeStyle = 'rgba(0,0,0,0.45)';
-  ctx.lineWidth   = dpr;
-  ctx.stroke();
+  ctx.fillStyle   = 'rgba(255,255,255,0.90)'; ctx.fill();
+  ctx.strokeStyle = 'rgba(0,0,0,0.45)'; ctx.lineWidth = dpr; ctx.stroke();
 }
 
 function clearPlayhead() {
-  const cvs = phCvs;
-  cvs.width  = cvs.clientWidth  * dpr;
-  cvs.height = cvs.clientHeight * dpr;
+  phCvs.width  = phCvs.clientWidth  * dpr;
+  phCvs.height = phCvs.clientHeight * dpr;
 }
 
 // ═══════════════════════════════════════════════════════════════════════
 // Resize
 // ═══════════════════════════════════════════════════════════════════════
 
-new ResizeObserver(() => {
-  offA = offB = offInterp = null;
-  drawSpec();
-}).observe($('specWrap'));
-
+new ResizeObserver(() => { offA = offB = offInterp = null; drawSpec(); }).observe($('specWrap'));
 new ResizeObserver(() => positionPipelineControls()).observe($('pipelinePanel'));
 
 // ═══════════════════════════════════════════════════════════════════════
 // Pipeline control positioning
-// Computes the x-center of key pipeline sections and positions the
-// α slider / VQ mode row inside #pipelineCtrl to align with the diagram.
 // ═══════════════════════════════════════════════════════════════════════
 
 function positionPipelineControls() {
@@ -1813,16 +1255,18 @@ function positionPipelineControls() {
   const padX = 10;
   const usW  = panelW - 2 * padX;
 
-  function secLeft(i)   { return padX + pcts.slice(0, i).reduce((a, b) => a + b, 0) / tot * usW; }
-  function secWidth(i)  { return pcts[i] / tot * usW; }
-  function secCenter(i) { return secLeft(i) + secWidth(i) / 2; }
+  const secLeft  = i => padX + pcts.slice(0, i).reduce((a, b) => a + b, 0) / tot * usW;
+  const secWidth = i => pcts[i] / tot * usW;
+  const secCenter= i => secLeft(i) + secWidth(i) / 2;
 
   const isVQ       = interpPoint === 'vq_codes';
   const usesLevels = isVQ && (vqMode === 'level_swap' || vqMode === 'int_lerp');
-  const stackedVQ  = isVQ && !usesLevels;  // flat_swap or frame_swap: both controls visible, stacked
+  const stackedVQ  = isVQ && !usesLevels;
 
-  const ctrl = $('pipelineCtrl');
-  ctrl.style.height = stackedVQ ? '74px' : '42px';
+  const ctrl  = $('pipelineCtrl');
+  const is48  = mp.getModelHz() === '48k';
+  const baseH = stackedVQ ? 74 : 42;
+  ctrl.style.height = (is48 ? baseH + 24 : baseH) + 'px';
 
   const sl = $('mainSliderSection');
   const vq = $('vqModeBar');
@@ -1832,36 +1276,53 @@ function positionPipelineControls() {
   vq.style.left  = vqLeft + 'px';
   vq.style.width = vqW + 'px';
 
+  // Compute slider left/width (used for both mainSliderSection and scaleSliderRow)
+  let slLeft, slW;
+  if (stackedVQ || usesLevels) {
+    slLeft = vqLeft; slW = vqW;
+  } else {
+    slW    = Math.max(180, Math.min(260, secWidth(2) + secWidth(3) + secWidth(4) + secWidth(5) + secWidth(6)));
+    const sliderSec = interpPoint === 'quantized_embeddings' ? 12 : 4;
+    slLeft = Math.max(0, secCenter(sliderSec) - slW / 2);
+  }
+
+  const scRow = $('scaleSliderRow');
+  scRow.style.left  = slLeft + 'px';
+  scRow.style.width = slW + 'px';
+
   if (stackedVQ) {
-    // VQ mode buttons at top, α slider below — both centred on the circles section
     vq.style.top       = '4px';
     vq.style.transform = 'none';
-
-    sl.style.left      = vqLeft + 'px';
-    sl.style.width     = vqW + 'px';
-    sl.style.top       = '40px';
+    sl.style.left      = slLeft + 'px';
+    sl.style.width     = slW + 'px';
+    // With scale row: push main slider up so scale row fits below
+    sl.style.top       = is48 ? '36px' : '40px';
     sl.style.transform = 'none';
+    scRow.style.bottom    = '4px';
+    scRow.style.top       = 'auto';
+    scRow.style.transform = 'none';
+  } else if (usesLevels) {
+    vq.style.top       = '4px';
+    vq.style.transform = 'none';
+    scRow.style.top       = 'auto';
+    scRow.style.bottom    = '4px';
+    scRow.style.transform = 'none';
   } else {
-    // Default: each element vertically centred in the strip
     vq.style.top       = '50%';
     vq.style.transform = 'translateY(-50%)';
-
-    const sliderW   = Math.max(180, Math.min(260, secWidth(2) + secWidth(3) + secWidth(4) + secWidth(5) + secWidth(6)));
-    const sliderSec = interpPoint === 'quantized_embeddings' ? 12 : 4;
-    sl.style.left      = Math.max(0, secCenter(sliderSec) - sliderW / 2) + 'px';
-    sl.style.width     = sliderW + 'px';
-    sl.style.top       = '50%';
-    sl.style.transform = 'translateY(-50%)';
+    sl.style.left      = slLeft + 'px';
+    sl.style.width     = slW + 'px';
+    // With scale row: anchor main slider at top, scale row at bottom
+    sl.style.top       = is48 ? '4px'  : '50%';
+    sl.style.transform = is48 ? 'none' : 'translateY(-50%)';
+    scRow.style.bottom    = '4px';
+    scRow.style.top       = 'auto';
+    scRow.style.transform = 'none';
   }
 
-  // Level slider panel — same width as VQ mode selector, centred on section 8
-  {
-    const ms = $('multisliderPanel');
-    ms.style.width      = vqW + 'px';
-    ms.style.marginLeft = vqLeft + 'px';
-  }
+  $('multisliderPanel').style.width      = vqW + 'px';
+  $('multisliderPanel').style.marginLeft = vqLeft + 'px';
 
-  // Interp-point labels above the diagram
   $('togEncLatents').style.left = secCenter(4)  + 'px';
   $('togVQCodes').style.left    = secCenter(8)  + 'px';
   $('togQuantEmb').style.left   = secCenter(12) + 'px';
@@ -1877,11 +1338,7 @@ function setStatus(msg, isErr = false) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Boot
-// ═══════════════════════════════════════════════════════════════════════
-
-// ═══════════════════════════════════════════════════════════════════════
-// Shift key tracking (for gang-drag on level sliders)
+// Shift key tracking
 // ═══════════════════════════════════════════════════════════════════════
 
 document.addEventListener('keydown', e => {
@@ -1891,31 +1348,27 @@ document.addEventListener('keydown', e => {
     if (isPlaying) stopPlayback(); else startPlayback(seekOffset);
   }
 });
-document.addEventListener('keyup',   e => { if (e.key === 'Shift') shiftHeld = false; });
-// Clear on blur so a window switch doesn't leave shift stuck
-window.addEventListener('blur', () => { shiftHeld = false; });
+document.addEventListener('keyup',  e => { if (e.key === 'Shift') shiftHeld = false; });
+window.addEventListener('blur',     () => { shiftHeld = false; });
 
 // ═══════════════════════════════════════════════════════════════════════
 // Pipeline visualization
 // ═══════════════════════════════════════════════════════════════════════
 
-const COL_A_RGB = [204, 51,  51 ];   // red  — Source A
-const COL_B_RGB = [ 51, 102, 204];   // blue — Source B
-
-let currentScrubFrac = 0;
-let pipelineTimer    = null;
+const COL_A_RGB = [204, 51,  51];
+const COL_B_RGB = [ 51, 102, 204];
 
 function blendRGB(t, ca, cb) {
   return [
-    Math.round(ca[0] * (1 - t) + cb[0] * t),
-    Math.round(ca[1] * (1 - t) + cb[1] * t),
-    Math.round(ca[2] * (1 - t) + cb[2] * t),
+    Math.round(ca[0] * (1-t) + cb[0] * t),
+    Math.round(ca[1] * (1-t) + cb[1] * t),
+    Math.round(ca[2] * (1-t) + cb[2] * t),
   ];
 }
 
 function computeNf() {
   if (!rawAudioA) return 1;
-  const fps = modelSel.value === '24k' ? 75 : 150;
+  const fps = mp.getModelHz() === '24k' ? 75 : 150;
   return Math.max(1, Math.round(rawAudioA.length / sourceSR * fps));
 }
 
@@ -1923,7 +1376,7 @@ function getVQCircleColor(levelK, scrubFrac) {
   const alpha  = parseInt(interpSlider.value) / 100;
   const Nf     = computeNf();
   const frame  = Math.min(Math.floor(scrubFrac * Nf), Nf - 1);
-  let t;   // 0 = A (red), 1 = B (blue), or a continuous [0,1] for int_lerp
+  let t;
 
   switch (vqMode) {
     case 'flat_swap': {
@@ -1950,7 +1403,6 @@ function getVQCircleColor(levelK, scrubFrac) {
     default:
       t = 0.5;
   }
-
   const [r, g, b] = blendRGB(t, COL_A_RGB, COL_B_RGB);
   return `rgb(${r},${g},${b})`;
 }
@@ -1967,11 +1419,9 @@ function pipeRR(ctx, x, y, w, h, r) {
 
 function drawPipeline() {
   const cvs = $('pipelineCanvas');
-  const W = cvs.clientWidth;
-  const H = cvs.clientHeight;
+  const W = cvs.clientWidth, H = cvs.clientHeight;
   if (!W || !H) return;
-  cvs.width  = W * dpr;
-  cvs.height = H * dpr;
+  cvs.width  = W * dpr; cvs.height = H * dpr;
   const ctx = cvs.getContext('2d');
   ctx.scale(dpr, dpr);
   ctx.clearRect(0, 0, W, H);
@@ -1983,25 +1433,16 @@ function drawPipeline() {
   const vqActive  = interpPoint === 'vq_codes';
   const qeActive  = interpPoint === 'quantized_embeddings';
 
-  const padX = 10;
-  const usW  = W - 2 * padX;
-  const cy   = H / 2;
-  const bH   = 30;                    // box height
-  const bY   = cy - bH / 2;
-  const fs   = Math.max(9, Math.min(11, W / 95));  // font size
+  const padX = 10, usW = W - 2 * padX;
+  const cy = H / 2, bH = 30, bY = cy - bH / 2;
+  const fs = Math.max(9, Math.min(11, W / 95));
 
-  // Proportional section widths — index map:
-  // 0:sources  1:arr  2:EncAudio  3:arr  4:tensor1  5:arr  6:VQ
-  // 7:arr(VQ→circ)  8:circles  9:arr(circ→Dec)
-  // 10:DecCodes  11:arr  12:tensor2  13:arr  14:DecAudio  15:arr  16:Out
   const pcts = [7, 2.5, 11, 2, 3, 2, 5, 2, 13, 2, 11, 2, 3, 2, 11, 2.5, 6];
   const tot  = pcts.reduce((a, b) => a + b, 0);
   const sw   = pcts.map(p => p / tot * usW);
 
   let x = padX;
-  const nx = i => { const v = x; x += sw[i]; return v; };  // advance and return start
-
-  // ── helpers ──
+  const nx = i => { const v = x; x += sw[i]; return v; };
 
   function drawBox(label, lx, lw, active) {
     ctx.fillStyle   = active ? '#3a2a0a' : '#252525';
@@ -2024,94 +1465,79 @@ function drawPipeline() {
   }
 
   function drawTensor(lx, lw, active) {
-    const th = bH * 0.80;
-    const ty = cy - th / 2;
+    const th = bH * 0.80, ty = cy - th / 2;
     if (active) {
       const [r, g, b] = blendRGB(alpha, COL_A_RGB, COL_B_RGB);
       ctx.fillStyle   = ready ? `rgb(${r},${g},${b})` : 'rgba(110,55,55,0.45)';
-      ctx.strokeStyle = '#c8902a';
-      ctx.lineWidth   = 1.5;
+      ctx.strokeStyle = '#c8902a'; ctx.lineWidth = 1.5;
     } else {
-      ctx.fillStyle   = '#363636';
-      ctx.strokeStyle = '#303030';
-      ctx.lineWidth   = 1;
+      ctx.fillStyle   = '#363636'; ctx.strokeStyle = '#303030'; ctx.lineWidth = 1;
     }
     pipeRR(ctx, lx, ty, lw, th, 2); ctx.fill(); ctx.stroke();
-
     if (active) {
-      ctx.fillStyle    = ready ? 'rgba(255,255,255,0.75)' : 'rgba(255,180,80,0.6)';
-      ctx.font         = `bold ${fs + 1}px system-ui`;
-      ctx.textAlign    = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillStyle  = ready ? 'rgba(255,255,255,0.75)' : 'rgba(255,180,80,0.6)';
+      ctx.font       = `bold ${fs + 1}px system-ui`;
+      ctx.textAlign  = 'center'; ctx.textBaseline = 'middle';
       ctx.fillText('α', lx + lw / 2, cy);
     }
   }
 
   // ── 0: Source A / B labels ──
   {
-    const lx = nx(0); const lw = sw[0];
-    const sh = Math.floor(bH / 2) - 2;
+    const lx = nx(0), lw = sw[0], sh = Math.floor(bH / 2) - 2;
     ctx.fillStyle = `rgb(${COL_A_RGB.join(',')})`;
     pipeRR(ctx, lx, cy - sh - 1, lw, sh, 3); ctx.fill();
     ctx.fillStyle = `rgb(${COL_B_RGB.join(',')})`;
     pipeRR(ctx, lx, cy + 1, lw, sh, 3); ctx.fill();
-    ctx.fillStyle = '#fff';
-    ctx.font = `bold ${Math.min(fs, 10)}px system-ui`;
+    ctx.fillStyle = '#fff'; ctx.font = `bold ${Math.min(fs, 10)}px system-ui`;
     ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
     ctx.fillText('A', lx + lw / 2, cy - sh / 2 - 1);
     ctx.fillText('B', lx + lw / 2, cy + sh / 2 + 1);
   }
 
-  drawArrow(nx(1), sw[1]);                              // ── 1 ──
-  drawBox('Encode Audio', nx(2), sw[2], false);         // ── 2 ──
-  drawArrow(nx(3), sw[3]);                              // ── 3 ──
-  drawTensor(nx(4), sw[4], encActive);                  // ── 4: Tensor 1 ──
-  drawArrow(nx(5), sw[5]);                              // ── 5 ──
-  drawBox('VQ', nx(6), sw[6], false);                   // ── 6 ──
-  drawArrow(nx(7), sw[7]);                              // ── 7: VQ → circles ──
+  drawArrow(nx(1), sw[1]);
+  drawBox('Encode Audio', nx(2), sw[2], false);
+  drawArrow(nx(3), sw[3]);
+  drawTensor(nx(4), sw[4], encActive);
+  drawArrow(nx(5), sw[5]);
+  drawBox('VQ', nx(6), sw[6], false);
+  drawArrow(nx(7), sw[7]);
 
-  // ── 8: VQ circles (one frame, dashed box, max 4 per row) ──
+  // ── 8: VQ circles ──
   {
-    const lx = nx(8); const lw = sw[8];
-    const cols    = Math.min(Nq, 8);
-    const rows    = Math.ceil(Nq / cols);
-    const padI    = 5;
-    const rowGap  = 3;
-    const colGap  = 3;
-    const availH  = H - 2 * 8;
+    const lx = nx(8), lw = sw[8];
+    const cols   = Math.min(Nq, 8), rows = Math.ceil(Nq / cols);
+    const padI   = 5, rowGap = 3, colGap = 3;
+    const availH = H - 2 * 8;
     const circByH = Math.floor((availH - 2 * padI - (rows - 1) * rowGap) / rows);
-    const circByW = Math.floor((lw   - 2 * padI - (cols - 1) * colGap) / cols);
+    const circByW = Math.floor((lw    - 2 * padI - (cols - 1) * colGap) / cols);
     const circD   = Math.max(6, Math.min(12, circByH, circByW));
     const circR   = circD / 2;
 
-    // Dashed box spans the full section so arrows connect flush on both sides
     const gridW = cols * circD + (cols - 1) * colGap;
     const gridH = rows * circD + (rows - 1) * rowGap;
     const dbH   = gridH + 2 * padI;
-    const dbX   = lx;          // flush with left arrow end
-    const dbW   = lw;          // flush with right arrow start
-    const dbY   = cy - dbH / 2;
+    const dbX   = lx, dbW = lw, dbY = cy - dbH / 2;
 
     ctx.save();
     ctx.strokeStyle = vqActive ? '#c8902a' : '#444';
-    ctx.lineWidth   = 1;
-    ctx.setLineDash([4, 3]);
+    ctx.lineWidth = 1; ctx.setLineDash([4, 3]);
     pipeRR(ctx, dbX, dbY, dbW, dbH, 4); ctx.stroke();
     ctx.restore();
 
-    // Centre the circles grid inside the box
     const gridX = dbX + (dbW - gridW) / 2;
     const gridY = dbY + padI;
-
     const _pipeNow = performance.now();
+
     for (let k = 0; k < Nq; k++) {
-      const col  = k % cols;
-      const row  = Math.floor(k / cols);
+      const col  = k % cols, row = Math.floor(k / cols);
       const cx2  = gridX + col * (circD + colGap) + circR;
       const cy2  = gridY + row * (circD + rowGap) + circR;
       const isHL = k === _activeLevel;
       const pulse = isHL ? 0.5 + 0.5 * Math.sin(2 * Math.PI * _pipeNow / 400) : 0;
       ctx.fillStyle = (vqActive && ready) ? getVQCircleColor(k, currentScrubFrac) : '#484848';
-      ctx.beginPath(); ctx.arc(cx2, cy2, isHL ? circR * (1 + 0.35 * pulse) : circR, 0, 2 * Math.PI);
+      ctx.beginPath();
+      ctx.arc(cx2, cy2, isHL ? circR * (1 + 0.35 * pulse) : circR, 0, 2 * Math.PI);
       ctx.fill();
       ctx.strokeStyle = isHL ? `rgba(255,210,100,${0.5 + pulse * 0.5})` : '#1a1a1a';
       ctx.lineWidth   = isHL ? 1.5 : 0.5;
@@ -2121,26 +1547,25 @@ function drawPipeline() {
     if (vqActive && ready) {
       const Nf    = computeNf();
       const frame = Math.min(Math.floor(currentScrubFrac * Nf), Nf - 1);
-      ctx.fillStyle    = '#666';
-      ctx.font         = `${fs - 2}px system-ui`;
-      ctx.textAlign    = 'center'; ctx.textBaseline = 'top';
+      ctx.fillStyle = '#666'; ctx.font = `${fs - 2}px system-ui`;
+      ctx.textAlign = 'center'; ctx.textBaseline = 'top';
       ctx.fillText(`f ${frame + 1}/${Nf}`, lx + lw / 2, dbY + dbH + 2);
     }
 
     _vqCircleGrid = { gridX, gridY, circD, circR, colGap, rowGap, cols, Nq };
   }
 
-  drawArrow(nx(9),  sw[9]);                             // ── 9: circles → Decode Codes ──
-  drawBox('Decode Codes', nx(10), sw[10], false);       // ── 10 ──
-  drawArrow(nx(11), sw[11]);                            // ── 11 ──
-  drawTensor(nx(12), sw[12], qeActive);                 // ── 12: Tensor 2 ──
-  drawArrow(nx(13), sw[13]);                            // ── 13 ──
-  drawBox('Decode Audio', nx(14), sw[14], false);       // ── 14 ──
-  drawArrow(nx(15), sw[15]);                            // ── 15 ──
+  drawArrow(nx(9),  sw[9]);
+  drawBox('Decode Codes', nx(10), sw[10], false);
+  drawArrow(nx(11), sw[11]);
+  drawTensor(nx(12), sw[12], qeActive);
+  drawArrow(nx(13), sw[13]);
+  drawBox('Decode Audio', nx(14), sw[14], false);
+  drawArrow(nx(15), sw[15]);
 
   // ── 16: Out label ──
   {
-    const lx = nx(16); const lw = sw[16];
+    const lx = nx(16), lw = sw[16];
     ctx.fillStyle = '#777'; ctx.font = `${fs}px system-ui`;
     ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
     ctx.fillText('Out', lx + lw / 2, cy);
@@ -2151,11 +1576,9 @@ function startPipelineTimer() {
   if (pipelineTimer) return;
   pipelineTimer = setInterval(() => {
     if (!isPlaying || !audioCtx) return;
-    const dur = playingDuration || 1;
+    const dur     = playingDuration || 1;
     const elapsed = audioCtx.currentTime - playStart;
-    currentScrubFrac = looping
-      ? (elapsed % dur) / dur
-      : Math.min(elapsed / dur, 1);
+    currentScrubFrac = looping ? (elapsed % dur) / dur : Math.min(elapsed / dur, 1);
     drawPipeline();
   }, 100);
 }
@@ -2165,51 +1588,42 @@ function stopPipelineTimer() {
   drawPipeline();
 }
 
-// ── Level meter (live.gain~ style) ────────────────────────────────────────
+// ── Level meter ──────────────────────────────────────────────────────────
+
 const _levelBuf = new Float32Array(512);
 
 function _drawLevelMeter() {
   const cvs = $('levelMeter');
   if (!cvs) return;
-  const dpr = window.devicePixelRatio || 1;
+  const dpr2 = window.devicePixelRatio || 1;
   const W = 10, H = 28;
-  if (cvs.width !== Math.round(W * dpr) || cvs.height !== Math.round(H * dpr)) {
-    cvs.width  = Math.round(W * dpr);
-    cvs.height = Math.round(H * dpr);
+  if (cvs.width !== Math.round(W * dpr2) || cvs.height !== Math.round(H * dpr2)) {
+    cvs.width  = Math.round(W * dpr2);
+    cvs.height = Math.round(H * dpr2);
   }
   const ctx = cvs.getContext('2d');
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.setTransform(dpr2, 0, 0, dpr2, 0, 0);
   ctx.clearRect(0, 0, W, H);
-  ctx.fillStyle = '#111';
-  ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = '#111'; ctx.fillRect(0, 0, W, H);
 
   if (!analyserNode || !isPlaying) return;
 
   analyserNode.getFloatTimeDomainData(_levelBuf);
   let rms = 0;
-  const len = _levelBuf.length;
-  for (let i = 0; i < len; i++) rms += _levelBuf[i] * _levelBuf[i];
-  rms = Math.sqrt(rms / len);
+  for (let i = 0; i < _levelBuf.length; i++) rms += _levelBuf[i] * _levelBuf[i];
+  rms = Math.sqrt(rms / _levelBuf.length);
 
-  // Ballistic: fast attack, moderate release
   if (rms > _levelCur) _levelCur = rms * 0.9 + _levelCur * 0.1;
   else                  _levelCur = _levelCur * 0.88;
   if (_levelCur > _levelPeak) _levelPeak = _levelCur;
   else                        _levelPeak = _levelPeak * 0.997;
 
-  // Map to 0-1 (linear amplitude; most signals are 0-1 range)
-  const level = Math.min(1, _levelCur);
-  const peak  = Math.min(1, _levelPeak);
-
+  const level = Math.min(1, _levelCur), peak = Math.min(1, _levelPeak);
   const barH  = Math.round(level * H);
   const peakY = Math.max(0, Math.round((1 - peak) * H) - 1);
 
-  // Color zones: green → yellow → red
-  const col = level > 0.85 ? '#cc4444' : level > 0.65 ? '#c8b828' : '#5cb85c';
-  ctx.fillStyle = col;
+  ctx.fillStyle = level > 0.85 ? '#cc4444' : level > 0.65 ? '#c8b828' : '#5cb85c';
   ctx.fillRect(1, H - barH, W - 2, barH);
-
-  // Peak hold tick
   if (_levelPeak > 0.01) {
     ctx.fillStyle = peak > 0.85 ? '#cc4444' : '#aaaaaa';
     ctx.fillRect(1, peakY, W - 2, 2);
@@ -2228,35 +1642,32 @@ function startLevelMeter() {
 
 function stopLevelMeter() {
   if (_levelRAF) { cancelAnimationFrame(_levelRAF); _levelRAF = null; }
-  _levelCur = 0; _levelPeak = 0;
-  _drawLevelMeter();
+  _levelCur = 0; _levelPeak = 0; _drawLevelMeter();
 }
 
-// Click a VQ circle → navigate slider panel to that level and blink it
+// ── VQ circle click → navigate multislider ─────────────────────────────
+
 $('pipelineCanvas').addEventListener('click', e => {
   if (interpPoint !== 'vq_codes') return;
   if (vqMode !== 'level_swap' && vqMode !== 'int_lerp') return;
   if (!_vqCircleGrid) return;
   const { gridX, gridY, circD, circR, colGap, rowGap, cols, Nq } = _vqCircleGrid;
   const rect = e.currentTarget.getBoundingClientRect();
-  const mx = e.clientX - rect.left;
-  const my = e.clientY - rect.top;
+  const mx = e.clientX - rect.left, my = e.clientY - rect.top;
   for (let k = 0; k < Nq; k++) {
-    const col = k % cols;
-    const row = Math.floor(k / cols);
+    const col = k % cols, row = Math.floor(k / cols);
     const cx2 = gridX + col * (circD + colGap) + circR;
     const cy2 = gridY + row * (circD + rowGap) + circR;
     const dx = mx - cx2, dy = my - cy2;
     if (dx * dx + dy * dy <= (circR + 3) * (circR + 3)) {
-      // Navigate slider page to show this level and blink its row
       _scatterOffset = Math.floor(k / 4) * 4;
       drawMultislider();
-      const rowIdx = k - _scatterOffset;
-      const rows = document.querySelectorAll('#scatterSliders .scatter-row');
+      const rowIdx    = k - _scatterOffset;
+      const rows      = document.querySelectorAll('#scatterSliders .scatter-row');
       const targetRow = rows[rowIdx];
       if (targetRow) {
         targetRow.classList.remove('blinking');
-        void targetRow.offsetWidth; // force reflow to restart animation
+        void targetRow.offsetWidth;
         targetRow.classList.add('blinking');
         targetRow.addEventListener('animationend', () => targetRow.classList.remove('blinking'), { once: true });
       }
@@ -2265,14 +1676,11 @@ $('pipelineCanvas').addEventListener('click', e => {
   }
 });
 
-// Seek position (seconds) — set by clicking spectrogram, used when play starts
-let seekOffset = 0;
-let isDraggingPlayhead = false;
+// ── Seek / scrub ──────────────────────────────────────────────────────────
 
 function isNearHandle(offsetX, offsetY) {
   const hw = $('specWrap').clientWidth;
-  return Math.abs(offsetX - currentScrubFrac * hw) < HANDLE_R + 6
-      && offsetY < HANDLE_R * 2 + 8;
+  return Math.abs(offsetX - currentScrubFrac * hw) < HANDLE_R + 6 && offsetY < HANDLE_R * 2 + 8;
 }
 
 function applySeek(frac) {
@@ -2287,48 +1695,19 @@ $('specWrap').style.cursor = 'crosshair';
 
 $('specWrap').addEventListener('mousedown', e => {
   if (!audioCtx) return;
-  if (isNearHandle(e.offsetX, e.offsetY)) {
-    isDraggingPlayhead = true;
-    e.preventDefault();
-  } else {
-    applySeek(e.offsetX / $('specWrap').clientWidth);
-  }
+  if (isNearHandle(e.offsetX, e.offsetY)) { isDraggingPlayhead = true; e.preventDefault(); }
+  else applySeek(e.offsetX / $('specWrap').clientWidth);
 });
 
 $('specWrap').addEventListener('mousemove', e => {
-  // Update cursor shape based on proximity to handle
   $('specWrap').style.cursor =
     (isDraggingPlayhead || isNearHandle(e.offsetX, e.offsetY)) ? 'ew-resize' : 'crosshair';
-
   if (!isDraggingPlayhead) return;
   applySeek(e.offsetX / $('specWrap').clientWidth);
 });
 
 window.addEventListener('mouseup', () => { isDraggingPlayhead = false; });
-
 new ResizeObserver(() => drawPipeline()).observe($('pipelinePanel'));
-
-// ═══════════════════════════════════════════════════════════════════════
-// Auto-recalc listeners
-// ═══════════════════════════════════════════════════════════════════════
-
-// Source/model/mode controls → full pipeline recalc
-['modelSel', 'bwSel', 'frameSel', 'srcTypeA', 'srcTypeB'].forEach(id =>
-  $(id).addEventListener('change', () => {
-    if (id === 'modelSel' || id === 'bwSel') { updateLevelSliders(); drawPipeline(); }
-    scheduleFullRecalc();
-  }));
-
-[togNS, togS].forEach(btn => {
-  // mode toggles already set `streaming` — just hook the recalc
-  btn.addEventListener('click', () => scheduleFullRecalc());
-});
-
-// Number inputs: debounce to avoid firing on every keystroke
-['freqA', 'freqB', 'dur', 'gateFreqA', 'gateFreqB', 'gateDecayA', 'gateDecayB'].forEach(id =>
-  $(id).addEventListener('input', () => scheduleFullRecalc(500)));
-
-// (file input recalc is handled inside the async change handler in the forEach loop above)
 
 // ═══════════════════════════════════════════════════════════════════════
 // Boot
@@ -2339,7 +1718,8 @@ initLevelSliders();
 updateLegend();
 updateNotePanel();
 updateVqSectionVisibility();
-loopBtn.classList.add('active');   // loop on by default
+updateScaleSliderVisibility();
+loopBtn.classList.add('active');
 drawPipeline();
 </script>
 </body>

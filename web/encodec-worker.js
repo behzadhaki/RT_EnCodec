@@ -283,20 +283,24 @@ function lerpF32(a, b, alpha) {
 
 // ── VQ code mixing helpers ────────────────────────────────────────────────
 
-function mixCodesElementWise(codes_a, codes_b, alpha) {
+function mixCodesElementWise(codes_a, codes_b, alpha, deterministic) {
   const out = new (codes_a.constructor)(codes_a.length);
   for (let i = 0; i < out.length; i++) {
-    const frac = ((Math.imul(i + 1, 0x9E3779B9) >>> 0) / 0xFFFFFFFF);
+    const frac = deterministic
+      ? ((Math.imul(i + 1, 0x9E3779B9) >>> 0) / 0xFFFFFFFF)
+      : Math.random();
     out[i] = frac < alpha ? codes_b[i] : codes_a[i];
   }
   return out;
 }
 
-function mixCodesByFrame(codes_a, codes_b, dims, alpha) {
+function mixCodesByFrame(codes_a, codes_b, dims, alpha, deterministic) {
   const N_q = dims[1], T = dims[2];
   const out = new (codes_a.constructor)(codes_a.length);
   for (let t = 0; t < T; t++) {
-    const frac = ((Math.imul(t + 1, 0x9E3779B9) >>> 0) / 0xFFFFFFFF);
+    const frac = deterministic
+      ? ((Math.imul(t + 1, 0x9E3779B9) >>> 0) / 0xFFFFFFFF)
+      : Math.random();
     const useB = frac < alpha;
     for (let k = 0; k < N_q; k++) {
       const idx = k * T + t;
@@ -306,14 +310,15 @@ function mixCodesByFrame(codes_a, codes_b, dims, alpha) {
   return out;
 }
 
-function mixCodesByLevel(codes_a, codes_b, dims, levelAlphas) {
+function mixCodesByLevel(codes_a, codes_b, dims, levelAlphas, deterministic) {
   const N_q = dims[1], T = dims[2];
   const out = new (codes_a.constructor)(codes_a.length);
   for (let k = 0; k < N_q; k++) {
     const alpha_k = levelAlphas[k] ?? 0.5;
     for (let t = 0; t < T; t++) {
-      const seed = (Math.imul(k + 1, 49999) + t + 1) | 0;
-      const frac = ((Math.imul(seed, 0x9E3779B9) >>> 0) / 0xFFFFFFFF);
+      const frac = deterministic
+        ? ((Math.imul((Math.imul(k + 1, 49999) + t + 1) | 0, 0x9E3779B9) >>> 0) / 0xFFFFFFFF)
+        : Math.random();
       const idx  = k * T + t;
       out[idx] = frac < alpha_k ? codes_b[idx] : codes_a[idx];
     }
@@ -406,8 +411,10 @@ async function decodeFromLatents(emb, embDims, scale, scaleDims, modelHz, hDec, 
 }
 
 // Apply interpolation at the chosen point then decode to audio.
+// scaleAlpha independently controls the 48k RMS scale mix (A=0, B=1).
 async function interpDecodeOnce(capA, capB, alpha, interpPoint, modelHz, hDec, cDec,
-                                vqMode = 'flat_swap', levelAlphas = null) {
+                                vqMode = 'flat_swap', levelAlphas = null, scaleAlpha = 0.5,
+                                deterministic = true) {
   if (interpPoint === 'encoder_latents') {
     const n         = Math.min(capA.emb_enc.length, capB.emb_enc.length);
     const interpEmb = lerpF32(capA.emb_enc.subarray(0, n), capB.emb_enc.subarray(0, n), alpha);
@@ -419,7 +426,7 @@ async function interpDecodeOnce(capA, capB, alpha, interpPoint, modelHz, hDec, c
     const decCodesOut = await sessions.decCodes.run({ codes: quantOut.codes });
     const qEmb  = new Float32Array(decCodesOut.emb.data);
     const qDims = decCodesOut.emb.dims.slice();
-    const scale = (capA.scale && capB.scale) ? lerpF32(capA.scale, capB.scale, alpha) : null;
+    const scale = (capA.scale && capB.scale) ? lerpF32(capA.scale, capB.scale, scaleAlpha) : null;
     return decodeFromLatents(qEmb, qDims, scale, capA.scaleDims, modelHz, hDec, cDec);
   }
 
@@ -427,23 +434,23 @@ async function interpDecodeOnce(capA, capB, alpha, interpPoint, modelHz, hDec, c
     let mixedCodes;
     switch (vqMode) {
       case 'frame_swap':
-        mixedCodes = mixCodesByFrame(capA.codes, capB.codes, capA.codesDims, alpha);
+        mixedCodes = mixCodesByFrame(capA.codes, capB.codes, capA.codesDims, alpha, deterministic);
         break;
       case 'level_swap':
-        mixedCodes = mixCodesByLevel(capA.codes, capB.codes, capA.codesDims, levelAlphas || []);
+        mixedCodes = mixCodesByLevel(capA.codes, capB.codes, capA.codesDims, levelAlphas || [], deterministic);
         break;
       case 'int_lerp':
         mixedCodes = mixCodesIntLerpByLevel(capA.codes, capB.codes, capA.codesDims,
                        levelAlphas || new Array(capA.codesDims[1]).fill(alpha));
         break;
       default: // flat_swap
-        mixedCodes = mixCodesElementWise(capA.codes, capB.codes, alpha);
+        mixedCodes = mixCodesElementWise(capA.codes, capB.codes, alpha, deterministic);
     }
     const codesTensor = new ort.Tensor(capA.codesType, mixedCodes, capA.codesDims);
     const decCodesOut = await sessions.decCodes.run({ codes: codesTensor });
     const emb   = new Float32Array(decCodesOut.emb.data);
     const dims  = decCodesOut.emb.dims.slice();
-    const scale = (capA.scale && capB.scale) ? lerpF32(capA.scale, capB.scale, alpha) : null;
+    const scale = (capA.scale && capB.scale) ? lerpF32(capA.scale, capB.scale, scaleAlpha) : null;
     return decodeFromLatents(emb, dims, scale, capA.scaleDims, modelHz, hDec, cDec);
   }
 
@@ -452,7 +459,7 @@ async function interpDecodeOnce(capA, capB, alpha, interpPoint, modelHz, hDec, c
   const interpEmb = lerpF32(capA.emb_quant.subarray(0, n), capB.emb_quant.subarray(0, n), alpha);
   const [B, C]    = capA.embQuantDims;
   const dims      = [B, C, n / (B * C)];
-  const scale     = (capA.scale && capB.scale) ? lerpF32(capA.scale, capB.scale, alpha) : null;
+  const scale     = (capA.scale && capB.scale) ? lerpF32(capA.scale, capB.scale, scaleAlpha) : null;
   return decodeFromLatents(interpEmb, dims, scale, capA.scaleDims, modelHz, hDec, cDec);
 }
 
@@ -626,7 +633,8 @@ async function encodeAndCapture48k(audio, jobId) {
 async function runInterpolation(msg) {
   const { jobId, modelHz, bwKbps, streaming, frameSize,
           alpha, interpPoint,
-          vqMode = 'flat_swap', levelAlphas = null } = msg;
+          vqMode = 'flat_swap', levelAlphas = null,
+          scaleAlpha = 0.5, deterministic = true } = msg;
 
   try {
     self.postMessage({ type: 'progress', jobId, value: 0, status: 'Loading models…' });
@@ -641,8 +649,8 @@ async function runInterpolation(msg) {
     }
 
     const decoded = (capsA.mode === 'ola48')
-      ? await interpFromCached48k(capsA, capsB, alpha, interpPoint, vqMode, levelAlphas, jobId)
-      : await interpFromCached24k(capsA, capsB, alpha, interpPoint, vqMode, levelAlphas, jobId);
+      ? await interpFromCached48k(capsA, capsB, alpha, interpPoint, vqMode, levelAlphas, scaleAlpha, deterministic, jobId)
+      : await interpFromCached24k(capsA, capsB, alpha, interpPoint, vqMode, levelAlphas, scaleAlpha, deterministic, jobId);
 
     if (decoded === null) return;
     self.postMessage({ type: 'result', jobId, decoded }, [decoded.buffer]);
@@ -652,13 +660,13 @@ async function runInterpolation(msg) {
   }
 }
 
-async function interpFromCached24k(capsA, capsB, alpha, interpPoint, vqMode, levelAlphas, jobId) {
+async function interpFromCached24k(capsA, capsB, alpha, interpPoint, vqMode, levelAlphas, scaleAlpha, deterministic, jobId) {
   if (capsA.mode === 'single') {
     // Non-streaming: single interpDecodeOnce, zero decoder state
     self.postMessage({ type: 'progress', jobId, value: 0.5, status: 'Interpolating…' });
     const result = await interpDecodeOnce(
       capsA.cap, capsB.cap, alpha, interpPoint, '24k',
-      zeroState(1), zeroState(1), vqMode, levelAlphas);
+      zeroState(1), zeroState(1), vqMode, levelAlphas, scaleAlpha, deterministic);
     if (currentJobId !== jobId) return null;
     self.postMessage({ type: 'progress', jobId, value: 1.0, status: 'Done.' });
     return result.outAudio.slice(0, capsA.totalLen);
@@ -680,7 +688,7 @@ async function interpFromCached24k(capsA, capsB, alpha, interpPoint, vqMode, lev
     const { cap: capB }                  = chunksB[s];
 
     const dec = await interpDecodeOnce(
-      capA, capB, alpha, interpPoint, '24k', hDec, cDec, vqMode, levelAlphas);
+      capA, capB, alpha, interpPoint, '24k', hDec, cDec, vqMode, levelAlphas, scaleAlpha, deterministic);
     hDec = dec.hDecNew; cDec = dec.cDecNew;
 
     for (let i = srcS - off; i < srcE - off; i++) {
@@ -702,7 +710,7 @@ async function interpFromCached24k(capsA, capsB, alpha, interpPoint, vqMode, lev
   return outBuf;
 }
 
-async function interpFromCached48k(capsA, capsB, alpha, interpPoint, vqMode, levelAlphas, jobId) {
+async function interpFromCached48k(capsA, capsB, alpha, interpPoint, vqMode, levelAlphas, scaleAlpha, deterministic, jobId) {
   const { totalLen, segments: segsA } = capsA;
   const { segments: segsB }           = capsB;
   const outBuf = new Float32Array(totalLen);
@@ -716,7 +724,7 @@ async function interpFromCached48k(capsA, capsB, alpha, interpPoint, vqMode, lev
 
     const dec = await interpDecodeOnce(
       capA, capB, alpha, interpPoint, '48k',
-      zeroState(1), zeroState(1), vqMode, levelAlphas);
+      zeroState(1), zeroState(1), vqMode, levelAlphas, scaleAlpha, deterministic);
 
     for (let i = 0; i < validEnd - offset; i++) {
       outBuf[offset + i] += TRI_WIN_48[i] * dec.outAudio[i];

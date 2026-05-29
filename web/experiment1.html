@@ -4,81 +4,10 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>EnCodec — Encode / Decode Explorer</title>
+<link rel="stylesheet" href="encodec.css">
 <style>
-/* ── Design tokens (match FRFT widget) ──────────────────────────────── */
-:root {
-  --bg:        #1a1a1a;
-  --surface:   #222222;
-  --surface2:  #282828;
-  --border:    #333333;
-  --border2:   #3a3a3a;
-  --accent:    #c8902a;
-  --accent-lo: #7a5418;
-  --text:      #d0d0d0;
-  --muted:     #aaaaaa;
-  --red:       #cc4444;
-  --lbl-w:     5.2em;
-}
-* { box-sizing: border-box; margin: 0; padding: 0; }
-html, body { height: 100%; background: var(--bg); color: var(--text);
-             font: 13px/1.4 system-ui, sans-serif; overflow: hidden; }
-
-/* ── Top-level layout ───────────────────────────────────────────────── */
-#frame {
-  display: grid;
-  grid-template-columns: 210px 1fr;
-  height: 100vh;
-}
-
-/* ── Left panel ─────────────────────────────────────────────────────── */
-#controls {
-  background: var(--surface);
-  border-right: 1px solid var(--border);
-  overflow-y: auto;
-  display: flex;
-  flex-direction: column;
-}
-.section {
-  padding: 0.55em 0.75em;
-  border-bottom: 1px solid var(--border);
-}
-.section-title {
-  font-size: 10px; font-weight: 700; letter-spacing: 0.1em;
-  text-transform: uppercase; color: var(--muted); margin-bottom: 0.5em;
-}
-.row {
-  display: flex; align-items: center; gap: 0.4em; margin-bottom: 0.3em;
-}
-.row:last-child { margin-bottom: 0; }
-.lbl { width: var(--lbl-w); flex-shrink: 0; color: var(--muted); font-size: 12px; }
-.unit { color: var(--muted); font-size: 11px; }
-
-select, input[type=number] {
-  flex: 1; min-width: 0;
-  background: #1c1c1c; border: 1px solid var(--border2);
-  color: var(--text); padding: 2px 4px; border-radius: 3px;
-  font-size: 12px; box-shadow: inset 0 1px 2px rgba(0,0,0,.4);
-}
-select:focus, input[type=number]:focus { outline: none; border-color: var(--accent); }
-
-#fileBtn {
-  flex: 1; background: #1c1c1c; border: 1px solid var(--border2);
-  color: var(--muted); padding: 2px 6px; border-radius: 3px;
-  font-size: 11px; cursor: pointer; text-align: left;
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-}
-#fileBtn:hover { border-color: var(--accent); color: var(--text); }
-#fileInput { display: none; }
-
-.toggle-row { display: flex; gap: 3px; }
-.tog {
-  flex: 1; background: #1c1c1c; border: 1px solid var(--border2);
-  color: var(--muted); padding: 3px 0; border-radius: 3px;
-  font-size: 11px; cursor: pointer; text-align: center;
-}
-.tog.active { background: var(--accent-lo); border-color: var(--accent); color: var(--text); }
-.tog:hover:not(.active) { color: var(--text); }
-
+:root { --lbl-w: 5.2em; }
+#frame { grid-template-columns: 210px 1fr; }
 #runBtn {
   width: 100%; margin-top: 0.7em; padding: 5px;
   background: var(--accent-lo); border: 1px solid var(--accent);
@@ -87,166 +16,13 @@ select:focus, input[type=number]:focus { outline: none; border-color: var(--acce
 }
 #runBtn:hover { filter: brightness(1.2); }
 #runBtn:disabled { opacity: 0.4; cursor: default; filter: none; }
-
-/* ── Right panel ────────────────────────────────────────────────────── */
-#right { display: flex; flex-direction: column; min-width: 0; }
-
-#toolbar {
-  display: flex; align-items: center; gap: 0.5em;
-  padding: 0.4em 0.7em; border-bottom: 1px solid var(--border);
-  background: var(--surface); flex-shrink: 0;
-}
-#playBtn {
-  width: 28px; height: 28px; border-radius: 4px; cursor: pointer;
-  background: var(--accent-lo); border: 1px solid var(--accent);
-  color: var(--text); font-size: 14px;
-  display: flex; align-items: center; justify-content: center;
-}
-#playBtn:hover { filter: brightness(1.2); }
-#playBtn:disabled { opacity: 0.4; cursor: default; filter: none; }
-
-.tab-group {
-  display: flex; gap: 2px;
-  background: #1c1c1c; border: 1px solid var(--border2);
-  border-radius: 4px; padding: 2px;
-}
-.tab {
-  padding: 2px 8px; border-radius: 3px; font-size: 11px; cursor: pointer;
-  color: var(--muted); border: none; background: none;
-}
-.tab.active  { background: var(--accent-lo); color: var(--text); }
-.tab:hover:not(.active) { color: var(--text); }
-
-#statusBar { flex: 1; font-size: 11px; color: var(--muted); min-width: 0; }
-
-#progressWrap {
-  width: 70px; height: 3px; background: var(--border2);
-  border-radius: 2px; overflow: hidden; display: none;
-}
-#progressBar { height: 100%; background: var(--accent); width: 0; transition: width 0.08s; }
-
-/* ── Spectrogram area ───────────────────────────────────────────────── */
-#specArea { flex: 1; display: flex; min-height: 0; }
-
-/* ── Note panel ─────────────────────────────────────────────────────── */
-#notePanel {
-  flex-shrink: 0;
-  padding: 0.45em 0.75em 0.45em calc(2.5em + 0.75em);
-  border-top: 1px solid var(--border);
-  background: var(--surface2);
-  font-size: 11px; line-height: 1.5; color: var(--muted);
-}
-#notePanel strong { color: var(--text); font-weight: 600; }
-
-#stripWrap {
-  width: 2.5em; flex-shrink: 0;
-  background: var(--surface2); border-right: 1px solid var(--border);
-  position: relative;
-}
-#stripCanvas { position: absolute; inset: 0; width: 100%; height: 100%; }
-
-#specWrap { flex: 1; position: relative; overflow: hidden; }
-#specCanvas, #playheadCanvas {
-  position: absolute; inset: 0; width: 100%; height: 100%;
-}
-#playheadCanvas { pointer-events: none; }
-
-/* ── Activation overlay ─────────────────────────────────────────────── */
-#activationOverlay {
-  position: absolute; inset: 0;
-  background: rgba(0,0,0,0.72);
-  display: flex; align-items: center; justify-content: center;
-  cursor: pointer; z-index: 10;
-}
-#activationOverlay span {
-  background: var(--surface); border: 1px solid var(--border2);
-  color: var(--text); padding: 0.5em 1.2em; border-radius: 4px; font-size: 13px;
-}
-
-/* ── Legend ─────────────────────────────────────────────────────────── */
-#legend {
-  display: flex; gap: 1.2em; padding: 0 0.7em 0 calc(2.5em + 0.7em);
-  font-size: 10px; color: var(--muted); flex-shrink: 0; height: 1.6em;
-  align-items: center;
-}
-.ldot {
-  display: inline-block; width: 8px; height: 8px;
-  border-radius: 50%; margin-right: 3px; vertical-align: middle;
-}
 </style>
 </head>
 <body>
 <div id="frame">
 
-  <!-- ─────────── LEFT CONTROLS ─────────── -->
-  <div id="controls">
-
-    <div class="section">
-      <div class="section-title">Source</div>
-      <div class="row">
-        <span class="lbl">Type</span>
-        <select id="srcType">
-          <option value="sine">Sine</option>
-          <option value="triangle">Triangle</option>
-          <option value="sawtooth">Sawtooth</option>
-          <option value="square">Square</option>
-          <option value="sweep">Sweep</option>
-          <option value="file">File</option>
-        </select>
-      </div>
-      <div class="row" id="freqRow">
-        <span class="lbl">Freq</span>
-        <input type="number" id="freq" value="440" min="20" max="20000" step="1">
-        <span class="unit">Hz</span>
-      </div>
-      <div class="row">
-        <span class="lbl">Duration</span>
-        <input type="number" id="dur" value="2" min="0.1" max="10" step="0.1">
-        <span class="unit">s</span>
-      </div>
-      <div class="row" id="fileRow" style="display:none">
-        <button id="fileBtn">choose file…</button>
-        <input type="file" id="fileInput" accept="audio/*">
-      </div>
-    </div>
-
-    <div class="section">
-      <div class="section-title">Model</div>
-      <div class="row">
-        <span class="lbl">Model</span>
-        <select id="modelSel">
-          <option value="24k">24 kHz</option>
-          <option value="48k">48 kHz</option>
-        </select>
-      </div>
-      <div class="row">
-        <span class="lbl">Bandwidth</span>
-        <select id="bwSel"></select>
-        <span class="unit">kbps</span>
-      </div>
-    </div>
-
-    <div class="section">
-      <div class="section-title">Mode</div>
-      <div class="toggle-row" id="modeToggleRow" style="margin-bottom:0.55em">
-        <button class="tog active" id="togNS">Non-streaming</button>
-        <button class="tog"        id="togS">Streaming</button>
-      </div>
-      <div class="row" id="frameRow" style="display:none">
-        <span class="lbl">Frame</span>
-        <select id="frameSel">
-          <option value="320">320 smp · 13 ms</option>
-          <option value="640">640 smp · 27 ms</option>
-          <option value="1280">1280 smp · 53 ms</option>
-          <option value="2560">2560 smp · 107 ms</option>
-          <option value="4800">4800 smp · 200 ms</option>
-          <option value="9600">9600 smp · 400 ms</option>
-        </select>
-      </div>
-      <button id="runBtn">Run EnCodec</button>
-    </div>
-
-  </div>
+  <!-- ─────────── LEFT CONTROLS (populated by JS) ─────────── -->
+  <div id="controls"></div>
 
   <!-- ─────────── RIGHT PANEL ─────────── -->
   <div id="right">
@@ -281,37 +57,70 @@ select:focus, input[type=number]:focus { outline: none; border-color: var(--acce
   </div>
 </div><!-- #frame -->
 
-<script>
+<script type="module">
 'use strict';
+
+import { createSourcePanel } from './lib/source-panel.js';
+import { createModelPanel   } from './lib/model-panel.js';
+import { generateSource, loadFile, normalizePeak, MAX_S } from './lib/audio-utils.js';
+import { computeSTFT, stftToOffscreen, drawStrip, PLASMA, HOT } from './lib/stft.js';
 
 // ═══════════════════════════════════════════════════════════════════════
 // Config
 // ═══════════════════════════════════════════════════════════════════════
 
 const MODELS_BASE = new URL('../serialization/encodec_onnx_exports', location.href).href;
-const BW_OPTIONS  = { '24k': [1.5, 3, 6, 12, 24], '48k': [3, 6, 12, 24] };
-const FFT_N  = 2048;
-const HOP    = 512;
-const MAX_S  = 10;   // max duration in seconds
 
-// Colormaps (5-stop linear interpolation)
-const PLASMA = [[5,5,25],[100,0,150],[200,50,100],[255,140,20],[255,255,100]];
-const HOT    = [[0,0,0],[191,0,0],[255,128,0],[255,255,64],[255,255,255]];
+// ═══════════════════════════════════════════════════════════════════════
+// Build left-panel controls
+// ═══════════════════════════════════════════════════════════════════════
+
+const controls = document.getElementById('controls');
+
+// Source section
+const srcPanel = createSourcePanel({ title: 'Source', defaultFreq: 440 });
+controls.appendChild(srcPanel.element);
+
+// Duration section (experiment-local: appears inside Source in original, now separate)
+const durSection = document.createElement('div');
+durSection.className = 'section';
+durSection.innerHTML = `
+  <div class="section-title">Duration</div>
+  <div class="row">
+    <span class="lbl">Duration</span>
+    <input type="number" id="dur" value="2" min="0.1" max="10" step="0.1">
+    <span class="unit">s</span>
+  </div>
+`.trim();
+controls.appendChild(durSection);
+const durInput = durSection.querySelector('#dur');
+
+// Model + Mode sections
+const mp = createModelPanel({ onChange: () => { updateNotePanel(); } });
+controls.appendChild(mp.modelSection);
+controls.appendChild(mp.modeSection);
+
+// Run-button section
+const runSection = document.createElement('div');
+runSection.className = 'section';
+runSection.innerHTML = `<button id="runBtn" disabled>Run EnCodec</button>`;
+controls.appendChild(runSection);
+const runBtn = runSection.querySelector('#runBtn');
+runBtn.disabled = false;
 
 // ═══════════════════════════════════════════════════════════════════════
 // State
 // ═══════════════════════════════════════════════════════════════════════
 
 let audioCtx     = null;
-let sourceAudio  = null;   // Float32Array, mono
-let decodedAudio = null;   // Float32Array, mono
+let sourceAudio  = null;
+let decodedAudio = null;
 let sourceSR     = 24000;
-let stftSrc      = null;   // { magDB, nFrames, nBins, dBmin, dBmax }
+let stftSrc      = null;
 let stftDec      = null;
-let offSrc       = null;   // OffscreenCanvas (plasma)
-let offDec       = null;   // OffscreenCanvas (hot)
+let offSrc       = null;
+let offDec       = null;
 let currentView  = 'source';
-let streaming    = false;
 let worker       = null;
 let jobSeq       = 0;
 let activeJobId  = -1;
@@ -319,29 +128,14 @@ let isPlaying    = false;
 let playNode     = null;
 let playStart    = 0;
 let phRAF        = null;
-const dpr        = devicePixelRatio || 1;
+const dpr = devicePixelRatio || 1;
 
 // ═══════════════════════════════════════════════════════════════════════
 // DOM refs
 // ═══════════════════════════════════════════════════════════════════════
 
 const $ = id => document.getElementById(id);
-const srcType   = $('srcType');
-const freqRow   = $('freqRow');
-const freqInput = $('freq');
-const durInput  = $('dur');
-const fileRow   = $('fileRow');
-const fileBtn   = $('fileBtn');
-const fileInput = $('fileInput');
-const modelSel  = $('modelSel');
-const bwSel     = $('bwSel');
-const togNS          = $('togNS');
-const togS           = $('togS');
-const modeToggleRow  = $('modeToggleRow');
-const frameRow       = $('frameRow');
-const notePanel      = $('notePanel');
-const frameSel  = $('frameSel');
-const runBtn    = $('runBtn');
+
 const playBtn   = $('playBtn');
 const statusBar = $('statusBar');
 const progWrap  = $('progressWrap');
@@ -350,11 +144,12 @@ const specCvs   = $('specCanvas');
 const phCvs     = $('playheadCanvas');
 const stripCvs  = $('stripCanvas');
 const actOvl    = $('activationOverlay');
+const notePanel = $('notePanel');
 const lgSrc     = $('lgSrc');
 const lgDec     = $('lgDec');
 
 // ═══════════════════════════════════════════════════════════════════════
-// Audio context init (user-gesture gated)
+// Audio context (user-gesture gated)
 // ═══════════════════════════════════════════════════════════════════════
 
 function ensureAudioCtx() {
@@ -363,47 +158,21 @@ function ensureAudioCtx() {
 actOvl.addEventListener('click', ensureAudioCtx);
 
 // ═══════════════════════════════════════════════════════════════════════
-// Bandwidth selector
+// Note panel
 // ═══════════════════════════════════════════════════════════════════════
-
-function populateBW() {
-  bwSel.innerHTML = '';
-  BW_OPTIONS[modelSel.value].forEach(bw => {
-    const o = document.createElement('option');
-    o.value = bw; o.textContent = bw;
-    if (bw === 6) o.selected = true;
-    bwSel.appendChild(o);
-  });
-  updateModeLabels();
-  updateFrameRowVisibility();
-}
-
-function updateModeLabels() {
-  const is48 = modelSel.value === '48k';
-  // 48k: hide the toggle entirely and force stateless
-  modeToggleRow.style.display = is48 ? 'none' : '';
-  if (is48 && streaming) {
-    streaming = false;
-    togNS.classList.add('active');
-    togS .classList.remove('active');
-  }
-  updateNotePanel();
-}
 
 const NOTES = {
   '24k-false': () =>
     '<strong>Non-streaming.</strong> The entire clip is encoded and decoded in one pass ' +
     'with zero LSTM state. Each run is independent — identical inputs always produce identical outputs.',
-
   '24k-true': () => {
-    const f = parseInt(frameSel.value);
+    const f  = mp.getFrameSize();
     const ms = Math.round(f / 24000 * 1000);
     return `<strong>Streaming (${f} samples · ${ms} ms frames).</strong> Audio is split into ` +
       'overlapping segments; each segment extends ±27 ms (640 samples) beyond the frame boundary ' +
       'so the causal encoder always has valid cross-boundary context. A triangle-window crossfade ' +
       'blends the overlap region. LSTM state is carried across segments.';
   },
-
   '48k': () =>
     '<strong>Stateless segments.</strong> Audio is split into 1 s segments, each encoded and decoded ' +
     'independently with zero LSTM state. Segments are stitched with a 100 ms triangle-window ' +
@@ -411,48 +180,17 @@ const NOTES = {
 };
 
 function updateNotePanel() {
-  const key = modelSel.value === '48k' ? '48k' : `24k-${streaming}`;
+  const key = mp.getModelHz() === '48k' ? '48k' : `24k-${mp.isStreaming()}`;
   notePanel.innerHTML = NOTES[key] ? NOTES[key]() : '';
 }
-modelSel.addEventListener('change', populateBW);
-populateBW();
+updateNotePanel();
 
-// ═══════════════════════════════════════════════════════════════════════
-// Source type
-// ═══════════════════════════════════════════════════════════════════════
-
-srcType.addEventListener('change', () => {
-  const v = srcType.value;
-  fileRow.style.display = v === 'file'  ? '' : 'none';
-  freqRow.style.display = (v === 'file' || v === 'sweep') ? 'none' : '';
-});
-fileBtn.addEventListener('click', () => fileInput.click());
-fileInput.addEventListener('change', () => {
-  if (fileInput.files[0]) fileBtn.textContent = fileInput.files[0].name;
-});
-
-// ═══════════════════════════════════════════════════════════════════════
-// Mode toggle
-// ═══════════════════════════════════════════════════════════════════════
-
-[togNS, togS].forEach(btn => btn.addEventListener('click', () => {
-  togNS.classList.toggle('active', btn === togNS);
-  togS .classList.toggle('active', btn === togS);
-  streaming = btn === togS;
-  updateFrameRowVisibility();
-  updateExpNote();
-}));
-
-function updateFrameRowVisibility() {
-  frameRow.style.display = (streaming && modelSel.value === '24k') ? '' : 'none';
-  updateNotePanel();   // frame size label is part of the 24k-streaming note
-}
+// frame-size change also rebuilds the note text (frame ms is embedded in it)
+mp.modeSection.querySelector('.mp-frame').addEventListener('change', updateNotePanel);
 
 // ═══════════════════════════════════════════════════════════════════════
 // View tabs
 // ═══════════════════════════════════════════════════════════════════════
-
-frameSel.addEventListener('change', updateNotePanel);
 
 document.querySelectorAll('.tab').forEach(tab => tab.addEventListener('click', () => {
   document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
@@ -465,78 +203,6 @@ document.querySelectorAll('.tab').forEach(tab => tab.addEventListener('click', (
 function updateLegend() {
   lgSrc.style.display = (currentView !== 'decoded') ? '' : 'none';
   lgDec.style.display = (currentView !== 'source')  ? '' : 'none';
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// Audio generation
-// ═══════════════════════════════════════════════════════════════════════
-
-function generateSource() {
-  const model = modelSel.value;
-  const sr    = model === '24k' ? 24000 : 48000;
-  const dur   = Math.min(parseFloat(durInput.value) || 2, MAX_S);
-  const n     = Math.round(dur * sr);
-  const type  = srcType.value;
-  const f     = parseFloat(freqInput.value) || 440;
-  const buf   = new Float32Array(n);
-  const τ     = 2 * Math.PI;
-
-  switch (type) {
-    case 'sine':
-      for (let i = 0; i < n; i++) buf[i] = Math.sin(τ * f * i / sr);
-      break;
-    case 'triangle':
-      for (let i = 0; i < n; i++) buf[i] = (2 / Math.PI) * Math.asin(Math.sin(τ * f * i / sr));
-      break;
-    case 'sawtooth':
-      for (let i = 0; i < n; i++) buf[i] = 2 * ((f * i / sr) % 1) - 1;
-      break;
-    case 'square':
-      for (let i = 0; i < n; i++) buf[i] = Math.sign(Math.sin(τ * f * i / sr));
-      break;
-    case 'sweep': {
-      const f0 = 20, f1 = sr / 2 * 0.9;
-      for (let i = 0; i < n; i++) {
-        const t = i / sr;
-        buf[i] = Math.sin(τ * (f0 * t + (f1 - f0) * t * t / (2 * dur)));
-      }
-      break;
-    }
-  }
-
-  // Normalise to 0.8 peak
-  const peak = buf.reduce((m, v) => Math.max(m, Math.abs(v)), 0);
-  if (peak > 0) for (let i = 0; i < n; i++) buf[i] *= 0.8 / peak;
-
-  sourceSR = sr;
-  return buf;
-}
-
-async function loadFile(file) {
-  const sr       = modelSel.value === '24k' ? 24000 : 48000;
-  const arrBuf   = await file.arrayBuffer();
-  const tmpCtx   = new OfflineAudioContext(1, 1, sr);
-  const decoded  = await tmpCtx.decodeAudioData(arrBuf);
-  const trimLen  = Math.min(decoded.length, Math.round(MAX_S * decoded.sampleRate));
-  const offCtx   = new OfflineAudioContext(1, Math.round(MAX_S * sr), sr);
-  const src      = offCtx.createBufferSource();
-  const trimBuf  = new AudioBuffer({
-    numberOfChannels: decoded.numberOfChannels,
-    length: trimLen, sampleRate: decoded.sampleRate,
-  });
-  for (let ch = 0; ch < decoded.numberOfChannels; ch++)
-    trimBuf.copyToChannel(decoded.getChannelData(ch).slice(0, trimLen), ch);
-  src.buffer = trimBuf;
-  src.connect(offCtx.destination);
-  src.start(0);
-  const rendered = await offCtx.startRendering();
-  const mono = new Float32Array(rendered.length);
-  for (let ch = 0; ch < rendered.numberOfChannels; ch++) {
-    const d = rendered.getChannelData(ch);
-    for (let i = 0; i < rendered.length; i++) mono[i] += d[i] / rendered.numberOfChannels;
-  }
-  sourceSR = sr;
-  return mono;
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -562,7 +228,7 @@ function onWorkerMsg(e) {
     progWrap.style.display = 'none';
     decodedAudio = msg.decoded;
     stftDec = computeSTFT(decodedAudio);
-    offDec  = null;   // invalidate render cache
+    offDec  = null;
     setStatus(`Done — ${(decodedAudio.length / sourceSR).toFixed(2)} s decoded`);
     runBtn.disabled = false;
     playBtn.disabled = false;
@@ -585,20 +251,23 @@ runBtn.addEventListener('click', async () => {
   decodedAudio = null; stftDec = null; offDec = null;
   playBtn.disabled = true;
 
-  // Build / load source
+  sourceSR = mp.getSampleRate();
+  const dur = Math.min(parseFloat(durInput.value) || 2, MAX_S);
+
   let audio;
-  if (srcType.value === 'file') {
-    if (!fileInput.files[0]) { setStatus('No file selected.', true); return; }
+  if (srcPanel.getType() === 'file') {
+    if (!srcPanel.getFile()) { setStatus('No file selected.', true); return; }
     setStatus('Loading file…');
-    try { audio = await loadFile(fileInput.files[0]); }
+    try { audio = await loadFile(srcPanel.getFile(), sourceSR); }
     catch (err) { setStatus('Could not load file: ' + err.message, true); return; }
   } else {
-    audio = generateSource();
+    audio = generateSource(srcPanel.getType(), srcPanel.getFreq(), dur, sourceSR);
+    audio = normalizePeak(audio, 0.8);
   }
 
   sourceAudio = audio;
   stftSrc     = computeSTFT(sourceAudio);
-  offSrc      = null;   // invalidate render cache
+  offSrc      = null;
   drawSpec();
 
   if (!worker) initWorker();
@@ -613,10 +282,10 @@ runBtn.addEventListener('click', async () => {
     type:      'process',
     jobId:     activeJobId,
     audio:     audio.slice(),
-    modelHz:   modelSel.value,
-    bwKbps:    parseFloat(bwSel.value),
-    streaming,
-    frameSize: parseInt(frameSel.value),
+    modelHz:   mp.getModelHz(),
+    bwKbps:    mp.getBwKbps(),
+    streaming: mp.isStreaming(),
+    frameSize: mp.getFrameSize(),
   });
 });
 
@@ -633,12 +302,12 @@ function startPlayback() {
   const buf = audioCtx.createBuffer(1, pcm.length, sourceSR);
   buf.copyToChannel(pcm, 0);
   playNode = audioCtx.createBufferSource();
-  playNode.buffer = buf;
+  playNode.buffer  = buf;
   playNode.connect(audioCtx.destination);
   playNode.onended = stopPlayback;
   playNode.start();
-  playStart  = audioCtx.currentTime;
-  isPlaying  = true;
+  playStart = audioCtx.currentTime;
+  isPlaying = true;
   playBtn.textContent = '⏹';
   animatePlayhead();
 }
@@ -662,119 +331,17 @@ function animatePlayhead() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// STFT
-// ═══════════════════════════════════════════════════════════════════════
-
-function hann(n) {
-  const w = new Float32Array(n);
-  for (let i = 0; i < n; i++) w[i] = 0.5 * (1 - Math.cos(2 * Math.PI * i / (n - 1)));
-  return w;
-}
-const WINDOW = hann(FFT_N);
-
-function fft(re, im) {
-  const n = re.length;
-  // bit-reversal
-  for (let i = 1, j = 0; i < n; i++) {
-    let b = n >> 1;
-    for (; j & b; b >>= 1) j ^= b;
-    j ^= b;
-    if (i < j) {
-      let t=re[i]; re[i]=re[j]; re[j]=t;
-          t=im[i]; im[i]=im[j]; im[j]=t;
-    }
-  }
-  // Cooley-Tukey
-  for (let len = 2; len <= n; len <<= 1) {
-    const ang = -2 * Math.PI / len;
-    const wr = Math.cos(ang), wi = Math.sin(ang);
-    for (let i = 0; i < n; i += len) {
-      let cr = 1, ci = 0;
-      for (let j = 0; j < len >> 1; j++) {
-        const ur=re[i+j], ui=im[i+j];
-        const vr=re[i+j+len/2]*cr - im[i+j+len/2]*ci;
-        const vi=re[i+j+len/2]*ci + im[i+j+len/2]*cr;
-        re[i+j]=ur+vr; im[i+j]=ui+vi;
-        re[i+j+len/2]=ur-vr; im[i+j+len/2]=ui-vi;
-        const nr=cr*wr-ci*wi; ci=cr*wi+ci*wr; cr=nr;
-      }
-    }
-  }
-}
-
-function computeSTFT(samples) {
-  const nBins   = FFT_N >> 1;
-  const nFrames = Math.max(1, Math.floor((samples.length - FFT_N) / HOP) + 1);
-  const magDB   = new Float32Array(nFrames * nBins);
-  const re = new Float32Array(FFT_N), im = new Float32Array(FFT_N);
-  let dBmax = -Infinity;
-
-  for (let f = 0; f < nFrames; f++) {
-    const s = f * HOP;
-    re.fill(0); im.fill(0);
-    for (let i = 0; i < FFT_N; i++) re[i] = (samples[s + i] || 0) * WINDOW[i];
-    fft(re, im);
-    for (let k = 0; k < nBins; k++) {
-      const m  = Math.sqrt(re[k]*re[k] + im[k]*im[k]);
-      const db = m > 1e-9 ? 20 * Math.log10(m) : -120;
-      magDB[f * nBins + k] = db;
-      if (db > dBmax) dBmax = db;
-    }
-  }
-  return { magDB, nFrames, nBins, dBmin: Math.max(dBmax - 100, -120), dBmax };
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// Colormap
-// ═══════════════════════════════════════════════════════════════════════
-
-function cmap(t, stops) {
-  t = Math.max(0, Math.min(1, t));
-  const n = stops.length - 1;
-  const i = Math.min(Math.floor(t * n), n - 1);
-  const f = t * n - i;
-  const a = stops[i], b = stops[i + 1];
-  return [
-    a[0] + f*(b[0]-a[0]) | 0,
-    a[1] + f*(b[1]-a[1]) | 0,
-    a[2] + f*(b[2]-a[2]) | 0,
-  ];
-}
-
-function stftToOffscreen(stft, stops) {
-  const { magDB, nFrames, nBins, dBmin, dBmax } = stft;
-  const range = dBmax - dBmin || 1;
-  const off = document.createElement('canvas');
-  off.width = nFrames; off.height = nBins;
-  const ctx = off.getContext('2d');
-  const img = ctx.createImageData(nFrames, nBins);
-
-  for (let f = 0; f < nFrames; f++) {
-    for (let k = 0; k < nBins; k++) {
-      const t  = (magDB[f * nBins + k] - dBmin) / range;
-      const [r, g, b] = cmap(t, stops);
-      const px = ((nBins - 1 - k) * nFrames + f) * 4;
-      img.data[px] = r; img.data[px+1] = g; img.data[px+2] = b; img.data[px+3] = 255;
-    }
-  }
-  ctx.putImageData(img, 0, 0);
-  return off;
-}
-
-// ═══════════════════════════════════════════════════════════════════════
 // Spectrogram draw
 // ═══════════════════════════════════════════════════════════════════════
 
 function drawSpec() {
-  const cvs = specCvs;
-  const cW = Math.round(cvs.clientWidth  * dpr);
-  const cH = Math.round(cvs.clientHeight * dpr);
+  const cW = Math.round(specCvs.clientWidth  * dpr);
+  const cH = Math.round(specCvs.clientHeight * dpr);
   if (!cW || !cH) return;
-  cvs.width = cW; cvs.height = cH;
-  const ctx = cvs.getContext('2d');
+  specCvs.width = cW; specCvs.height = cH;
+  const ctx = specCvs.getContext('2d');
   ctx.clearRect(0, 0, cW, cH);
 
-  // Build / reuse offscreen caches
   if (stftSrc && !offSrc) offSrc = stftToOffscreen(stftSrc, PLASMA);
   if (stftDec && !offDec) offDec = stftToOffscreen(stftDec, HOT);
 
@@ -783,10 +350,8 @@ function drawSpec() {
 
   if (currentView === 'source' && offSrc) {
     ctx.drawImage(offSrc, 0, 0, cW, cH);
-
   } else if (currentView === 'decoded' && offDec) {
     ctx.drawImage(offDec, 0, 0, cW, cH);
-
   } else if (currentView === 'both') {
     if (offSrc) { ctx.globalAlpha = 1.0; ctx.drawImage(offSrc, 0, 0, cW, cH); }
     if (offDec) {
@@ -798,34 +363,9 @@ function drawSpec() {
     }
   }
 
-  drawStrip();
-}
-
-function drawStrip() {
   const stft  = (currentView === 'decoded' && stftDec) ? stftDec : stftSrc;
   const stops = (currentView === 'decoded' && stftDec) ? HOT : PLASMA;
-  if (!stft) return;
-
-  const cvs = stripCvs;
-  const cW  = Math.round(cvs.clientWidth  * dpr) || Math.round(2.5 * 16 * dpr);
-  const cH  = Math.round(cvs.clientHeight * dpr) || 400;
-  cvs.width = cW; cvs.height = cH;
-  const ctx = cvs.getContext('2d');
-  ctx.clearRect(0, 0, cW, cH);
-
-  const { magDB, nFrames, nBins, dBmin, dBmax } = stft;
-  const range = dBmax - dBmin || 1;
-  const f     = Math.floor(nFrames / 2);   // middle frame
-
-  for (let k = 0; k < nBins; k++) {
-    const t    = (magDB[f * nBins + k] - dBmin) / range;
-    const [r, g, b] = cmap(t, stops);
-    const y    = (1 - (k + 0.5) / nBins) * cH;
-    const barH = Math.ceil(cH / nBins) + 1;
-    const barW = Math.max(1, t * cW * 0.85);
-    ctx.fillStyle = `rgb(${r},${g},${b})`;
-    ctx.fillRect(cW - barW, y, barW, barH);
-  }
+  drawStrip(stripCvs, stft, stops, dpr);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -833,12 +373,11 @@ function drawStrip() {
 // ═══════════════════════════════════════════════════════════════════════
 
 function drawPlayhead(frac) {
-  const cvs = phCvs;
-  const cW = Math.round(cvs.clientWidth  * dpr);
-  const cH = Math.round(cvs.clientHeight * dpr);
-  cvs.width = cW; cvs.height = cH;
+  const cW = Math.round(phCvs.clientWidth  * dpr);
+  const cH = Math.round(phCvs.clientHeight * dpr);
+  phCvs.width = cW; phCvs.height = cH;
   if (frac < 0 || frac > 1.001) return;
-  const ctx = cvs.getContext('2d');
+  const ctx = phCvs.getContext('2d');
   const x   = Math.round(Math.min(frac, 1) * cW);
   ctx.strokeStyle = 'rgba(255,255,255,0.85)';
   ctx.lineWidth   = dpr;
@@ -846,19 +385,15 @@ function drawPlayhead(frac) {
 }
 
 function clearPlayhead() {
-  const cvs = phCvs;
-  cvs.width = cvs.clientWidth * dpr;
-  cvs.height = cvs.clientHeight * dpr;
+  phCvs.width  = phCvs.clientWidth  * dpr;
+  phCvs.height = phCvs.clientHeight * dpr;
 }
 
 // ═══════════════════════════════════════════════════════════════════════
 // Resize
 // ═══════════════════════════════════════════════════════════════════════
 
-new ResizeObserver(() => {
-  offSrc = null; offDec = null;   // rebuild offscreen caches at new size
-  drawSpec();
-}).observe($('specWrap'));
+new ResizeObserver(() => { offSrc = null; offDec = null; drawSpec(); }).observe($('specWrap'));
 
 // ═══════════════════════════════════════════════════════════════════════
 // Helpers
@@ -875,7 +410,6 @@ function setStatus(msg, isErr = false) {
 
 initWorker();
 updateLegend();
-updateNotePanel();
 </script>
 </body>
 </html>
