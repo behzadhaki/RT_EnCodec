@@ -206,7 +206,7 @@ import {
 } from './lib/stft.js';
 
 // Diverging colormap for embedding deltas: blue (negative) → black (zero) → orange (positive)
-const DELTA = [[0,80,220],[0,20,60],[12,12,12],[60,20,0],[220,90,0]];
+const DELTA = [[0,60,200],[140,180,255],[255,255,255],[255,180,100],[200,70,0]];
 
 // ═══════════════════════════════════════════════════════════════════════
 // Config
@@ -600,7 +600,7 @@ function onWorkerMsg(e) {
       drawPipeline();
       if (currentView === 'B') startSpecFade(prevOff, offB, 'B');
       else drawSpec();
-      if (!isPlaying) setView('A');
+      if (!isPlaying && currentView !== 'delta_b') setView('A');
       triggerDeltaTransfer();
       requestEmbDeltas();
 
@@ -623,7 +623,7 @@ function onWorkerMsg(e) {
       drawPipeline();
       if (currentView === 'interp' || !isPlaying) startSpecFade(prevOff, offMod, 'interp');
       else drawSpec();
-      if (!isPlaying) setView('interp');
+      if (!isPlaying && currentView !== 'delta_b') setView('interp');
     }
 
   } else if (msg.type === 'error') {
