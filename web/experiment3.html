@@ -786,9 +786,10 @@ loopBtn.addEventListener('click', () => {
 });
 
 function currentAudio() {
-  if (currentView === 'A')      return decodedA;
-  if (currentView === 'B')      return decodedB;
-  if (currentView === 'interp') return modAudio;
+  if (currentView === 'A')       return decodedA;
+  if (currentView === 'B')       return decodedB;
+  if (currentView === 'delta_b') return decodedB;
+  if (currentView === 'interp')  return modAudio;
   return null;
 }
 
@@ -822,7 +823,7 @@ function startPlayback(atOffset = 0) {
   if (playGain) { try { playGain.disconnect(); } catch {} playGain = null; }
   cancelAnimationFrame(phRAF);
 
-  const preBuf = currentView === 'A' ? bufA : currentView === 'B' ? bufB : bufMod;
+  const preBuf = currentView === 'A' ? bufA : (currentView === 'B' || currentView === 'delta_b') ? bufB : bufMod;
   const buf = preBuf || (() => {
     const b = audioCtx.createBuffer(1, pcm.length, sourceSR);
     b.copyToChannel(pcm, 0);
@@ -876,7 +877,7 @@ function _crossfadeAudioTo(offset) {
 
   const dur     = pcm.length / sourceSR;
   const safeOff = Math.max(0, Math.min(offset, dur - 0.001));
-  const preBuf  = currentView === 'A' ? bufA : currentView === 'B' ? bufB : bufMod;
+  const preBuf  = currentView === 'A' ? bufA : (currentView === 'B' || currentView === 'delta_b') ? bufB : bufMod;
   const buf     = preBuf || (() => {
     const b = audioCtx.createBuffer(1, pcm.length, sourceSR);
     b.copyToChannel(pcm, 0);
