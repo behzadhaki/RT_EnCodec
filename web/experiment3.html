@@ -1,0 +1,1433 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>EnCodec — Dynamics Transfer</title>
+<link rel="stylesheet" href="encodec.css">
+<style>
+/* ── experiment3-specific overrides & additions ──────────────────────── */
+:root { --lbl-w: 4.8em; }
+#frame { grid-template-columns: 230px 1fr; }
+
+#loopBtn {
+  width: 28px; height: 28px; border-radius: 4px; cursor: pointer;
+  background: var(--accent-lo); border: 1px solid var(--accent);
+  color: var(--text); font-size: 20px;
+  display: flex; align-items: center; justify-content: center;
+}
+#loopBtn:hover { filter: brightness(1.2); }
+#loopBtn:disabled { opacity: 0.4; cursor: default; filter: none; }
+#loopBtn.active { background: var(--accent); color: #000; }
+
+#levelMeter {
+  width: 10px; height: 28px; flex-shrink: 0;
+  border-radius: 2px; border: 1px solid var(--border2);
+  background: #111; display: block;
+}
+
+/* ── Pipeline labels ─────────────────────────────────────────────────── */
+#pipelineLabels {
+  position: absolute; top: 4px; left: 0; right: 0;
+  z-index: 1; pointer-events: none;
+}
+.ipt-label {
+  position: absolute; top: 0; transform: translateX(-50%);
+  font-size: 10px; font-weight: 600; letter-spacing: 0.04em;
+  white-space: nowrap; cursor: pointer; user-select: none;
+  pointer-events: auto; color: var(--muted); transition: color 0.15s;
+}
+.ipt-label.active { color: var(--accent); }
+.ipt-label:not(.active):hover { color: var(--text); }
+
+/* ── Pipeline panel ──────────────────────────────────────────────────── */
+#pipelinePanel {
+  flex-shrink: 0; position: relative;
+  background: var(--surface2); border-bottom: 1px solid var(--border); overflow: hidden;
+}
+#pipelineCanvas { display: block; width: 100%; height: 75px; }
+#pipelineCtrl { position: relative; height: 84px; border-top: 1px solid var(--border2); }
+
+/* ── Delta controls ──────────────────────────────────────────────────── */
+#deltaCtrlSection {
+  position: absolute; top: 50%; transform: translateY(-50%);
+  display: flex; flex-direction: column; gap: 3px;
+  min-width: 200px;
+}
+.delta-row { display: flex; align-items: center; gap: 5px; }
+.delta-lbl {
+  font-size: 11px; color: var(--muted); white-space: nowrap;
+  min-width: 3.8em; text-align: right; flex-shrink: 0;
+}
+.delta-val {
+  font-size: 11px; color: var(--muted); min-width: 3em;
+  text-align: right; white-space: nowrap; flex-shrink: 0;
+}
+#strengthSlider, #onsetSlider {
+  flex: 1; accent-color: var(--accent); cursor: pointer; height: 4px;
+}
+
+/* ── Dual-range (dims) slider ────────────────────────────────────────── */
+.dual-range-wrap {
+  flex: 1; position: relative; height: 18px;
+}
+.dual-range-track {
+  position: absolute; top: 50%; left: 0; right: 0; height: 4px;
+  transform: translateY(-50%);
+  background: var(--border2); border-radius: 2px; pointer-events: none;
+}
+.dual-range-fill {
+  position: absolute; top: 0; height: 100%;
+  background: var(--accent-lo); border-radius: 2px;
+}
+.dual-range-wrap input[type=range] {
+  position: absolute; width: 100%; top: 50%; transform: translateY(-50%);
+  margin: 0; padding: 0; height: 4px;
+  background: transparent; pointer-events: none;
+  -webkit-appearance: none; appearance: none; accent-color: var(--accent);
+}
+.dual-range-wrap input[type=range]::-webkit-slider-thumb {
+  pointer-events: auto; -webkit-appearance: none;
+  width: 12px; height: 12px; border-radius: 50%;
+  background: var(--accent); cursor: pointer; border: none;
+}
+.dual-range-wrap input[type=range]::-moz-range-thumb {
+  pointer-events: auto; width: 12px; height: 12px; border-radius: 50%;
+  background: var(--accent); cursor: pointer; border: none;
+}
+
+/* ── Norm toggle ─────────────────────────────────────────────────────── */
+#normToggle {
+  position: absolute; top: 6px; right: 8px; z-index: 2;
+  display: flex; align-items: center; gap: 4px;
+  font-size: 10px; color: var(--muted); cursor: pointer;
+  user-select: none; background: rgba(0,0,0,0.45); border-radius: 3px; padding: 2px 6px;
+}
+#normToggle input { cursor: pointer; accent-color: var(--accent); margin: 0; }
+</style>
+</head>
+<body>
+
+<div id="frame">
+
+  <!-- ─────────── LEFT CONTROLS (populated by JS) ─────────── -->
+  <div id="controls"></div>
+
+  <!-- ─────────── RIGHT PANEL ─────────── -->
+  <div id="right">
+
+    <div id="toolbar">
+      <button id="playBtn" disabled>▶</button>
+      <button id="loopBtn" disabled title="Loop">↺</button>
+      <canvas id="levelMeter" title="Output level"></canvas>
+      <div class="tab-group">
+        <button class="tab active" data-view="A">Source A</button>
+        <button class="tab"        data-view="B">Source B</button>
+        <button class="tab"        data-view="interp">Modified</button>
+      </div>
+      <span id="statusBar">Click to enable audio.</span>
+      <div id="progressWrap"><div id="progressBar"></div></div>
+    </div>
+
+    <div id="legend">
+      <span id="lgA"><span class="ldot" style="background:#c87800"></span>Source A (plasma)</span>
+      <span id="lgB" style="display:none"><span class="ldot" style="background:#2090c0"></span>Source B (ocean)</span>
+      <span id="lgI" style="display:none"><span class="ldot" style="background:#ff4400"></span>Modified (hot)</span>
+    </div>
+
+    <div id="pipelinePanel">
+      <div id="pipelineLabels">
+        <span class="ipt-label active" id="togEncLatents" data-point="encoder_latents">Apply Here</span>
+        <span class="ipt-label"        id="togQuantEmb"   data-point="quantized_embeddings">Apply Here</span>
+      </div>
+      <canvas id="pipelineCanvas"></canvas>
+      <div id="pipelineCtrl">
+        <div id="deltaCtrlSection">
+          <div class="delta-row">
+            <span class="delta-lbl">Mode</span>
+            <div class="toggle-row" id="modeRow" style="flex:1">
+              <button class="tog active" data-mode="per_frame">Per-frame</button>
+              <button class="tog"        data-mode="cumulative">Cumulative</button>
+              <button class="tog"        data-mode="anchored">Anchored</button>
+            </div>
+          </div>
+          <div class="delta-row">
+            <span class="delta-lbl">Strength</span>
+            <input type="range" id="strengthSlider" min="0" max="500" value="100" step="5">
+            <span class="delta-val" id="strengthDisplay">1.00</span>
+          </div>
+          <div class="delta-row">
+            <span class="delta-lbl">Onset</span>
+            <input type="range" id="onsetSlider" min="0" max="100" value="0" step="1">
+            <span class="delta-val" id="onsetDisplay">0 %</span>
+          </div>
+          <div class="delta-row">
+            <span class="delta-lbl">Dims</span>
+            <div class="dual-range-wrap" id="dimsWrap">
+              <div class="dual-range-track"><div class="dual-range-fill" id="dimsFill"></div></div>
+              <input type="range" id="dimsLo" min="0" max="127" value="0"   step="1">
+              <input type="range" id="dimsHi" min="0" max="127" value="127" step="1">
+            </div>
+            <span class="delta-val" id="dimsDisplay">all</span>
+          </div>
+        </div>
+      </div>
+      <label id="normToggle" title="Shared scale: use same dB range for all spectrograms">
+        <input type="checkbox" id="sharedScaleChk"> Shared scale
+      </label>
+    </div>
+
+    <div id="specArea">
+      <div id="stripWrap"><canvas id="stripCanvas"></canvas></div>
+      <div id="specWrap">
+        <canvas id="specCanvas"></canvas>
+        <canvas id="playheadCanvas"></canvas>
+        <div id="activationOverlay"><span>Click to enable audio</span></div>
+      </div>
+    </div>
+
+    <div id="notePanel"></div>
+
+  </div>
+</div>
+
+<script type="module">
+'use strict';
+
+import { createSourcePanel }    from './lib/source-panel.js';
+import { createModelPanel }     from './lib/model-panel.js';
+import {
+  generateSource, applyPulseGate, loadFile, getAudioFileDuration, loopToLength, MAX_S,
+} from './lib/audio-utils.js';
+import {
+  computeSTFT, stftToOffscreen, drawStrip as _drawStrip, PLASMA, OCEAN, HOT,
+} from './lib/stft.js';
+
+// ═══════════════════════════════════════════════════════════════════════
+// Config
+// ═══════════════════════════════════════════════════════════════════════
+
+const MODELS_BASE = new URL('../serialization/encodec_onnx_exports', location.href).href;
+
+const APPLY_NOTES = {
+  encoder_latents:
+    '<strong>Encoder Latents.</strong> The delta is applied before quantization. Modified ' +
+    'embeddings are re-quantized then decoded. VQ snapping may absorb small deltas — ' +
+    'increase strength to push through.',
+  quantized_embeddings:
+    '<strong>Quantized Embeddings.</strong> The delta is applied after <code>decode_codes</code>, ' +
+    'bypassing re-quantization. The audio LSTM decodes directly from the shifted embeddings.',
+};
+
+const MODE_NOTES = {
+  per_frame:
+    '<strong>Per-frame.</strong> out[t] = A[t] + strength × (B[t] − B[t−1]). ' +
+    "B's instantaneous velocity modulates A at each frame independently.",
+  cumulative:
+    '<strong>Cumulative.</strong> From the onset, B\'s frame deltas are integrated: ' +
+    'out[t] = A[t] + strength × Σ ΔB. ' +
+    "A's embeddings drift along B's trajectory in the latent space.",
+  anchored:
+    '<strong>Anchored.</strong> A is frozen at the onset frame; B drives from that same point: ' +
+    'out[t] = A[onset] + strength × (B[t] − B[onset]). ' +
+    "The output follows B's shape but is anchored to A's timbre at onset.",
+};
+
+// ═══════════════════════════════════════════════════════════════════════
+// Build left-panel controls
+// ═══════════════════════════════════════════════════════════════════════
+
+const controls = document.getElementById('controls');
+
+const panelA = createSourcePanel({
+  title: 'Source A', defaultFreq: 440,
+  showVol: true, showGate: true, showSilence: true,
+  onChange: (delay) => scheduleFullRecalc(delay),
+  onFilePicked: async (file) => {
+    const fileDur = await getAudioFileDuration(file);
+    const current = parseFloat(durEl.value) || 2;
+    if (fileDur > current) durEl.value = fileDur.toFixed(2);
+  },
+});
+controls.appendChild(panelA.element);
+
+const panelB = createSourcePanel({
+  title: 'Source B', defaultFreq: 880,
+  showVol: true, showGate: true, showSilence: true,
+  onChange: (delay) => scheduleFullRecalc(delay),
+  onFilePicked: async (file) => {
+    const fileDur = await getAudioFileDuration(file);
+    const current = parseFloat(durEl.value) || 2;
+    if (fileDur > current) durEl.value = fileDur.toFixed(2);
+  },
+});
+controls.appendChild(panelB.element);
+
+// Duration section
+const durSection = document.createElement('div');
+durSection.className = 'section';
+durSection.innerHTML = `
+  <div class="section-title">Duration</div>
+  <div class="row">
+    <span class="lbl">Target</span>
+    <input type="number" value="2" min="0.1" max="10" step="0.1">
+    <span class="unit">s</span>
+  </div>
+`.trim();
+controls.appendChild(durSection);
+const durEl = durSection.querySelector('input');
+durEl.addEventListener('input', () => scheduleFullRecalc(500));
+
+// Model + Mode sections
+const mp = createModelPanel({
+  onChange() {
+    drawPipeline();
+    scheduleFullRecalc(0);
+  },
+});
+controls.appendChild(mp.modelSection);
+controls.appendChild(mp.modeSection);
+
+// ═══════════════════════════════════════════════════════════════════════
+// State
+// ═══════════════════════════════════════════════════════════════════════
+
+let audioCtx  = null;
+let sourceSR  = 24000;
+
+let rawAudioA = null;
+let rawAudioB = null;
+let decodedA  = null;
+let decodedB  = null;
+let modAudio  = null;
+
+let bufA = null, bufB = null, bufMod = null;
+let stftA = null, stftB = null, stftMod = null;
+let offA  = null, offB  = null, offMod  = null;
+
+let currentView  = 'A';
+let applyPoint   = 'encoder_latents';
+let transferMode = 'per_frame';
+let strengthVal  = 1.0;
+let onsetFrac    = 0.0;
+let dimLo        = 0;
+let dimHi        = 127;
+let sharedScale  = false;
+let shiftHeld    = false;
+
+let analyserNode = null;
+let _levelCur    = 0;
+let _levelPeak   = 0;
+let _levelRAF    = null;
+
+let worker          = null;
+let jobSeq          = 0;
+let activeJobId     = -1;
+let encodePhase     = null;
+let fullRecalcTimer = null;
+let deltaTimer      = null;
+let recalcToken     = 0;
+let capturesDirty   = true;
+
+let isPlaying       = false;
+let looping         = true;
+let playNode        = null;
+let playGain        = null;
+let fadeOutNode     = null;
+let fadeOutGain     = null;
+const CROSSFADE_S   = 1.5;
+let playStart       = 0;
+let playingDuration = 0;
+let phRAF           = null;
+
+let specFadeOldOff  = null;
+let specFadeNewOff  = null;
+let specFadeView    = null;
+let specFadeStart   = 0;
+let specFadeRAF     = null;
+
+let seekOffset         = 0;
+let isDraggingPlayhead = false;
+let currentScrubFrac   = 0;
+let pipelineTimer      = null;
+
+const dpr = devicePixelRatio || 1;
+
+// ═══════════════════════════════════════════════════════════════════════
+// DOM refs
+// ═══════════════════════════════════════════════════════════════════════
+
+const $ = id => document.getElementById(id);
+
+const playBtn        = $('playBtn');
+const loopBtn        = $('loopBtn');
+const statusBar      = $('statusBar');
+const progWrap       = $('progressWrap');
+const progBar        = $('progressBar');
+const specCvs        = $('specCanvas');
+const phCvs          = $('playheadCanvas');
+const stripCvs       = $('stripCanvas');
+const actOvl         = $('activationOverlay');
+const notePanel      = $('notePanel');
+const lgA = $('lgA'), lgB = $('lgB'), lgI = $('lgI');
+const strengthSlider  = $('strengthSlider');
+const strengthDisplay = $('strengthDisplay');
+const onsetSlider     = $('onsetSlider');
+const onsetDisplay    = $('onsetDisplay');
+const dimsLoInput     = $('dimsLo');
+const dimsHiInput     = $('dimsHi');
+const dimsFill        = $('dimsFill');
+const dimsDisplay     = $('dimsDisplay');
+const sharedScaleChk  = $('sharedScaleChk');
+
+// ═══════════════════════════════════════════════════════════════════════
+// Audio context (user-gesture gated)
+// ═══════════════════════════════════════════════════════════════════════
+
+function ensureAudioCtx() {
+  if (!audioCtx) {
+    audioCtx = new AudioContext();
+    analyserNode = audioCtx.createAnalyser();
+    analyserNode.fftSize = 512;
+    analyserNode.smoothingTimeConstant = 0;
+    analyserNode.connect(audioCtx.destination);
+    actOvl.style.display = 'none';
+    scheduleFullRecalc();
+  }
+}
+actOvl.addEventListener('click', ensureAudioCtx);
+
+// ═══════════════════════════════════════════════════════════════════════
+// Apply-point toggle
+// ═══════════════════════════════════════════════════════════════════════
+
+document.querySelectorAll('#pipelineLabels .ipt-label').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('#pipelineLabels .ipt-label').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    applyPoint = btn.dataset.point;
+    updateNotePanel();
+    positionPipelineControls();
+    drawPipeline();
+    scheduleDeltaRecalc();
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// Delta controls
+// ═══════════════════════════════════════════════════════════════════════
+
+document.querySelectorAll('#modeRow .tog').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('#modeRow .tog').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    transferMode = btn.dataset.mode;
+    updateNotePanel();
+    scheduleDeltaRecalc();
+  });
+});
+
+strengthSlider.addEventListener('input', () => {
+  strengthVal = parseInt(strengthSlider.value) / 100;
+  strengthDisplay.textContent = strengthVal.toFixed(2);
+  drawPipeline();
+});
+strengthSlider.addEventListener('change', () => scheduleDeltaRecalc());
+
+onsetSlider.addEventListener('input', () => {
+  onsetFrac = parseInt(onsetSlider.value) / 100;
+  onsetDisplay.textContent = `${parseInt(onsetSlider.value)} %`;
+  drawPipeline();
+});
+onsetSlider.addEventListener('change', () => scheduleDeltaRecalc());
+
+function updateDimsUI() {
+  const lo = parseInt(dimsLoInput.value);
+  const hi = parseInt(dimsHiInput.value);
+  const pct = v => (v / 127) * 100;
+  dimsFill.style.left  = pct(lo) + '%';
+  dimsFill.style.width = (pct(hi) - pct(lo)) + '%';
+  dimsDisplay.textContent = (lo === 0 && hi === 127) ? 'all' : `${lo}–${hi}`;
+  // When handles overlap at max, bring lo on top so it can be dragged left.
+  dimsLoInput.style.zIndex = (lo >= hi) ? 2 : 1;
+}
+dimsLoInput.addEventListener('input', () => {
+  if (parseInt(dimsLoInput.value) > parseInt(dimsHiInput.value))
+    dimsLoInput.value = dimsHiInput.value;
+  dimLo = parseInt(dimsLoInput.value);
+  updateDimsUI();
+});
+dimsHiInput.addEventListener('input', () => {
+  if (parseInt(dimsHiInput.value) < parseInt(dimsLoInput.value))
+    dimsHiInput.value = dimsLoInput.value;
+  dimHi = parseInt(dimsHiInput.value);
+  updateDimsUI();
+});
+dimsLoInput.addEventListener('change', () => scheduleDeltaRecalc());
+dimsHiInput.addEventListener('change', () => scheduleDeltaRecalc());
+updateDimsUI();
+
+// ═══════════════════════════════════════════════════════════════════════
+// View tabs
+// ═══════════════════════════════════════════════════════════════════════
+
+document.querySelectorAll('.tab').forEach(tab => tab.addEventListener('click', () => {
+  const newView = tab.dataset.view;
+  if (newView === currentView) return;
+
+  if (stftA && !offA) offA = makeOffscreen(stftA, PLASMA);
+  if (stftB && !offB) offB = makeOffscreen(stftB, OCEAN);
+  if (stftMod && !offMod) offMod = makeOffscreen(stftMod, HOT);
+  const oldOff = currentView === 'A' ? offA : currentView === 'B' ? offB : offMod;
+  const newOff = newView    === 'A' ? offA : newView    === 'B' ? offB : offMod;
+
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.view === newView));
+  currentView = newView;
+  updateLegend();
+  startSpecFade(oldOff, newOff, newView);
+
+  if (isPlaying && audioCtx) {
+    const elapsed = audioCtx.currentTime - playStart;
+    const dur     = playingDuration || 1;
+    const offset  = looping ? elapsed % dur : Math.min(elapsed, dur - 0.001);
+    _crossfadeAudioTo(Math.max(0, offset));
+  }
+}));
+
+function setView(v) {
+  currentView = v;
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.view === v));
+  updateLegend();
+  drawSpec();
+}
+
+function updateLegend() {
+  lgA.style.display = currentView === 'A'      ? '' : 'none';
+  lgB.style.display = currentView === 'B'      ? '' : 'none';
+  lgI.style.display = currentView === 'interp' ? '' : 'none';
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Shared scale toggle
+// ═══════════════════════════════════════════════════════════════════════
+
+sharedScaleChk.addEventListener('change', () => {
+  sharedScale = sharedScaleChk.checked;
+  offA = offB = offMod = null;
+  drawSpec();
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// Note panel
+// ═══════════════════════════════════════════════════════════════════════
+
+function updateNotePanel() {
+  const parts = [APPLY_NOTES[applyPoint], MODE_NOTES[transferMode]].filter(Boolean);
+  notePanel.innerHTML = parts.join('  ');
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Worker
+// ═══════════════════════════════════════════════════════════════════════
+
+function initWorker() {
+  if (worker) worker.terminate();
+  worker = new Worker('encodec-worker.js?v=8');
+  worker.postMessage({ type: 'init', modelsBaseUrl: MODELS_BASE });
+  worker.onmessage = onWorkerMsg;
+}
+
+function onWorkerMsg(e) {
+  const msg = e.data;
+  if (msg.jobId !== activeJobId) return;
+
+  if (msg.type === 'progress') {
+    progBar.style.width = Math.round(msg.value * 100) + '%';
+    setStatus(msg.status);
+
+  } else if (msg.type === 'result') {
+    progWrap.style.display = 'none';
+
+    if (encodePhase === 'A') {
+      const prevOff = offA;
+      decodedA = msg.decoded;
+      sourceSR = mp.getSampleRate();
+      bufA  = makeAudioBuf(decodedA);
+      stftA = computeSTFT(decodedA);
+      offA  = makeOffscreen(stftA, PLASMA);
+      crossfadeToNew('A');
+      drawPipeline();
+      setStatus('Source A encoded — encoding B…');
+      if (currentView === 'A') startSpecFade(prevOff, offA, 'A');
+      else drawSpec();
+      startEncodeB();
+
+    } else if (encodePhase === 'B') {
+      const prevOff = offB;
+      decodedB = msg.decoded;
+      bufB  = makeAudioBuf(decodedB);
+      stftB = computeSTFT(decodedB);
+      offB  = makeOffscreen(stftB, OCEAN);
+      if (sharedScale) offA = null;
+      capturesDirty = false;
+      encodePhase   = null;
+      playBtn.disabled = false;
+      loopBtn.disabled = false;
+      crossfadeToNew('B');
+      drawPipeline();
+      if (currentView === 'B') startSpecFade(prevOff, offB, 'B');
+      else drawSpec();
+      if (!isPlaying) setView('A');
+      triggerDeltaTransfer();
+
+    } else if (encodePhase === 'delta') {
+      const prevOff = offMod;
+      modAudio = msg.decoded;
+      bufMod  = makeAudioBuf(modAudio);
+      stftMod = computeSTFT(modAudio);
+      offMod  = makeOffscreen(stftMod, HOT);
+      if (sharedScale) { offA = null; offB = null; }
+      setStatus(
+        `Done  ·  ${applyPoint.replace(/_/g,' ')}  ·  ` +
+        `${transferMode.replace(/_/g,' ')}  ·  str ${strengthVal.toFixed(2)}` +
+        (onsetFrac > 0 ? `  ·  onset ${Math.round(onsetFrac*100)} %` : '')
+      );
+      encodePhase = null;
+      playBtn.disabled = false;
+      loopBtn.disabled = false;
+      crossfadeToNew('interp');
+      drawPipeline();
+      if (currentView === 'interp' || !isPlaying) startSpecFade(prevOff, offMod, 'interp');
+      else drawSpec();
+      if (!isPlaying) setView('interp');
+    }
+
+  } else if (msg.type === 'error') {
+    progWrap.style.display = 'none';
+    setStatus('Error: ' + msg.message, true);
+    encodePhase = null;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Recalculation scheduling
+// ═══════════════════════════════════════════════════════════════════════
+
+function cancelCurrentJob() {
+  if (encodePhase !== null) {
+    const phase = encodePhase;
+    worker.postMessage({ type: 'cancel', jobId: activeJobId });
+    activeJobId = ++jobSeq;
+    encodePhase = null;
+    if (phase === 'A' || phase === 'B') capturesDirty = true;
+  }
+}
+
+function makeAudioBuf(pcm) {
+  if (!audioCtx || !pcm) return null;
+  const b = audioCtx.createBuffer(1, pcm.length, sourceSR);
+  b.copyToChannel(pcm, 0);
+  return b;
+}
+
+function clearVisualizers(deltaOnly) {
+  _cancelSpecFade();
+  if (!deltaOnly) { seekOffset = 0; currentScrubFrac = 0; bufA = null; bufB = null; }
+  bufMod   = null;
+  modAudio = null;
+  if (!deltaOnly) rawAudioA = rawAudioB = null;
+  progWrap.style.display = 'block';
+  progBar.style.width = '0%';
+  setStatus('Re-calculating…');
+  drawSpec();
+}
+
+function scheduleFullRecalc(delay = 0) {
+  capturesDirty = true;
+  clearTimeout(fullRecalcTimer);
+  clearTimeout(deltaTimer);
+  fullRecalcTimer = setTimeout(() => {
+    if (!audioCtx) return;
+    cancelCurrentJob();
+    clearVisualizers(false);
+    startFullPipeline();
+  }, delay);
+}
+
+function scheduleDeltaRecalc() {
+  if (capturesDirty || !rawAudioA || !rawAudioB) {
+    scheduleFullRecalc(0);
+    return;
+  }
+  clearTimeout(deltaTimer);
+  deltaTimer = setTimeout(() => {
+    if (capturesDirty || !rawAudioA || !rawAudioB) { scheduleFullRecalc(0); return; }
+    cancelCurrentJob();
+    clearVisualizers(true);
+    triggerDeltaTransfer();
+  }, 0);
+}
+
+async function startFullPipeline() {
+  const token = ++recalcToken;
+  if (!worker) initWorker();
+
+  let result;
+  try { result = await buildBothAudios(token); }
+  catch (err) {
+    if (recalcToken === token) { setStatus(err.message, true); progWrap.style.display = 'none'; }
+    return;
+  }
+  if (!result) return;
+
+  rawAudioA = result.audioA;
+  rawAudioB = result.audioB;
+  sourceSR  = mp.getSampleRate();
+
+  encodePhase = 'A';
+  activeJobId = ++jobSeq;
+  setStatus('Encoding A…');
+
+  worker.postMessage({
+    type:      'encode',
+    source:    'A',
+    jobId:     activeJobId,
+    audio:     rawAudioA.slice(),
+    modelHz:   mp.getModelHz(),
+    bwKbps:    mp.getBwKbps(),
+    streaming: mp.isStreaming(),
+    frameSize: mp.getFrameSize(),
+  });
+}
+
+function startEncodeB() {
+  encodePhase = 'B';
+  activeJobId = ++jobSeq;
+  progWrap.style.display = 'block';
+  progBar.style.width = '0%';
+  setStatus('Encoding B…');
+
+  worker.postMessage({
+    type:      'encode',
+    source:    'B',
+    jobId:     activeJobId,
+    audio:     rawAudioB.slice(),
+    modelHz:   mp.getModelHz(),
+    bwKbps:    mp.getBwKbps(),
+    streaming: mp.isStreaming(),
+    frameSize: mp.getFrameSize(),
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Delta transfer trigger
+// ═══════════════════════════════════════════════════════════════════════
+
+function triggerDeltaTransfer() {
+  if (!rawAudioA || !rawAudioB) return;
+  encodePhase = 'delta';
+  activeJobId = ++jobSeq;
+  progWrap.style.display = 'block';
+  progBar.style.width = '0%';
+  setStatus(`Applying ${transferMode.replace(/_/g,' ')} delta…`);
+
+  worker.postMessage({
+    type:       'delta_transfer',
+    jobId:      activeJobId,
+    modelHz:    mp.getModelHz(),
+    bwKbps:     mp.getBwKbps(),
+    streaming:  mp.isStreaming(),
+    frameSize:  mp.getFrameSize(),
+    applyPoint,
+    mode:       transferMode,
+    strength:   strengthVal,
+    startFrac:  onsetFrac,
+    dimLo,
+    dimHi,
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Playback
+// ═══════════════════════════════════════════════════════════════════════
+
+playBtn.addEventListener('click', () => { isPlaying ? stopPlayback() : startPlayback(seekOffset); });
+
+loopBtn.addEventListener('click', () => {
+  looping = !looping;
+  loopBtn.classList.toggle('active', looping);
+  if (playNode) playNode.loop = looping;
+  if (playNode && !looping) playNode.onended = stopPlayback;
+  if (playNode &&  looping) playNode.onended = null;
+});
+
+function currentAudio() {
+  if (currentView === 'A')      return decodedA;
+  if (currentView === 'B')      return decodedB;
+  if (currentView === 'interp') return modAudio;
+  return null;
+}
+
+function _killFadeOut() {
+  if (!fadeOutNode) return;
+  fadeOutGain.gain.cancelScheduledValues(audioCtx.currentTime);
+  fadeOutGain.gain.setValueAtTime(0, audioCtx.currentTime);
+  fadeOutNode.onended = null;
+  try { fadeOutNode.stop(); } catch {}
+  try { fadeOutGain.disconnect(); } catch {}
+  fadeOutNode = null; fadeOutGain = null;
+}
+
+function _cancelSpecFade() {
+  if (specFadeRAF) { cancelAnimationFrame(specFadeRAF); specFadeRAF = null; }
+  specFadeOldOff = null; specFadeNewOff = null; specFadeView = null;
+}
+
+function startPlayback(atOffset = 0) {
+  if (!audioCtx) return;
+  const pcm = currentAudio();
+  if (!pcm) return;
+
+  _killFadeOut();
+
+  if (playNode) {
+    playNode.onended = null;
+    try { playNode.stop(); } catch {}
+    playNode = null;
+  }
+  if (playGain) { try { playGain.disconnect(); } catch {} playGain = null; }
+  cancelAnimationFrame(phRAF);
+
+  const preBuf = currentView === 'A' ? bufA : currentView === 'B' ? bufB : bufMod;
+  const buf = preBuf || (() => {
+    const b = audioCtx.createBuffer(1, pcm.length, sourceSR);
+    b.copyToChannel(pcm, 0);
+    return b;
+  })();
+
+  playGain = audioCtx.createGain();
+  playGain.gain.value = 1;
+  playGain.connect(analyserNode || audioCtx.destination);
+
+  playNode = audioCtx.createBufferSource();
+  playNode.buffer  = buf;
+  playNode.loop    = looping;
+  playNode.onended = looping ? null : stopPlayback;
+  playNode.connect(playGain);
+
+  const offset = Math.max(0, Math.min(atOffset, pcm.length / sourceSR - 0.001));
+  playNode.start(0, offset);
+  playStart       = audioCtx.currentTime - offset;
+  playingDuration = pcm.length / sourceSR;
+  isPlaying       = true;
+  playBtn.textContent = '⏹';
+  updateLegend();
+  drawSpec();
+  animatePlayhead();
+  startPipelineTimer();
+  startLevelMeter();
+}
+
+function _crossfadeAudioTo(offset) {
+  if (!audioCtx) return;
+  const pcm = currentAudio();
+  if (!pcm) { stopPlayback(); return; }
+
+  _killFadeOut();
+
+  if (playNode) {
+    fadeOutNode = playNode;
+    fadeOutGain = playGain;
+    fadeOutGain.gain.cancelScheduledValues(audioCtx.currentTime);
+    fadeOutGain.gain.setValueAtTime(1, audioCtx.currentTime);
+    fadeOutGain.gain.linearRampToValueAtTime(0, audioCtx.currentTime + CROSSFADE_S);
+    const fn = fadeOutNode, fg = fadeOutGain;
+    setTimeout(() => {
+      fn.onended = null;
+      try { fn.stop(); } catch {}
+      try { fg.disconnect(); } catch {}
+    }, (CROSSFADE_S + 0.15) * 1000);
+    playNode = null; playGain = null;
+  }
+
+  const dur     = pcm.length / sourceSR;
+  const safeOff = Math.max(0, Math.min(offset, dur - 0.001));
+  const preBuf  = currentView === 'A' ? bufA : currentView === 'B' ? bufB : bufMod;
+  const buf     = preBuf || (() => {
+    const b = audioCtx.createBuffer(1, pcm.length, sourceSR);
+    b.copyToChannel(pcm, 0);
+    return b;
+  })();
+
+  playGain = audioCtx.createGain();
+  playGain.gain.setValueAtTime(0, audioCtx.currentTime);
+  playGain.gain.linearRampToValueAtTime(1, audioCtx.currentTime + CROSSFADE_S);
+  playGain.connect(analyserNode || audioCtx.destination);
+
+  playNode = audioCtx.createBufferSource();
+  playNode.buffer  = buf;
+  playNode.loop    = looping;
+  playNode.onended = looping ? null : stopPlayback;
+  playNode.connect(playGain);
+  playNode.start(0, safeOff);
+  playStart       = audioCtx.currentTime - safeOff;
+  playingDuration = dur;
+}
+
+function crossfadeToNew(view) {
+  if (!isPlaying || currentView !== view) return;
+  const elapsed = audioCtx.currentTime - playStart;
+  const pcm = currentAudio();
+  if (!pcm) return;
+  const dur = pcm.length / sourceSR;
+  _crossfadeAudioTo(looping ? elapsed % dur : Math.min(elapsed, dur - 0.001));
+}
+
+function stopPlayback() {
+  _killFadeOut();
+  if (playNode) { playNode.onended = null; try { playNode.stop(); } catch {} playNode = null; }
+  if (playGain) { try { playGain.disconnect(); } catch {} playGain = null; }
+  isPlaying = false;
+  playBtn.textContent = '▶';
+  cancelAnimationFrame(phRAF);
+  drawPlayhead(currentScrubFrac);
+  stopPipelineTimer();
+  stopLevelMeter();
+}
+
+function animatePlayhead() {
+  function tick() {
+    if (!isPlaying) return;
+    const dur     = playingDuration || 1;
+    const elapsed = audioCtx.currentTime - playStart;
+    const frac    = looping ? (elapsed % dur) / dur : elapsed / dur;
+    drawPlayhead(frac);
+    phRAF = requestAnimationFrame(tick);
+  }
+  tick();
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Spectrogram draw
+// ═══════════════════════════════════════════════════════════════════════
+
+function globalStftRange() {
+  const stfts = [stftA, stftB, stftMod].filter(Boolean);
+  if (!stfts.length) return null;
+  return {
+    dBmin: Math.min(...stfts.map(s => s.dBmin)),
+    dBmax: Math.max(...stfts.map(s => s.dBmax)),
+  };
+}
+
+function makeOffscreen(stft, stops) {
+  if (!stft) return null;
+  if (!sharedScale) return stftToOffscreen(stft, stops);
+  const range = globalStftRange();
+  return range ? stftToOffscreen({ ...stft, dBmin: range.dBmin, dBmax: range.dBmax }, stops)
+               : stftToOffscreen(stft, stops);
+}
+
+function drawSpec() {
+  if (specFadeRAF && specFadeView === currentView) return;
+
+  const cW = Math.round(specCvs.clientWidth  * dpr);
+  const cH = Math.round(specCvs.clientHeight * dpr);
+  if (!cW || !cH) return;
+  specCvs.width = cW; specCvs.height = cH;
+  const ctx = specCvs.getContext('2d');
+  ctx.clearRect(0, 0, cW, cH);
+
+  if (stftA   && !offA)   offA   = makeOffscreen(stftA,   PLASMA);
+  if (stftB   && !offB)   offB   = makeOffscreen(stftB,   OCEAN);
+  if (stftMod && !offMod) offMod = makeOffscreen(stftMod, HOT);
+
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+
+  const off = currentView === 'A' ? offA : currentView === 'B' ? offB : offMod;
+  if (off) ctx.drawImage(off, 0, 0, cW, cH);
+
+  drawStrip();
+}
+
+function drawStrip() {
+  const stft  = currentView === 'A' ? stftA : currentView === 'B' ? stftB : stftMod;
+  const stops = currentView === 'A' ? PLASMA : currentView === 'B' ? OCEAN : HOT;
+  _drawStrip(stripCvs, stft, stops, dpr);
+}
+
+function startSpecFade(oldOff, newOff, view) {
+  _cancelSpecFade();
+  if (!oldOff || !newOff || oldOff === newOff) { drawSpec(); return; }
+  specFadeOldOff = oldOff;
+  specFadeNewOff = newOff;
+  specFadeView   = view;
+  specFadeStart  = performance.now();
+
+  function tick() {
+    const t = Math.min((performance.now() - specFadeStart) / (CROSSFADE_S * 1000), 1);
+    if (currentView === specFadeView) {
+      const cW = Math.round(specCvs.clientWidth  * dpr);
+      const cH = Math.round(specCvs.clientHeight * dpr);
+      if (cW && cH) {
+        specCvs.width = cW; specCvs.height = cH;
+        const ctx = specCvs.getContext('2d');
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = 'high';
+        ctx.globalAlpha = 1 - t; ctx.drawImage(specFadeOldOff, 0, 0, cW, cH);
+        ctx.globalAlpha = t;     ctx.drawImage(specFadeNewOff, 0, 0, cW, cH);
+        ctx.globalAlpha = 1;
+      }
+    }
+    if (t < 1) {
+      specFadeRAF = requestAnimationFrame(tick);
+    } else {
+      specFadeOldOff = null; specFadeNewOff = null; specFadeView = null; specFadeRAF = null;
+      drawSpec();
+    }
+  }
+  specFadeRAF = requestAnimationFrame(tick);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Playhead
+// ═══════════════════════════════════════════════════════════════════════
+
+const HANDLE_R = 7;
+
+function drawPlayhead(frac) {
+  const cW = Math.round(phCvs.clientWidth  * dpr);
+  const cH = Math.round(phCvs.clientHeight * dpr);
+  phCvs.width = cW; phCvs.height = cH;
+  if (frac < 0 || frac > 1.001) return;
+  const ctx = phCvs.getContext('2d');
+  const x   = Math.round(Math.min(frac, 1) * cW);
+  const hr  = HANDLE_R * dpr;
+
+  ctx.strokeStyle = 'rgba(255,255,255,0.80)';
+  ctx.lineWidth   = dpr;
+  ctx.beginPath(); ctx.moveTo(x, hr * 2); ctx.lineTo(x, cH); ctx.stroke();
+
+  ctx.beginPath(); ctx.arc(x, hr, hr, 0, 2 * Math.PI);
+  ctx.fillStyle   = 'rgba(255,255,255,0.90)'; ctx.fill();
+  ctx.strokeStyle = 'rgba(0,0,0,0.45)'; ctx.lineWidth = dpr; ctx.stroke();
+}
+
+function clearPlayhead() {
+  phCvs.width  = phCvs.clientWidth  * dpr;
+  phCvs.height = phCvs.clientHeight * dpr;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Resize
+// ═══════════════════════════════════════════════════════════════════════
+
+new ResizeObserver(() => { offA = offB = offMod = null; drawSpec(); }).observe($('specWrap'));
+new ResizeObserver(() => positionPipelineControls()).observe($('pipelinePanel'));
+
+// ═══════════════════════════════════════════════════════════════════════
+// Pipeline control positioning
+// ═══════════════════════════════════════════════════════════════════════
+
+function positionPipelineControls() {
+  const panelW = $('pipelinePanel').clientWidth;
+  if (!panelW) return;
+
+  const pcts = [7, 2.5, 11, 2, 3, 2, 5, 2, 13, 2, 11, 2, 3, 2, 11, 2.5, 6];
+  const tot  = pcts.reduce((a, b) => a + b, 0);
+  const padX = 10;
+  const usW  = panelW - 2 * padX;
+
+  const secLeft   = i => padX + pcts.slice(0, i).reduce((a, b) => a + b, 0) / tot * usW;
+  const secWidth  = i => pcts[i] / tot * usW;
+  const secCenter = i => secLeft(i) + secWidth(i) / 2;
+
+  // Center controls on the active apply-point section
+  const activeSec = applyPoint === 'encoder_latents' ? 4 : 12;
+  const ctrlW     = Math.max(240, Math.min(380, usW * 0.45));
+  const ctrlLeft  = Math.max(0, Math.min(panelW - ctrlW, secCenter(activeSec) - ctrlW / 2));
+
+  const dcs = $('deltaCtrlSection');
+  dcs.style.left  = ctrlLeft + 'px';
+  dcs.style.width = ctrlW + 'px';
+
+  $('togEncLatents').style.left = secCenter(4)  + 'px';
+  $('togQuantEmb').style.left   = secCenter(12) + 'px';
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Helpers
+// ═══════════════════════════════════════════════════════════════════════
+
+function setStatus(msg, isErr = false) {
+  statusBar.textContent = msg;
+  statusBar.style.color = isErr ? 'var(--red)' : 'var(--muted)';
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Shift key
+// ═══════════════════════════════════════════════════════════════════════
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'Shift') shiftHeld = true;
+  if (e.key === ' ' && !e.target.matches('input, select, button, textarea')) {
+    e.preventDefault();
+    if (isPlaying) stopPlayback(); else startPlayback(seekOffset);
+  }
+});
+document.addEventListener('keyup',  e => { if (e.key === 'Shift') shiftHeld = false; });
+window.addEventListener('blur',     () => { shiftHeld = false; });
+
+// ═══════════════════════════════════════════════════════════════════════
+// Pipeline visualization
+// ═══════════════════════════════════════════════════════════════════════
+
+const COL_A_RGB = [204, 51,  51];
+const COL_B_RGB = [ 51, 102, 204];
+
+function computeNq() {
+  const framesPerSec = mp.getModelHz() === '24k' ? 75 : 150;
+  return Math.round(mp.getBwKbps() * 1000 / (framesPerSec * 10));
+}
+
+function pipeRR(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + w - r, y); ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+  ctx.lineTo(x + w, y + h - r); ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+  ctx.lineTo(x + r, y + h); ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+  ctx.lineTo(x, y + r); ctx.quadraticCurveTo(x, y, x + r, y);
+  ctx.closePath();
+}
+
+function drawPipeline() {
+  const cvs = $('pipelineCanvas');
+  const W = cvs.clientWidth, H = cvs.clientHeight;
+  if (!W || !H) return;
+  cvs.width  = W * dpr; cvs.height = H * dpr;
+  const ctx = cvs.getContext('2d');
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, W, H);
+
+  const Nq        = computeNq();
+  const ready     = !!(rawAudioA && rawAudioB);
+  const encActive = applyPoint === 'encoder_latents';
+  const qeActive  = applyPoint === 'quantized_embeddings';
+
+  const padX = 10, usW = W - 2 * padX;
+  const cy = H / 2, bH = 30, bY = cy - bH / 2;
+  const fs = Math.max(9, Math.min(11, W / 95));
+
+  const pcts = [7, 2.5, 11, 2, 3, 2, 5, 2, 13, 2, 11, 2, 3, 2, 11, 2.5, 6];
+  const tot  = pcts.reduce((a, b) => a + b, 0);
+  const sw   = pcts.map(p => p / tot * usW);
+
+  let x = padX;
+  const nx = i => { const v = x; x += sw[i]; return v; };
+
+  function drawBox(label, lx, lw) {
+    ctx.fillStyle   = '#252525';
+    ctx.strokeStyle = '#404040';
+    ctx.lineWidth   = 1;
+    pipeRR(ctx, lx, bY, lw, bH, 4); ctx.fill(); ctx.stroke();
+    ctx.fillStyle   = '#909090';
+    ctx.font        = `${fs}px system-ui`;
+    ctx.textAlign   = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(label, lx + lw / 2, cy);
+  }
+
+  function drawArrow(lx, lw) {
+    const ex = lx + lw;
+    ctx.strokeStyle = '#484848'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(lx, cy); ctx.lineTo(ex - 5, cy); ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(ex - 7, cy - 3); ctx.lineTo(ex, cy); ctx.lineTo(ex - 7, cy + 3);
+    ctx.stroke();
+  }
+
+  // Active tensor node: shows Δ label + onset marker + +ΔB arrow from above
+  function drawDeltaTensor(lx, lw, active) {
+    const th = bH * 0.80, ty = cy - th / 2;
+    if (active) {
+      ctx.fillStyle   = ready ? `rgb(${COL_A_RGB.join(',')})` : 'rgba(110,55,55,0.45)';
+      ctx.strokeStyle = '#c8902a'; ctx.lineWidth = 1.5;
+    } else {
+      ctx.fillStyle   = '#363636'; ctx.strokeStyle = '#303030'; ctx.lineWidth = 1;
+    }
+    pipeRR(ctx, lx, ty, lw, th, 2); ctx.fill(); ctx.stroke();
+
+    if (active) {
+      // Main Δ label
+      ctx.fillStyle  = ready ? 'rgba(255,255,255,0.82)' : 'rgba(255,180,80,0.65)';
+      ctx.font       = `bold ${fs + 2}px system-ui`;
+      ctx.textAlign  = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText('Δ', lx + lw * 0.35, cy);
+
+      // Onset marker — vertical dashed line within tensor
+      if (onsetFrac > 0.01) {
+        const onsetX = lx + onsetFrac * lw;
+        ctx.save();
+        ctx.strokeStyle = 'rgba(255,255,255,0.40)';
+        ctx.lineWidth = 1;
+        ctx.setLineDash([2, 2]);
+        ctx.beginPath(); ctx.moveTo(onsetX, ty + 2); ctx.lineTo(onsetX, ty + th - 2); ctx.stroke();
+        ctx.restore();
+      }
+
+      // +ΔB indicator — dashed B-colored arrow entering from top
+      if (ready) {
+        const arrowX = lx + lw * 0.78;
+        ctx.save();
+        ctx.strokeStyle = `rgb(${COL_B_RGB.join(',')})`;
+        ctx.lineWidth = 1.5;
+        ctx.setLineDash([3, 2]);
+        ctx.beginPath(); ctx.moveTo(arrowX, 3); ctx.lineTo(arrowX, ty - 1); ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.beginPath();
+        ctx.moveTo(arrowX - 3, ty + 5); ctx.lineTo(arrowX, ty); ctx.lineTo(arrowX + 3, ty + 5);
+        ctx.stroke();
+        ctx.fillStyle  = `rgba(${COL_B_RGB.join(',')}, 0.9)`;
+        ctx.font       = `bold ${fs - 1}px system-ui`;
+        ctx.textAlign  = 'center'; ctx.textBaseline = 'bottom';
+        ctx.fillText('+ΔB', arrowX, 3 + fs);
+        ctx.restore();
+      }
+    }
+  }
+
+  // ── 0: Source A / B labels ──
+  {
+    const lx = nx(0), lw = sw[0], sh = Math.floor(bH / 2) - 2;
+    ctx.fillStyle = `rgb(${COL_A_RGB.join(',')})`;
+    pipeRR(ctx, lx, cy - sh - 1, lw, sh, 3); ctx.fill();
+    ctx.fillStyle = `rgb(${COL_B_RGB.join(',')})`;
+    pipeRR(ctx, lx, cy + 1, lw, sh, 3); ctx.fill();
+    ctx.fillStyle = '#fff'; ctx.font = `bold ${Math.min(fs, 10)}px system-ui`;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText('A', lx + lw / 2, cy - sh / 2 - 1);
+    ctx.fillText('B', lx + lw / 2, cy + sh / 2 + 1);
+  }
+
+  drawArrow(nx(1), sw[1]);
+  drawBox('Encode Audio', nx(2), sw[2]);
+  drawArrow(nx(3), sw[3]);
+  drawDeltaTensor(nx(4), sw[4], encActive);
+  drawArrow(nx(5), sw[5]);
+  drawBox('VQ', nx(6), sw[6]);
+  drawArrow(nx(7), sw[7]);
+
+  // ── 8: VQ circles (always inactive — grey — in experiment3) ──
+  {
+    const lx = nx(8), lw = sw[8];
+    const cols    = Math.min(Nq, 8), rows = Math.ceil(Nq / cols);
+    const padI    = 5, rowGap = 3, colGap = 3;
+    const availH  = H - 2 * 8;
+    const circByH = Math.floor((availH - 2 * padI - (rows - 1) * rowGap) / rows);
+    const circByW = Math.floor((lw     - 2 * padI - (cols - 1) * colGap) / cols);
+    const circD   = Math.max(6, Math.min(12, circByH, circByW));
+    const circR   = circD / 2;
+
+    const gridW = cols * circD + (cols - 1) * colGap;
+    const gridH = rows * circD + (rows - 1) * rowGap;
+    const dbH   = gridH + 2 * padI;
+    const dbX   = lx, dbW = lw, dbY = cy - dbH / 2;
+
+    ctx.save();
+    ctx.strokeStyle = '#444'; ctx.lineWidth = 1; ctx.setLineDash([4, 3]);
+    pipeRR(ctx, dbX, dbY, dbW, dbH, 4); ctx.stroke();
+    ctx.restore();
+
+    const gridX = dbX + (dbW - gridW) / 2;
+    const gridY = dbY + padI;
+
+    for (let k = 0; k < Nq; k++) {
+      const col = k % cols, row = Math.floor(k / cols);
+      const cx2 = gridX + col * (circD + colGap) + circR;
+      const cy2 = gridY + row * (circD + rowGap) + circR;
+      ctx.fillStyle   = '#484848';
+      ctx.strokeStyle = '#1a1a1a'; ctx.lineWidth = 0.5;
+      ctx.beginPath(); ctx.arc(cx2, cy2, circR, 0, 2 * Math.PI); ctx.fill(); ctx.stroke();
+    }
+  }
+
+  drawArrow(nx(9),  sw[9]);
+  drawBox('Decode Codes', nx(10), sw[10]);
+  drawArrow(nx(11), sw[11]);
+  drawDeltaTensor(nx(12), sw[12], qeActive);
+  drawArrow(nx(13), sw[13]);
+  drawBox('Decode Audio', nx(14), sw[14]);
+  drawArrow(nx(15), sw[15]);
+
+  // ── 16: Out label ──
+  {
+    const lx = nx(16), lw = sw[16];
+    ctx.fillStyle = '#777'; ctx.font = `${fs}px system-ui`;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText('Out', lx + lw / 2, cy);
+  }
+}
+
+function startPipelineTimer() {
+  if (pipelineTimer) return;
+  pipelineTimer = setInterval(() => {
+    if (!isPlaying || !audioCtx) return;
+    const dur     = playingDuration || 1;
+    const elapsed = audioCtx.currentTime - playStart;
+    currentScrubFrac = looping ? (elapsed % dur) / dur : Math.min(elapsed / dur, 1);
+    drawPipeline();
+  }, 100);
+}
+
+function stopPipelineTimer() {
+  if (pipelineTimer) { clearInterval(pipelineTimer); pipelineTimer = null; }
+  drawPipeline();
+}
+
+// ── Level meter ──────────────────────────────────────────────────────────
+
+const _levelBuf = new Float32Array(512);
+
+function _drawLevelMeter() {
+  const cvs = $('levelMeter');
+  if (!cvs) return;
+  const dpr2 = window.devicePixelRatio || 1;
+  const W = 10, H = 28;
+  if (cvs.width !== Math.round(W * dpr2) || cvs.height !== Math.round(H * dpr2)) {
+    cvs.width  = Math.round(W * dpr2);
+    cvs.height = Math.round(H * dpr2);
+  }
+  const ctx = cvs.getContext('2d');
+  ctx.setTransform(dpr2, 0, 0, dpr2, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = '#111'; ctx.fillRect(0, 0, W, H);
+
+  if (!analyserNode || !isPlaying) return;
+
+  analyserNode.getFloatTimeDomainData(_levelBuf);
+  let rms = 0;
+  for (let i = 0; i < _levelBuf.length; i++) rms += _levelBuf[i] * _levelBuf[i];
+  rms = Math.sqrt(rms / _levelBuf.length);
+
+  if (rms > _levelCur) _levelCur = rms * 0.9 + _levelCur * 0.1;
+  else                  _levelCur = _levelCur * 0.88;
+  if (_levelCur > _levelPeak) _levelPeak = _levelCur;
+  else                        _levelPeak = _levelPeak * 0.997;
+
+  const level = Math.min(1, _levelCur), peak = Math.min(1, _levelPeak);
+  const barH  = Math.round(level * H);
+  const peakY = Math.max(0, Math.round((1 - peak) * H) - 1);
+
+  ctx.fillStyle = level > 0.85 ? '#cc4444' : level > 0.65 ? '#c8b828' : '#5cb85c';
+  ctx.fillRect(1, H - barH, W - 2, barH);
+  if (_levelPeak > 0.01) {
+    ctx.fillStyle = peak > 0.85 ? '#cc4444' : '#aaaaaa';
+    ctx.fillRect(1, peakY, W - 2, 2);
+  }
+}
+
+function startLevelMeter() {
+  if (_levelRAF) return;
+  function tick() {
+    _drawLevelMeter();
+    if (isPlaying) _levelRAF = requestAnimationFrame(tick);
+    else { _levelRAF = null; _levelCur = 0; _levelPeak = 0; _drawLevelMeter(); }
+  }
+  _levelRAF = requestAnimationFrame(tick);
+}
+
+function stopLevelMeter() {
+  if (_levelRAF) { cancelAnimationFrame(_levelRAF); _levelRAF = null; }
+  _levelCur = 0; _levelPeak = 0; _drawLevelMeter();
+}
+
+// ── Seek / scrub ──────────────────────────────────────────────────────────
+
+function isNearHandle(offsetX, offsetY) {
+  const hw = $('specWrap').clientWidth;
+  return Math.abs(offsetX - currentScrubFrac * hw) < HANDLE_R + 6 && offsetY < HANDLE_R * 2 + 8;
+}
+
+function applySeek(frac) {
+  currentScrubFrac = Math.max(0, Math.min(1, frac));
+  const pcm = currentAudio();
+  if (pcm) seekOffset = currentScrubFrac * (pcm.length / sourceSR);
+  if (isPlaying) startPlayback(seekOffset);
+  else { drawPlayhead(currentScrubFrac); drawPipeline(); }
+}
+
+$('specWrap').style.cursor = 'crosshair';
+
+$('specWrap').addEventListener('mousedown', e => {
+  if (!audioCtx) return;
+  if (isNearHandle(e.offsetX, e.offsetY)) { isDraggingPlayhead = true; e.preventDefault(); }
+  else applySeek(e.offsetX / $('specWrap').clientWidth);
+});
+
+$('specWrap').addEventListener('mousemove', e => {
+  $('specWrap').style.cursor =
+    (isDraggingPlayhead || isNearHandle(e.offsetX, e.offsetY)) ? 'ew-resize' : 'crosshair';
+  if (!isDraggingPlayhead) return;
+  applySeek(e.offsetX / $('specWrap').clientWidth);
+});
+
+window.addEventListener('mouseup', () => { isDraggingPlayhead = false; });
+new ResizeObserver(() => drawPipeline()).observe($('pipelinePanel'));
+
+// ═══════════════════════════════════════════════════════════════════════
+// Audio generation helpers
+// ═══════════════════════════════════════════════════════════════════════
+
+async function buildAligned(panel, finalLen, sr) {
+  const type = panel.getType();
+  if (type !== 'file') {
+    return generateSource(type, panel.getFreq(), finalLen / sr, sr);
+  }
+  const f = panel.getFile();
+  if (!f) throw new Error(`No file selected for "${panel.element.querySelector('.section-title').textContent}".`);
+  const raw = await loadFile(f, sr);
+  if (raw.length === finalLen) return raw;
+  if (raw.length >  finalLen) return raw.slice(0, finalLen);
+  return loopToLength(raw, finalLen);
+}
+
+async function buildBothAudios(token) {
+  const sr        = mp.getSampleRate();
+  const targetSec = Math.min(parseFloat(durEl.value) || 2, MAX_S);
+  const finalLen  = Math.round(targetSec * sr);
+
+  setStatus('Loading A…');
+  let audioA;
+  try { audioA = await buildAligned(panelA, finalLen, sr); }
+  catch (err) { throw err; }
+  if (recalcToken !== token) return null;
+
+  setStatus('Loading B…');
+  let audioB;
+  try { audioB = await buildAligned(panelB, finalLen, sr); }
+  catch (err) { throw err; }
+  if (recalcToken !== token) return null;
+
+  const volA = panelA.getVolume(), volB = panelB.getVolume();
+  if (volA !== 1) audioA = audioA.map(x => x * volA);
+  if (volB !== 1) audioB = audioB.map(x => x * volB);
+
+  if (panelA.isGateEnabled()) audioA = applyPulseGate(audioA, sr, panelA.getGateFreq(), panelA.getGateDecay());
+  if (panelB.isGateEnabled()) audioB = applyPulseGate(audioB, sr, panelB.getGateFreq(), panelB.getGateDecay());
+
+  return { audioA, audioB };
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Boot
+// ═══════════════════════════════════════════════════════════════════════
+
+initWorker();
+updateNotePanel();
+updateLegend();
+loopBtn.classList.add('active');
+drawPipeline();
+positionPipelineControls();
+</script>
+</body>
+</html>

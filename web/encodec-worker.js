@@ -745,6 +745,263 @@ async function interpFromCached48k(capsA, capsB, alpha, interpPoint, vqMode, lev
 }
 
 // ---------------------------------------------------------------------------
+// Delta transfer  (experiment3)
+// ---------------------------------------------------------------------------
+
+// Apply dynamics transfer.
+// accumState: Float32Array(C) — per-channel accumulator for cumulative mode.
+// startFrame: first A-frame index where modification begins.
+// anchorBFrame: Float32Array(C) — B embedding values at the onset frame,
+//               used as the reference point for 'anchored' mode.
+// anchorAFrame, anchorBFrame: Float32Array(C), pre-populated by caller for 'anchored' mode.
+//   anchorAFrame[c] = A's embedding at the global onset frame.
+//   anchorBFrame[c] = B's embedding at the global onset frame.
+function applyDeltaTransfer(embA, embB, C, TA, TB, mode, strength, startFrame, accumState, anchorAFrame, anchorBFrame, dimLo, dimHi) {
+  const out = new Float32Array(C * TA);
+  for (let c = 0; c < C; c++) {
+    // Channels outside the selected dim range: in anchored mode freeze to A[onset]
+    // after onset, otherwise pass A through unchanged.
+    if (c < dimLo || c > dimHi) {
+      for (let t = 0; t < TA; t++)
+        out[c * TA + t] = (mode === 'anchored' && t >= startFrame) ? anchorAFrame[c] : embA[c * TA + t];
+      continue;
+    }
+    for (let t = 0; t < TA; t++) {
+      if (t < startFrame) {
+        out[c * TA + t] = embA[c * TA + t];
+        continue;
+      }
+      const tRelB = (t - startFrame) % TB;
+      // delta[0] = 0 (no prior B frame at the start of each B cycle)
+      const delta = tRelB === 0 ? 0
+                  : embB[c * TB + tRelB] - embB[c * TB + (tRelB - 1)];
+      if (mode === 'per_frame') {
+        out[c * TA + t] = embA[c * TA + t] + strength * delta;
+      } else if (mode === 'cumulative') {
+        accumState[c] += delta;
+        out[c * TA + t] = embA[c * TA + t] + strength * accumState[c];
+      } else {
+        // anchored: out[t] = A[onset] + strength × (B[t] − B[onset])
+        out[c * TA + t] = anchorAFrame[c] + strength * (embB[c * TB + tRelB] - anchorBFrame[c]);
+      }
+    }
+  }
+  return out;
+}
+
+async function decodeWithDelta(embA, dimsA, embB, dimsB,
+                               mode, strength, startFrame, accumState, anchorAFrame, anchorBFrame,
+                               dimLo, dimHi,
+                               applyPoint, modelHz, scale, scaleDims, hDec, cDec) {
+  const [, C, TA] = dimsA;
+  const [, , TB]  = dimsB;
+  const outEmb = applyDeltaTransfer(embA, embB, C, TA, TB, mode, strength, startFrame, accumState, anchorAFrame, anchorBFrame, dimLo, dimHi);
+
+  let finalEmb = outEmb, finalDims = dimsA.slice();
+  if (applyPoint === 'encoder_latents') {
+    const quantOut    = await sessions.quantEnc.run({ emb: new ort.Tensor('float32', outEmb, dimsA) });
+    const decCodesOut = await sessions.decCodes.run({ codes: quantOut.codes });
+    finalEmb  = new Float32Array(decCodesOut.emb.data);
+    finalDims = decCodesOut.emb.dims.slice();
+  }
+  return decodeFromLatents(finalEmb, finalDims, scale, scaleDims, modelHz, hDec, cDec);
+}
+
+function getCapEmb(cap, applyPoint) {
+  return applyPoint === 'encoder_latents'
+    ? { emb: cap.emb_enc,   dims: cap.embEncDims }
+    : { emb: cap.emb_quant, dims: cap.embQuantDims };
+}
+
+async function runDeltaTransfer(msg) {
+  const { jobId, modelHz, bwKbps, streaming, frameSize,
+          applyPoint, mode, strength, startFrac,
+          dimLo = 0, dimHi = 127 } = msg;
+
+  try {
+    self.postMessage({ type: 'progress', jobId, value: 0, status: 'Loading models…' });
+    await ensureSessions(modelHz, bwKbps);
+    if (currentJobId !== jobId) return;
+
+    const capsA = captureCache.A, capsB = captureCache.B;
+    if (!capsA || !capsB) {
+      self.postMessage({ type: 'error', jobId, message: 'Sources not yet encoded.' });
+      return;
+    }
+
+    const decoded = capsA.mode === 'ola48'
+      ? await deltaTransfer48k(capsA, capsB, applyPoint, mode, strength, startFrac, dimLo, dimHi, jobId)
+      : await deltaTransfer24k(capsA, capsB, applyPoint, mode, strength, startFrac, dimLo, dimHi, jobId);
+
+    if (decoded === null) return;
+    self.postMessage({ type: 'result', jobId, decoded }, [decoded.buffer]);
+
+  } catch (err) {
+    self.postMessage({ type: 'error', jobId, message: err.message });
+  }
+}
+
+// Both 24k (75 fr/s) and 48k (150 fr/s) encode one frame per 320 audio samples.
+const SAMPLES_PER_EMB_FRAME = 320;
+
+async function deltaTransfer24k(capsA, capsB, applyPoint, mode, strength, startFrac, dimLo, dimHi, jobId) {
+  if (capsA.mode === 'single') {
+    const { emb: embA, dims: dimsA } = getCapEmb(capsA.cap, applyPoint);
+    const { emb: embB, dims: dimsB } = getCapEmb(capsB.cap, applyPoint);
+    const [, C, TA] = dimsA;
+    const [, , TB] = dimsB;
+    const startFrame = Math.round(startFrac * TA);
+    const accum = new Float32Array(C);
+    const anchorAFrame = new Float32Array(C);
+    const anchorBFrame = new Float32Array(C);
+    if (mode === 'anchored') {
+      const sf = Math.min(startFrame, TA - 1);
+      for (let c = 0; c < C; c++) {
+        anchorAFrame[c] = embA[c * TA + sf];
+        anchorBFrame[c] = embB[c * TB + Math.min(sf, TB - 1)];
+      }
+    }
+
+    self.postMessage({ type: 'progress', jobId, value: 0.5, status: 'Applying delta…' });
+    const dec = await decodeWithDelta(
+      embA, dimsA, embB, dimsB, mode, strength, startFrame, accum, anchorAFrame, anchorBFrame,
+      dimLo, dimHi,
+      applyPoint, '24k', capsA.cap.scale, capsA.cap.scaleDims, zeroState(1), zeroState(1));
+    if (currentJobId !== jobId) return null;
+
+    self.postMessage({ type: 'progress', jobId, value: 1.0, status: 'Done.' });
+    return dec.outAudio.slice(0, capsA.totalLen);
+  }
+
+  // Streaming OLA — carry decoder state, accumulator, and anchorBFrame across chunks.
+  const { win, totalLen, chunks: chunksA } = capsA;
+  const { chunks: chunksB } = capsB;
+  const outBuf  = new Float32Array(totalLen);
+  const wgtBuf  = new Float32Array(totalLen);
+  const numSegs = chunksA.length;
+
+  const C = getCapEmb(chunksA[0].cap, applyPoint).dims[1];
+  const accum        = new Float32Array(C);
+  const anchorAFrame = new Float32Array(C);
+  const anchorBFrame = new Float32Array(C);
+  const totalFramesA = Math.round(totalLen / SAMPLES_PER_EMB_FRAME);
+  let globalFrameA = 0;
+  let anchorSet = false;
+  let hDec = zeroState(1), cDec = zeroState(1);
+
+  for (let s = 0; s < numSegs; s++) {
+    if (currentJobId !== jobId) return null;
+
+    const { cap: capA, srcS, srcE, off } = chunksA[s];
+    const { cap: capB } = chunksB[s % chunksB.length];
+
+    const { emb: embA, dims: dimsA } = getCapEmb(capA, applyPoint);
+    const { emb: embB, dims: dimsB } = getCapEmb(capB, applyPoint);
+    const [, , TA] = dimsA;
+    const [, , TB] = dimsB;
+
+    const startFrameGlobal  = Math.round(startFrac * totalFramesA);
+    const chunkStartFrame   = Math.max(0, startFrameGlobal - globalFrameA);
+    globalFrameA += TA;
+
+    // Capture onset anchors once, on the chunk where onset falls.
+    if (mode === 'anchored' && !anchorSet && chunkStartFrame < TA) {
+      const sf = Math.min(chunkStartFrame, TA - 1);
+      for (let c = 0; c < C; c++) {
+        anchorAFrame[c] = embA[c * TA + sf];
+        anchorBFrame[c] = embB[c * TB + Math.min(sf, TB - 1)];
+      }
+      anchorSet = true;
+    }
+
+    const dec = await decodeWithDelta(
+      embA, dimsA, embB, dimsB, mode, strength, chunkStartFrame, accum, anchorAFrame, anchorBFrame,
+      dimLo, dimHi,
+      applyPoint, '24k', capA.scale, capA.scaleDims, hDec, cDec);
+    hDec = dec.hDecNew; cDec = dec.cDecNew;
+
+    for (let i = srcS - off; i < srcE - off; i++) {
+      const pos = off + i;
+      outBuf[pos] += win[i] * dec.outAudio[i];
+      wgtBuf[pos] += win[i];
+    }
+
+    self.postMessage({
+      type: 'progress', jobId,
+      value: Math.min((s + 1) / numSegs, 1),
+      status: `Applying… ${Math.round((s + 1) / numSegs * 100)} %`,
+    });
+  }
+
+  for (let i = 0; i < totalLen; i++) {
+    if (wgtBuf[i] > 0) outBuf[i] /= wgtBuf[i];
+  }
+  return outBuf;
+}
+
+async function deltaTransfer48k(capsA, capsB, applyPoint, mode, strength, startFrac, dimLo, dimHi, jobId) {
+  const { totalLen, segments: segsA } = capsA;
+  const { segments: segsB } = capsB;
+  const outBuf = new Float32Array(totalLen);
+  const wgtBuf = new Float32Array(totalLen);
+
+  const C = getCapEmb(segsA[0].cap, applyPoint).dims[1];
+  const accum        = new Float32Array(C);
+  const anchorAFrame = new Float32Array(C);
+  const anchorBFrame = new Float32Array(C);
+  const totalFramesA = Math.round(totalLen / SAMPLES_PER_EMB_FRAME);
+  let globalFrameA = 0;
+  let anchorSet = false;
+
+  for (let s = 0; s < segsA.length; s++) {
+    if (currentJobId !== jobId) return null;
+
+    const { cap: capA, offset, validEnd } = segsA[s];
+    const { cap: capB } = segsB[s % segsB.length];
+
+    const { emb: embA, dims: dimsA } = getCapEmb(capA, applyPoint);
+    const { emb: embB, dims: dimsB } = getCapEmb(capB, applyPoint);
+    const [, , TA] = dimsA;
+    const [, , TB] = dimsB;
+
+    const startFrameGlobal = Math.round(startFrac * totalFramesA);
+    const chunkStartFrame  = Math.max(0, startFrameGlobal - globalFrameA);
+    globalFrameA += TA;
+
+    // Capture onset anchors once, on the chunk where onset falls.
+    if (mode === 'anchored' && !anchorSet && chunkStartFrame < TA) {
+      const sf = Math.min(chunkStartFrame, TA - 1);
+      for (let c = 0; c < C; c++) {
+        anchorAFrame[c] = embA[c * TA + sf];
+        anchorBFrame[c] = embB[c * TB + Math.min(sf, TB - 1)];
+      }
+      anchorSet = true;
+    }
+
+    const dec = await decodeWithDelta(
+      embA, dimsA, embB, dimsB, mode, strength, chunkStartFrame, accum, anchorAFrame, anchorBFrame,
+      dimLo, dimHi,
+      applyPoint, '48k', capA.scale, capA.scaleDims, zeroState(1), zeroState(1));
+
+    for (let i = 0; i < validEnd - offset; i++) {
+      outBuf[offset + i] += TRI_WIN_48[i] * dec.outAudio[i];
+      wgtBuf[offset + i] += TRI_WIN_48[i];
+    }
+
+    self.postMessage({
+      type: 'progress', jobId,
+      value: Math.min((s + 1) / segsA.length, 1),
+      status: `Applying… ${Math.round((s + 1) / segsA.length * 100)} %`,
+    });
+  }
+
+  for (let i = 0; i < totalLen; i++) {
+    if (wgtBuf[i] > 0) outBuf[i] /= wgtBuf[i];
+  }
+  return outBuf;
+}
+
+// ---------------------------------------------------------------------------
 // Message dispatcher
 // ---------------------------------------------------------------------------
 
@@ -761,7 +1018,7 @@ self.onmessage = (e) => {
       runJob(msg);
       break;
     case 'encode':
-      // Experiment2: encode one source, cache captures, return decoded audio
+      // Experiment2/3: encode one source, cache captures, return decoded audio
       currentJobId = msg.jobId;
       runEncode(msg);
       break;
@@ -769,6 +1026,11 @@ self.onmessage = (e) => {
       // Experiment2: interpolate using cached captures — no audio needed
       currentJobId = msg.jobId;
       runInterpolation(msg);
+      break;
+    case 'delta_transfer':
+      // Experiment3: dynamics transfer using cached captures
+      currentJobId = msg.jobId;
+      runDeltaTransfer(msg);
       break;
     case 'cancel':
       currentJobId = -1;
