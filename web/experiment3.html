@@ -214,6 +214,13 @@
             <input type="range" id="compsSlider" min="1" max="128" value="8" step="1" style="flex:1;accent-color:var(--accent);cursor:pointer;height:4px">
             <span class="delta-val" id="compsDisplay">8</span>
           </div>
+          <div class="delta-row" id="svdNormRow" style="display:none">
+            <span class="delta-lbl">Pre-proc</span>
+            <div class="toggle-row" style="flex:1;gap:4px">
+              <button class="tog" id="svdCenterBtn"   title="Subtract per-channel mean of deltas before SVD (removes DC drift)">Center δ</button>
+              <button class="tog" id="svdNormBtn"     title="Divide by per-channel std before SVD, rescale after (equalises dim weights)">Norm σ</button>
+            </div>
+          </div>
         </div>
       </div>
       <div id="svdScreeWrap">
@@ -373,6 +380,8 @@ let svdMode           = false;
 let nComponents       = 8;
 let svdSingularValues = null; // Float32Array(C)
 let compMask          = null; // Uint8Array(C) — per-component on/off in SVD mode
+let svdCenter         = false; // subtract per-channel mean from deltas before SVD
+let svdNormalize      = false; // divide by per-channel std before SVD
 let sharedScale  = false;
 let shiftHeld    = false;
 
@@ -449,6 +458,9 @@ const varRow         = $('varRow');
 const compsRow       = $('compsRow');
 const compsSlider    = $('compsSlider');
 const compsDisplay   = $('compsDisplay');
+const svdNormRow     = $('svdNormRow');
+const svdCenterBtn   = $('svdCenterBtn');
+const svdNormBtn     = $('svdNormBtn');
 const svdScreeWrap   = $('svdScreeWrap');
 const svdScreeCvs    = $('svdScreeCanvas');
 const svdActiveCount = $('svdActiveCount');
@@ -579,9 +591,10 @@ updateDualRange(meanLoInput, meanHiInput, meanFillEl, v => meanLoPct = v, v => m
 updateDualRange(varLoInput,  varHiInput,  varFillEl,  v => varLoPct  = v, v => varHiPct  = v);
 
 function applyMethodVisibility() {
-  meanRow.style.display    = svdMode ? 'none' : '';
-  varRow.style.display     = svdMode ? 'none' : '';
-  compsRow.style.display   = svdMode ? '' : 'none';
+  meanRow.style.display      = svdMode ? 'none' : '';
+  varRow.style.display       = svdMode ? 'none' : '';
+  compsRow.style.display     = svdMode ? '' : 'none';
+  svdNormRow.style.display   = svdMode ? '' : 'none';
   svdScreeWrap.style.display = svdMode ? 'block' : 'none';
   if (svdMode) drawSvdScree();
   if (deltaBRaw) {
@@ -640,6 +653,17 @@ compsSlider.addEventListener('input', () => {
   if (currentView === 'delta_b') drawStrip();
 });
 compsSlider.addEventListener('change', () => scheduleDeltaRecalc());
+
+[svdCenterBtn, svdNormBtn].forEach(btn => {
+  btn.addEventListener('click', () => {
+    if (btn === svdCenterBtn)  svdCenter    = !svdCenter;
+    if (btn === svdNormBtn)    svdNormalize = !svdNormalize;
+    btn.classList.toggle('active', btn === svdCenterBtn ? svdCenter : svdNormalize);
+    // Normalisation flags change the SVD computation itself — recompute embeddings first.
+    requestEmbDeltas();
+    scheduleDeltaRecalc();
+  });
+});
 
 // ═══════════════════════════════════════════════════════════════════════
 // View tabs
@@ -708,14 +732,15 @@ function updateNotePanel() {
 
 function initWorker() {
   if (worker) worker.terminate();
-  worker = new Worker('encodec-worker.js?v=20');
+  worker = new Worker('encodec-worker.js?v=21');
   worker.postMessage({ type: 'init', modelsBaseUrl: MODELS_BASE });
   worker.onmessage = onWorkerMsg;
 }
 
 function requestEmbDeltas() {
   if (!worker) return;
-  worker.postMessage({ type: 'get_emb_deltas', applyPoint });
+  worker.postMessage({ type: 'get_emb_deltas', applyPoint,
+                       centerDeltas: svdCenter, normalizeDeltas: svdNormalize });
 }
 
 function onWorkerMsg(e) {

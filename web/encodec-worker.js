@@ -862,7 +862,7 @@ async function runDeltaTransfer(msg) {
       // Always set filtDeltaFull in SVD mode so applyDeltaTransfer never falls back
       // to raw B deltas. Zero array = no B influence when nothing is selected.
       filtDeltaFull = activeComps.length > 0
-        ? computeFiltDeltaFull(svd.U, svd.deltas, svd.C, svd.totalT, activeComps)
+        ? computeFiltDeltaFull(svd.U, svd.deltas, svd.C, svd.totalT, activeComps, svd.meanD, svd.stdD)
         : new Float32Array(svd.C * svd.totalT);
     }
     const svdTotalT = svd ? svd.totalT : 0;
@@ -1115,17 +1115,30 @@ function symmetricEigen(flatA, n) {
 
 // Project delta sequence onto selected eigenvectors and reconstruct.
 // U: Float32Array(C×C) eigenvectors column-major (each column = one direction)
-// deltas: Float32Array(C×totalT)
+// deltas: Float32Array(C×totalT) — raw (un-normalised) deltas
 // activeComps: number[] — sorted list of component indices to include
-// Returns filtered Float32Array(C×totalT).
-function computeFiltDeltaFull(U, deltas, C, totalT, activeComps) {
+// meanD: Float32Array(C)|null — per-channel delta mean (subtract before projection if set)
+// stdD:  Float32Array(C)|null — per-channel delta std  (divide before projection,
+//                               multiply after reconstruction, if set)
+// Returns filtered Float32Array(C×totalT) in the ORIGINAL (un-normalised) delta space.
+// The mean is intentionally NOT added back — centering strips DC drift from the transfer.
+function computeFiltDeltaFull(U, deltas, C, totalT, activeComps, meanD = null, stdD = null) {
   const filt = new Float32Array(C * totalT);
   for (const k of activeComps) {
     if (k < 0 || k >= C) continue;
     for (let t = 0; t < totalT; t++) {
       let coeff = 0;
-      for (let c = 0; c < C; c++) coeff += U[c*C+k] * deltas[c*totalT+t];
-      for (let c = 0; c < C; c++) filt[c*totalT+t] += U[c*C+k] * coeff;
+      for (let c = 0; c < C; c++) {
+        let d = deltas[c * totalT + t];
+        if (meanD) d -= meanD[c];
+        if (stdD)  d /= stdD[c];
+        coeff += U[c * C + k] * d;
+      }
+      for (let c = 0; c < C; c++) {
+        let contrib = U[c * C + k] * coeff;
+        if (stdD) contrib *= stdD[c];   // rescale back to original units
+        filt[c * totalT + t] += contrib;
+      }
     }
   }
   return filt;
@@ -1198,12 +1211,43 @@ function runGetEmbDeltas(msg) {
     variance[c] = sq / totalT;
   }
 
-  // Covariance of deltas: cov[i,j] = Σ_t delta[i,t]·delta[j,t] / totalT
+  // Optional pre-processing before covariance / SVD.
+  // centerDeltas  — subtract per-channel mean of deltas (removes DC drift, standard PCA centering).
+  // normalizeDeltas — divide by per-channel std so all channels contribute equally.
+  const { centerDeltas = false, normalizeDeltas = false } = msg;
+  let meanD = null, stdD = null;
+  if (centerDeltas || normalizeDeltas) {
+    meanD = new Float32Array(C);
+    for (let c = 0; c < C; c++) {
+      let s = 0;
+      for (let t = 0; t < totalT; t++) s += deltas[c * totalT + t];
+      meanD[c] = s / totalT;
+    }
+    if (normalizeDeltas) {
+      stdD = new Float32Array(C);
+      for (let c = 0; c < C; c++) {
+        let sq = 0;
+        for (let t = 0; t < totalT; t++) {
+          const d = deltas[c * totalT + t] - meanD[c];
+          sq += d * d;
+        }
+        stdD[c] = Math.max(Math.sqrt(sq / totalT), 1e-8);
+      }
+    }
+    if (!centerDeltas) meanD = null; // not needed unless centering
+  }
+
+  // Covariance of (possibly normalised) deltas: cov[i,j] = Σ_t d̃[i,t]·d̃[j,t] / totalT
   const cov = new Float32Array(C * C);
   for (let i = 0; i < C; i++) {
     for (let j = i; j < C; j++) {
       let s = 0;
-      for (let t = 0; t < totalT; t++) s += deltas[i*totalT+t] * deltas[j*totalT+t];
+      for (let t = 0; t < totalT; t++) {
+        let di = deltas[i * totalT + t], dj = deltas[j * totalT + t];
+        if (meanD) { di -= meanD[i]; dj -= meanD[j]; }
+        if (stdD)  { di /= stdD[i];  dj /= stdD[j]; }
+        s += di * dj;
+      }
       cov[i*C+j] = cov[j*C+i] = s / totalT;
     }
   }
@@ -1211,8 +1255,9 @@ function runGetEmbDeltas(msg) {
   const svdS = new Float32Array(C);
   for (let k = 0; k < C; k++) svdS[k] = Math.sqrt(eigenvalues[k]);
 
-  // Cache for SVD-mode transfer (deltas NOT transferred so worker retains the reference)
-  captureCache.B.svd = { U: eigenvectors, deltas, C, totalT };
+  // Cache for SVD-mode transfer (deltas NOT transferred so worker retains the reference).
+  // meanD / stdD are stored so computeFiltDeltaFull can apply the same normalisation.
+  captureCache.B.svd = { U: eigenvectors, deltas, C, totalT, meanD, stdD };
 
   self.postMessage(
     { type: 'emb_deltas', data: deltas, variance, C, T: totalT, svdS },
