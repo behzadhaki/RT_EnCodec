@@ -25,6 +25,7 @@ Run from repo root:
 """
 
 import argparse
+import json
 import os
 import sys
 import warnings
@@ -208,6 +209,38 @@ def _export(wrapper, dummy_inputs, path, input_names, output_names, dynamic_axes
 
 
 # ---------------------------------------------------------------------------
+# Codebook export
+# ---------------------------------------------------------------------------
+
+def _export_codebooks(model: EncodecModel, model_root_dir: str) -> None:
+    """Export all RVQ codebook embedding matrices to a flat binary file.
+
+    Writes two files to model_root_dir:
+      codebooks.bin  — float32 LE, shape [n_q, vocab_size, dim], row-major
+      codebooks.json — {"n_q": int, "vocab_size": int, "dim": int}
+
+    All bandwidth variants share the same codebooks; bandwidth only controls
+    how many levels are active, so this is exported once per model.
+    """
+    layers = model.quantizer.vq.layers
+    embeds = [layer._codebook.embed.detach().cpu() for layer in layers]
+    codebooks = torch.stack(embeds, dim=0)           # [n_q, vocab_size, dim]
+    n_q, vocab_size, dim = codebooks.shape
+
+    os.makedirs(model_root_dir, exist_ok=True)
+
+    bin_path = os.path.join(model_root_dir, "codebooks.bin")
+    with open(bin_path, "wb") as f:
+        f.write(codebooks.numpy().astype("float32").tobytes())
+
+    meta_path = os.path.join(model_root_dir, "codebooks.json")
+    with open(meta_path, "w") as f:
+        json.dump({"n_q": n_q, "vocab_size": vocab_size, "dim": dim}, f)
+
+    print(f"  codebooks [{n_q}, {vocab_size}, {dim}] → {bin_path}")
+
+
+# ---------------------------------------------------------------------------
 # Per-bandwidth export helpers
 # ---------------------------------------------------------------------------
 
@@ -369,6 +402,7 @@ def main():
         model_24.eval()
         for bw in bws_24:
             _export_24khz(model_24, bw)
+        _export_codebooks(model_24, os.path.join(_EXPORTS_ROOT, "24k"))
 
     if bws_48:
         print(f"\n{'='*60}")
@@ -379,6 +413,7 @@ def main():
         model_48.eval()
         for bw in bws_48:
             _export_48khz(model_48, bw)
+        _export_codebooks(model_48, os.path.join(_EXPORTS_ROOT, "48k"))
 
     print(f"\nDone. All exports written to {_EXPORTS_ROOT}/")
 
