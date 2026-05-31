@@ -169,6 +169,7 @@
             <button class="tog"        data-vqmode="frame_swap">Frame Swap</button>
             <button class="tog"        data-vqmode="level_swap">Level Swap</button>
             <button class="tog"        data-vqmode="int_lerp">Int. Lerp</button>
+            <button class="tog"        data-vqmode="sim_interp">Sim. Interp.</button>
           </div>
         </div>
         <label id="vqHashToggle" style="display:none" title="Deterministic golden-ratio hash — same seed always gives same split">
@@ -232,6 +233,12 @@ const VQ_MODE_NOTES = {
     '<strong>Int. Lerp.</strong> Each RVQ level k has its own α<sub>k</sub> slider. The index ' +
     'at each position is <code>round((1−α<sub>k</sub>)·a + α<sub>k</sub>·b)</code>. Codebook ' +
     'entries are not acoustically ordered — this is a purely exploratory operation.',
+  sim_interp:
+    '<strong>Sim. Interp.</strong> Each RVQ level k has its own α<sub>k</sub> slider. Codebook ' +
+    'entries are globally ranked once by centrality — distance from the codebook centroid — so ' +
+    'rank 0 is the most peripheral (unusual) entry and rank 1023 is the most central (typical). ' +
+    'α<sub>k</sub> walks from A\'s rank to B\'s rank: α=0 gives exactly code A, α=1 gives ' +
+    'exactly code B, and the midpoint picks the entry whose typicality sits between them.',
 };
 
 const INTERP_NOTES = {
@@ -661,8 +668,8 @@ function drawMultislider() {
 
 function updateVqSectionVisibility() {
   const isVQ       = interpPoint === 'vq_codes';
-  const usesLevels = isVQ && (vqMode === 'level_swap' || vqMode === 'int_lerp');
-  const usesHash   = isVQ && vqMode !== 'int_lerp';
+  const usesLevels = isVQ && (vqMode === 'level_swap' || vqMode === 'int_lerp' || vqMode === 'sim_interp');
+  const usesHash   = isVQ && vqMode !== 'int_lerp' && vqMode !== 'sim_interp';
   $('vqModeBar').style.display         = isVQ       ? '' : 'none';
   $('vqHashToggle').style.display      = usesHash   ? '' : 'none';
   $('multisliderPanel').style.display  = usesLevels ? '' : 'none';
@@ -950,7 +957,7 @@ function triggerInterpolation() {
     scaleAlpha,
     deterministic: deterministicHash,
   };
-  if (vqMode === 'level_swap' || vqMode === 'int_lerp') {
+  if (vqMode === 'level_swap' || vqMode === 'int_lerp' || vqMode === 'sim_interp') {
     const nq = computeNq();
     msg.levelAlphas = new Float32Array(levelAlphas.slice(0, nq));
   }
@@ -1260,7 +1267,7 @@ function positionPipelineControls() {
   const secCenter= i => secLeft(i) + secWidth(i) / 2;
 
   const isVQ       = interpPoint === 'vq_codes';
-  const usesLevels = isVQ && (vqMode === 'level_swap' || vqMode === 'int_lerp');
+  const usesLevels = isVQ && (vqMode === 'level_swap' || vqMode === 'int_lerp' || vqMode === 'sim_interp');
   const stackedVQ  = isVQ && !usesLevels;
 
   const ctrl  = $('pipelineCtrl');
@@ -1398,6 +1405,7 @@ function getVQCircleColor(levelK, scrubFrac) {
       break;
     }
     case 'int_lerp':
+    case 'sim_interp':
       t = levelAlphas[levelK] !== undefined ? levelAlphas[levelK] : alpha;
       break;
     default:
@@ -1649,7 +1657,7 @@ function stopLevelMeter() {
 
 $('pipelineCanvas').addEventListener('click', e => {
   if (interpPoint !== 'vq_codes') return;
-  if (vqMode !== 'level_swap' && vqMode !== 'int_lerp') return;
+  if (vqMode !== 'level_swap' && vqMode !== 'int_lerp' && vqMode !== 'sim_interp') return;
   if (!_vqCircleGrid) return;
   const { gridX, gridY, circD, circR, colGap, rowGap, cols, Nq } = _vqCircleGrid;
   const rect = e.currentTarget.getBoundingClientRect();

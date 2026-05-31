@@ -49,6 +49,9 @@ let modelsBaseUrl = '/serialization/encodec_onnx_exports';
 let cachedKey = null;
 let sessions  = null;   // { encSeg, quantEnc, decCodes, decAudio }
 
+// Codebook cache (keyed by modelHz; shared across all bandwidth variants)
+let codebookCache = {};  // { '24k': { embeddings, norms, n_q, vocab_size, dim }, … }
+
 async function ensureSessions(modelHz, bwKbps) {
   const key = `${modelHz}-${bwKbps}`;
   if (key === cachedKey) return;
@@ -326,6 +329,102 @@ function mixCodesByLevel(codes_a, codes_b, dims, levelAlphas, deterministic) {
   return out;
 }
 
+async function ensureCodebooks(modelHz) {
+  if (codebookCache[modelHz]) return;
+  const base = `${modelsBaseUrl}/${modelHz}`;
+  const meta = await (await fetch(`${base}/codebooks.json`)).json();
+  const { n_q, vocab_size, dim } = meta;
+  const buf        = await (await fetch(`${base}/codebooks.bin`)).arrayBuffer();
+  const embeddings = new Float32Array(buf);
+
+  // Precompute per-level centrality ranking.
+  //
+  // score[j] = −||cⱼ − μ||²   (higher = closer to centroid = more "typical")
+  //
+  // Sum of pairwise squared distances reduces to distance-to-centroid:
+  //   Σᵢ ||cⱼ−cᵢ||² = V·||cⱼ||² + Σᵢ||cᵢ||² − 2·cⱼ·Σᵢcᵢ  ∝  ||cⱼ−μ||²
+  // So this is O(V·dim) per level, not O(V²·dim).
+  //
+  // globalRank[k*V + j] = rank of code j at level k  (0=most peripheral, V-1=most central)
+  // rankToCode[k*V + r] = code index at rank r for level k
+  const globalRank = new Int32Array(n_q * vocab_size);
+  const rankToCode = new Int32Array(n_q * vocab_size);
+  const centroid   = new Float32Array(dim);
+  const scores     = new Float32Array(vocab_size);
+  const order      = new Int32Array(vocab_size);
+
+  for (let k = 0; k < n_q; k++) {
+    const kBase = k * vocab_size;
+
+    // Centroid of level-k codebook
+    centroid.fill(0);
+    for (let j = 0; j < vocab_size; j++) {
+      const off = (kBase + j) * dim;
+      for (let d = 0; d < dim; d++) centroid[d] += embeddings[off + d];
+    }
+    for (let d = 0; d < dim; d++) centroid[d] /= vocab_size;
+
+    // Score = −||cⱼ − μ||²
+    for (let j = 0; j < vocab_size; j++) {
+      const off = (kBase + j) * dim;
+      let sq = 0;
+      for (let d = 0; d < dim; d++) {
+        const diff = embeddings[off + d] - centroid[d];
+        sq += diff * diff;
+      }
+      scores[j] = -sq;
+      order[j]  = j;
+    }
+
+    // Ascending sort: rank 0 = most peripheral, rank V−1 = most central
+    order.sort((a, b) => scores[a] - scores[b]);
+
+    for (let r = 0; r < vocab_size; r++) {
+      const code = order[r];
+      rankToCode[kBase + r]    = code;
+      globalRank[kBase + code] = r;
+    }
+  }
+
+  codebookCache[modelHz] = { embeddings, n_q, vocab_size, dim, globalRank, rankToCode };
+}
+
+// Use the precomputed global centrality ranking to interpolate between cA and cB.
+// For each (level k, frame t): look up the fixed ranks of cA and cB in the
+// centrality ordering, lerp between them, and return the code at that rank.
+//
+// Rank 0 = most peripheral (furthest from codebook centroid).
+// Rank V−1 = most central (closest to centroid, most "typical").
+//
+// alpha=0 → exactly cA,  alpha=1 → exactly cB,
+// alpha=0.5 → the code whose centrality sits midway between cA and cB.
+// O(1) per (level, frame) — no per-frame sort.
+function mixCodesSimInterp(codes_a, codes_b, dims, levelAlphas, cb) {
+  const { vocab_size, globalRank, rankToCode } = cb;
+  const N_q   = dims[1], T = dims[2];
+  const isBig = codes_a instanceof BigInt64Array;
+  const out   = new (codes_a.constructor)(codes_a.length);
+
+  for (let k = 0; k < N_q; k++) {
+    const alpha_k = levelAlphas[k] ?? 0.5;
+    const kBase   = k * vocab_size;
+
+    for (let t = 0; t < T; t++) {
+      const pos = k * T + t;
+      const cA  = isBig ? Number(codes_a[pos]) : codes_a[pos];
+      const cB  = isBig ? Number(codes_b[pos]) : codes_b[pos];
+
+      if (cA === cB) { out[pos] = codes_a[pos]; continue; }
+
+      const rankA      = globalRank[kBase + cA];
+      const rankB      = globalRank[kBase + cB];
+      const targetRank = Math.round(rankA + alpha_k * (rankB - rankA));
+      out[pos] = isBig ? BigInt(rankToCode[kBase + targetRank]) : rankToCode[kBase + targetRank];
+    }
+  }
+  return out;
+}
+
 function mixCodesIntLerpByLevel(codes_a, codes_b, dims, levelAlphas) {
   const N_q   = dims[1], T = dims[2];
   const out   = new (codes_a.constructor)(codes_a.length);
@@ -442,6 +541,12 @@ async function interpDecodeOnce(capA, capB, alpha, interpPoint, modelHz, hDec, c
       case 'int_lerp':
         mixedCodes = mixCodesIntLerpByLevel(capA.codes, capB.codes, capA.codesDims,
                        levelAlphas || new Array(capA.codesDims[1]).fill(alpha));
+        break;
+      case 'sim_interp':
+        await ensureCodebooks(modelHz);
+        mixedCodes = mixCodesSimInterp(capA.codes, capB.codes, capA.codesDims,
+                       levelAlphas || new Array(capA.codesDims[1]).fill(alpha),
+                       codebookCache[modelHz]);
         break;
       default: // flat_swap
         mixedCodes = mixCodesElementWise(capA.codes, capB.codes, alpha, deterministic);
