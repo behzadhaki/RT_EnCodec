@@ -78,11 +78,24 @@ function stateTensor(data, B) {
   return new ort.Tensor('float32', data, [LSTM_LAYERS, B, LSTM_HIDDEN]);
 }
 
+// Trim the first `startFrame` frames from a flat [B, D, T] typed-array tensor.
+// Works for Float32Array (embeddings) and BigInt64Array (codes) alike.
+function sliceFrames(data, dims, startFrame) {
+  const [B, D, T] = dims;
+  const keep = T - startFrame;
+  const dst  = new data.constructor(B * D * keep);
+  for (let b = 0; b < B; b++)
+    for (let d = 0; d < D; d++)
+      dst.set(data.subarray(b*D*T + d*T + startFrame, b*D*T + d*T + T),
+              b*D*keep + d*keep);
+  return { data: dst, dims: [B, D, keep] };
+}
+
 // ---------------------------------------------------------------------------
 // Single-chunk pipeline  (used by experiment1 'process' handler only)
 // ---------------------------------------------------------------------------
 
-async function processChunk(chunk, modelHz, hEnc, cEnc, hDec, cDec) {
+async function processChunk(chunk, modelHz, hEnc, cEnc, hDec, cDec, leftGuardFrames = 0) {
   const T = chunk.length;
 
   let audioTensor;
@@ -101,7 +114,14 @@ async function processChunk(chunk, modelHz, hEnc, cEnc, hDec, cDec) {
     c_in: stateTensor(cEnc, 1),
   });
 
-  const quantOut = await sessions.quantEnc.run({ emb: encOut.emb });
+  // Discard left guard frames so the VQ and decoder only see valid-region embeddings.
+  let embForVQ = encOut.emb;
+  if (leftGuardFrames > 0) {
+    const { data, dims } = sliceFrames(encOut.emb.data, encOut.emb.dims, leftGuardFrames);
+    embForVQ = new ort.Tensor('float32', data, dims);
+  }
+
+  const quantOut = await sessions.quantEnc.run({ emb: embForVQ });
   const decCodesOut = await sessions.decCodes.run({ codes: quantOut.codes });
 
   const decAudioInputs = { emb: decCodesOut.emb, h_in: stateTensor(hDec, 1), c_in: stateTensor(cDec, 1) };
@@ -133,8 +153,11 @@ async function processChunk(chunk, modelHz, hEnc, cEnc, hDec, cDec) {
 
 const HALF_OV_24 = 640;
 
-const SEG_48    = 48000;
-const STRIDE_48 = 43200;
+const SEG_48          = 48000;
+const STRIDE_48       = 43200;
+const HOP_48          = 320;    // samples per encoder frame
+const GUARD_FRAMES_48 = 16;     // guard frames each side (~107 ms at 48 kHz)
+const GUARD_48        = GUARD_FRAMES_48 * HOP_48;
 
 const TRI_WIN_48 = new Float32Array(SEG_48);
 for (let i = 0; i < SEG_48; i++) {
@@ -239,19 +262,18 @@ async function run48k(audio, streaming, jobId) {
   for (let seg = 0; seg < numSegs; seg++) {
     if (currentJobId !== jobId) return null;
 
-    const offset = seg * STRIDE_48;
-    const chunk  = new Float32Array(SEG_48);
-    chunk.set(audio.subarray(offset, offset + SEG_48));
+    const offset         = seg * STRIDE_48;
+    const leftGuard      = Math.min(offset, GUARD_48);
+    const leftGuardFrames = leftGuard / HOP_48;
 
-    const result = await processChunk(chunk, '48k', hEnc, cEnc, hDec, cDec);
+    const extLen = leftGuard + SEG_48;
+    const chunk  = new Float32Array(extLen);
+    chunk.set(audio.subarray(offset - leftGuard, Math.min(offset - leftGuard + extLen, totalLen)));
 
-    if (streaming) {
-      hEnc = result.hEncNew; cEnc = result.cEncNew;
-      hDec = result.hDecNew; cDec = result.cDecNew;
-    } else {
-      hEnc = zeroState(1); cEnc = zeroState(1);
-      hDec = zeroState(1); cDec = zeroState(1);
-    }
+    const result = await processChunk(chunk, '48k', hEnc, cEnc, hDec, cDec, leftGuardFrames);
+
+    hEnc = result.hEncNew; cEnc = result.cEncNew;
+    hDec = result.hDecNew; cDec = result.cDecNew;
 
     const validEnd = Math.min(offset + SEG_48, totalLen);
     for (let i = 0; i < validEnd - offset; i++) {
@@ -446,7 +468,7 @@ function mixCodesIntLerpByLevel(codes_a, codes_b, dims, levelAlphas) {
 
 // Run stages 1–3 and return all intermediate tensors needed for any
 // interpolation point, plus the updated encoder LSTM state.
-async function encodeCapture(chunk, modelHz, hEnc, cEnc) {
+async function encodeCapture(chunk, modelHz, hEnc, cEnc, leftGuardFrames = 0) {
   const T = chunk.length;
   let audioTensor;
   if (modelHz === '48k') {
@@ -466,16 +488,32 @@ async function encodeCapture(chunk, modelHz, hEnc, cEnc) {
   const quantOut     = await sessions.quantEnc.run({ emb: encOut.emb });
   const decCodesOut  = await sessions.decCodes.run({ codes: quantOut.codes });
 
+  let embEncData   = new Float32Array(encOut.emb.data);
+  let embEncDims   = encOut.emb.dims.slice();
+  let codesData    = quantOut.codes.data.slice();
+  let codesDims    = quantOut.codes.dims.slice();
+  let embQuantData = new Float32Array(decCodesOut.emb.data);
+  let embQuantDims = decCodesOut.emb.dims.slice();
+
+  if (leftGuardFrames > 0) {
+    const e = sliceFrames(embEncData,   embEncDims,   leftGuardFrames);
+    embEncData = e.data; embEncDims = e.dims;
+    const c = sliceFrames(codesData,    codesDims,    leftGuardFrames);
+    codesData = c.data; codesDims = c.dims;
+    const q = sliceFrames(embQuantData, embQuantDims, leftGuardFrames);
+    embQuantData = q.data; embQuantDims = q.dims;
+  }
+
   return {
-    emb_enc:     new Float32Array(encOut.emb.data),
-    embEncDims:  encOut.emb.dims.slice(),
-    codes:       quantOut.codes.data.slice(),
-    codesType:   quantOut.codes.type,
-    codesDims:   quantOut.codes.dims.slice(),
-    emb_quant:   new Float32Array(decCodesOut.emb.data),
-    embQuantDims: decCodesOut.emb.dims.slice(),
-    scale:       encOut.scale ? new Float32Array(encOut.scale.data) : null,
-    scaleDims:   encOut.scale ? encOut.scale.dims.slice() : null,
+    emb_enc:      embEncData,
+    embEncDims,
+    codes:        codesData,
+    codesType:    quantOut.codes.type,
+    codesDims,
+    emb_quant:    embQuantData,
+    embQuantDims,
+    scale:        encOut.scale ? new Float32Array(encOut.scale.data) : null,
+    scaleDims:    encOut.scale ? encOut.scale.dims.slice() : null,
     hEncNew: new Float32Array(encOut.h_out.data),
     cEncNew: new Float32Array(encOut.c_out.data),
   };
@@ -705,11 +743,15 @@ async function encodeAndCapture48k(audio, jobId) {
   for (let s = 0; s < numSegs; s++) {
     if (currentJobId !== jobId) return [null, null];
 
-    const offset = s * STRIDE_48;
-    const chunk  = new Float32Array(SEG_48);
-    chunk.set(audio.subarray(offset, offset + SEG_48));
+    const offset          = s * STRIDE_48;
+    const leftGuard       = Math.min(offset, GUARD_48);
+    const leftGuardFrames = leftGuard / HOP_48;
 
-    const cap = await encodeCapture(chunk, '48k', hEnc, cEnc);
+    const extLen = leftGuard + SEG_48;
+    const chunk  = new Float32Array(extLen);
+    chunk.set(audio.subarray(offset - leftGuard, Math.min(offset - leftGuard + extLen, totalLen)));
+
+    const cap = await encodeCapture(chunk, '48k', hEnc, cEnc, leftGuardFrames);
     hEnc = cap.hEncNew; cEnc = cap.cEncNew;
 
     const dec = await decodeFromLatents(
