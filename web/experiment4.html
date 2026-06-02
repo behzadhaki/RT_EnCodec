@@ -1,0 +1,1045 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>EnCodec — SVD Component Swap</title>
+<link rel="stylesheet" href="encodec.css">
+<style>
+:root { --lbl-w: 4.8em; }
+#frame { grid-template-columns: 230px 1fr; }
+
+#loopBtn {
+  width: 28px; height: 28px; border-radius: 4px; cursor: pointer;
+  background: var(--accent-lo); border: 1px solid var(--accent);
+  color: var(--text); font-size: 20px;
+  display: flex; align-items: center; justify-content: center;
+}
+#loopBtn:hover { filter: brightness(1.2); }
+#loopBtn:disabled { opacity: 0.4; cursor: default; filter: none; }
+#loopBtn.active { background: var(--accent); color: #000; }
+
+#levelMeter {
+  width: 10px; height: 28px; flex-shrink: 0;
+  border-radius: 2px; border: 1px solid var(--border2);
+  background: #111; display: block;
+}
+
+/* ── Pipeline ─────────────────────────────────────────────────────────── */
+#pipelinePanel {
+  flex-shrink: 0; position: relative;
+  background: var(--surface2); border-bottom: 1px solid var(--border);
+}
+#pipelineLabels {
+  position: absolute; top: 4px; left: 0; right: 0;
+  z-index: 1; pointer-events: none;
+}
+.ipt-label {
+  position: absolute; top: 0; transform: translateX(-50%);
+  font-size: 10px; font-weight: 600; letter-spacing: 0.04em;
+  white-space: nowrap; cursor: pointer; user-select: none;
+  pointer-events: auto; color: var(--muted); transition: color 0.15s;
+}
+.ipt-label.active { color: var(--accent); }
+.ipt-label:not(.active):hover { color: var(--text); }
+#pipelineCanvas { display: block; width: 100%; height: 75px; }
+
+/* ── Swap controls ────────────────────────────────────────────────────── */
+#swapCtrlPanel {
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--border);
+  padding: 6px 12px;
+  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+}
+.swap-row { display: flex; align-items: center; gap: 6px; }
+.swap-lbl { font-size: 11px; color: var(--muted); white-space: nowrap; min-width: 4.8em; text-align: right; }
+.swap-val  { font-size: 11px; color: var(--muted); min-width: 3em; text-align: right; white-space: nowrap; }
+#strengthSlider { flex: 1; accent-color: var(--accent); cursor: pointer; height: 4px; min-width: 100px; }
+.toggle-row { display: flex; gap: 3px; }
+.tog {
+  padding: 2px 8px; font-size: 11px; border-radius: 3px; cursor: pointer;
+  background: var(--surface3); border: 1px solid var(--border2); color: var(--muted);
+  transition: background 0.15s, color 0.15s;
+}
+.tog:hover  { background: var(--accent-lo); color: var(--text); }
+.tog.active { background: var(--accent); color: #000; border-color: var(--accent); }
+
+/* ── Dual scree ───────────────────────────────────────────────────────── */
+#screePanel {
+  flex-shrink: 0; display: flex; gap: 0;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface2);
+}
+.screePane {
+  flex: 1; display: flex; flex-direction: column; padding: 4px 6px 3px;
+  border-right: 1px solid var(--border2);
+}
+.screePane:last-child { border-right: none; }
+.screeHead {
+  display: flex; justify-content: space-between; align-items: baseline;
+  margin-bottom: 2px;
+}
+.screeTitle { font-size: 10px; color: var(--muted); font-weight: 600; letter-spacing: 0.06em; }
+.screeCount { font-size: 10px; color: var(--muted); }
+.screeCvs   { width: 100%; height: 52px; cursor: pointer; display: block; }
+
+/* ── Math equation panel ──────────────────────────────────────────────── */
+#mathPanel {
+  flex-shrink: 0;
+  padding: 5px 14px 6px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface2);
+  font-size: 11px; color: var(--muted);
+  line-height: 1.65;
+}
+#mathPanel .meq {
+  font-family: 'Georgia', 'Times New Roman', serif;
+  font-size: 11.5px; color: var(--text);
+  letter-spacing: 0.01em;
+}
+#mathPanel .mwhere {
+  font-size: 10.5px; color: var(--muted); padding-left: 1em;
+}
+#mathPanel .mkey {
+  font-size: 10px; color: var(--muted); margin-top: 2px;
+  padding-left: 1em; font-style: italic;
+}
+
+.sl-ep { font-size: 10px; color: var(--muted); flex-shrink: 0; padding: 0 2px; }
+
+/* shared-scale toggle */
+#normToggle {
+  position: absolute; bottom: 4px; right: 8px;
+  font-size: 10px; color: var(--muted); display: flex; align-items: center; gap: 4px;
+  cursor: pointer; user-select: none;
+}
+</style>
+</head>
+<body>
+
+<div id="frame">
+
+  <div id="controls"></div>
+
+  <div id="right">
+
+    <div id="toolbar">
+      <button id="playBtn" disabled>▶</button>
+      <button id="loopBtn" disabled title="Loop">↺</button>
+      <canvas id="levelMeter" title="Output level"></canvas>
+      <div class="tab-group">
+        <button class="tab active" data-view="A">Source A</button>
+        <button class="tab"        data-view="B">Source B</button>
+        <button class="tab"        data-view="mod">Modified</button>
+      </div>
+      <span id="statusBar">Click to enable audio.</span>
+      <div id="progressWrap"><div id="progressBar"></div></div>
+    </div>
+
+    <div id="legend">
+      <span id="lgA"><span class="ldot" style="background:#c87800"></span>Source A (plasma)</span>
+      <span id="lgB" style="display:none"><span class="ldot" style="background:#2090c0"></span>Source B (ocean)</span>
+      <span id="lgM" style="display:none"><span class="ldot" style="background:#ff4400"></span>Modified (hot)</span>
+    </div>
+
+    <div id="pipelinePanel">
+      <div id="pipelineLabels">
+        <span class="ipt-label active" id="togEncLatents" data-point="encoder_latents">Apply Here</span>
+        <span class="ipt-label"        id="togQuantEmb"   data-point="quantized_embeddings">Apply Here</span>
+      </div>
+      <canvas id="pipelineCanvas"></canvas>
+    </div>
+
+    <div id="swapCtrlPanel">
+      <div class="swap-row" style="flex:1; min-width:120px" title="Blend basis directions: A=0, B=1. Shift+drag moves all sliders.">
+        <span class="swap-lbl">U</span>
+        <span class="sl-ep">A</span>
+        <input type="range" class="alpha-sl" id="sliderU" min="0" max="100" value="0" step="1">
+        <span class="sl-ep">B</span>
+        <span class="swap-val" id="displayU">0.00</span>
+      </div>
+      <div class="swap-row" style="flex:1; min-width:120px" title="Blend singular values: A=0, B=1. Shift+drag moves all sliders.">
+        <span class="swap-lbl">S</span>
+        <span class="sl-ep">A</span>
+        <input type="range" class="alpha-sl" id="sliderS" min="0" max="100" value="0" step="1">
+        <span class="sl-ep">B</span>
+        <span class="swap-val" id="displayS">0.00</span>
+      </div>
+      <div class="swap-row" style="flex:1; min-width:120px" title="Blend temporal patterns: A=0, B=1. Shift+drag moves all sliders.">
+        <span class="swap-lbl">V</span>
+        <span class="sl-ep">A</span>
+        <input type="range" class="alpha-sl" id="sliderV" min="0" max="100" value="0" step="1">
+        <span class="sl-ep">B</span>
+        <span class="swap-val" id="displayV">0.00</span>
+      </div>
+    </div>
+
+    <div id="mathPanel"></div>
+
+    <div id="screePanel">
+      <div class="screePane" id="screePaneA">
+        <div class="screeHead">
+          <span class="screeTitle">SVD — A</span>
+          <span class="screeCount" id="screeCountA"></span>
+        </div>
+        <canvas class="screeCvs" id="screeCvsA"></canvas>
+      </div>
+      <div class="screePane" id="screePaneB">
+        <div class="screeHead">
+          <span class="screeTitle">SVD — B</span>
+          <span class="screeCount" id="screeCountB"></span>
+        </div>
+        <canvas class="screeCvs" id="screeCvsB"></canvas>
+      </div>
+    </div>
+
+    <div id="specArea">
+      <div id="stripWrap"><canvas id="stripCanvas"></canvas></div>
+      <div id="specWrap">
+        <canvas id="specCanvas"></canvas>
+        <canvas id="playheadCanvas"></canvas>
+        <div id="activationOverlay"><span>Click to enable audio</span></div>
+      </div>
+    </div>
+
+    <div id="notePanel"></div>
+
+  </div>
+</div>
+
+<script type="module">
+'use strict';
+
+import { createSourcePanel }    from './lib/source-panel.js';
+import { createModelPanel }     from './lib/model-panel.js';
+import {
+  generateSource, applyPulseGate, loadFile, getAudioFileDuration, loopToLength, MAX_S,
+} from './lib/audio-utils.js';
+import {
+  computeSTFT, stftToOffscreen, drawStrip as _drawStrip, PLASMA, OCEAN, HOT, cmap,
+} from './lib/stft.js';
+
+const MODELS_BASE = new URL('../serialization/encodec_onnx_exports', location.href).href;
+
+// ═══════════════════════════════════════════════════════════════════════
+// State
+// ═══════════════════════════════════════════════════════════════════════
+
+let audioCtx  = null;
+let sourceSR  = 24000;
+
+let rawAudioA = null, rawAudioB = null;
+let decodedA  = null, decodedB  = null, modAudio = null;
+let bufA = null, bufB = null, bufMod = null;
+let stftA = null, stftB = null, stftMod = null;
+let offA  = null, offB  = null, offMod  = null;
+
+let currentView  = 'A';
+let applyPoint   = 'encoder_latents';
+let alphaU = 0, alphaS = 0, alphaV = 0;
+let sA = null, sB = null;         // Float32Array — singular values
+let compMask = null;              // Uint8Array(C) — shared component on/off
+let svd4Ready    = false;
+let sharedScale  = false;
+let shiftHeld    = false;
+let lastClickedComp = -1;
+
+let worker     = null;
+let jobSeq     = 0;
+let activeJobId = -1;
+let encodePhase = null;
+let capturesDirty = true;
+let applyTimer    = null;
+
+let isPlaying = false, looping = true;
+let playNode = null, playGain = null;
+let fadeOutNode = null, fadeOutGain = null;
+const CROSSFADE_S = 1.5;
+let playStart = 0, playingDuration = 0, phRAF = null;
+let specFadeOldOff = null, specFadeNewOff = null, specFadeView = null;
+let specFadeStart = 0, specFadeRAF = null;
+let seekOffset = 0, isDraggingPlayhead = false, currentScrubFrac = 0;
+let pipelineTimer = null;
+const dpr = devicePixelRatio || 1;
+
+// ═══════════════════════════════════════════════════════════════════════
+// DOM refs
+// ═══════════════════════════════════════════════════════════════════════
+
+const $ = id => document.getElementById(id);
+const playBtn        = $('playBtn');
+const loopBtn        = $('loopBtn');
+const statusBar      = $('statusBar');
+const progWrap       = $('progressWrap');
+const progBar        = $('progressBar');
+const specCvs        = $('specCanvas');
+const phCvs          = $('playheadCanvas');
+const stripCvs       = $('stripCanvas');
+const actOvl         = $('activationOverlay');
+const sliderU = $('sliderU'), displayU = $('displayU');
+const sliderS = $('sliderS'), displayS = $('displayS');
+const sliderV = $('sliderV'), displayV = $('displayV');
+const screeCvsA      = $('screeCvsA');
+const screeCvsB      = $('screeCvsB');
+const screeCountA    = $('screeCountA');
+const screeCountB    = $('screeCountB');
+const lgA = $('lgA'), lgB = $('lgB'), lgM = $('lgM');
+
+// ═══════════════════════════════════════════════════════════════════════
+// Left panel — source + model panels
+// ═══════════════════════════════════════════════════════════════════════
+
+const controls = $('controls');
+
+const panelA = createSourcePanel({
+  label: 'SOURCE A', color: 'A',
+  onFilePicked: async file => {
+    const fileDur = await getAudioFileDuration(file);
+    const current = parseFloat(durEl.value) || 4;
+    if (fileDur < current) durEl.value = fileDur.toFixed(1);
+  },
+  onChange: delay => scheduleEncode(delay),
+});
+controls.appendChild(panelA.element);
+
+const panelB = createSourcePanel({
+  label: 'SOURCE B', color: 'B',
+  onFilePicked: async file => {
+    const fileDur = await getAudioFileDuration(file);
+    const current = parseFloat(durEl.value) || 4;
+    if (fileDur < current) durEl.value = fileDur.toFixed(1);
+  },
+  onChange: delay => scheduleEncode(delay),
+});
+controls.appendChild(panelB.element);
+
+const durSection = document.createElement('div');
+durSection.className = 'ctrl-section';
+durSection.innerHTML = `
+  <div class="section-label">DURATION</div>
+  <div class="ctrl-row">
+    <span class="ctrl-lbl">Target</span>
+    <input type="number" min="0.5" max="${MAX_S}" step="0.5" value="4" style="width:48px">
+    <span class="ctrl-unit">s</span>
+  </div>`;
+controls.appendChild(durSection);
+const durEl = durSection.querySelector('input');
+durEl.addEventListener('change', () => scheduleEncode(200));
+
+const mp = createModelPanel({
+  defaultModel: '48k',
+  onChange: () => { capturesDirty = true; svd4Ready = false; clearScrees(); scheduleEncode(200); },
+});
+controls.appendChild(mp.modelSection);
+controls.appendChild(mp.modeSection);
+
+// ═══════════════════════════════════════════════════════════════════════
+// Audio context (user-gesture gated)
+// ═══════════════════════════════════════════════════════════════════════
+
+function ensureAudioCtx() {
+  if (!audioCtx) {
+    audioCtx = new AudioContext();
+    actOvl.style.display = 'none';
+  }
+}
+$('activationOverlay').addEventListener('click', ensureAudioCtx);
+
+// ═══════════════════════════════════════════════════════════════════════
+// Helpers
+// ═══════════════════════════════════════════════════════════════════════
+
+function setStatus(msg, isErr = false) {
+  statusBar.textContent = msg;
+  statusBar.style.color = isErr ? 'var(--red)' : 'var(--muted)';
+}
+
+function makeAudioBuf(pcm) {
+  const buf = audioCtx.createBuffer(1, pcm.length, sourceSR);
+  buf.copyToChannel(pcm, 0);
+  return buf;
+}
+
+function makeOffscreen(stft, palette) { return stftToOffscreen(stft, palette, sharedScale); }
+
+function drawStrip(offscreen) { _drawStrip(stripCvs, offscreen); }
+
+// ═══════════════════════════════════════════════════════════════════════
+// Spec drawing
+// ═══════════════════════════════════════════════════════════════════════
+
+function currentOff() {
+  if (currentView === 'A')   return offA;
+  if (currentView === 'B')   return offB;
+  if (currentView === 'mod') return offMod;
+  return null;
+}
+
+function drawSpec() {
+  const off = currentOff();
+  if (!off) return;
+  const W = Math.round(specCvs.clientWidth * dpr);
+  const H = Math.round(specCvs.clientHeight * dpr);
+  specCvs.width = W; specCvs.height = H;
+  const ctx = specCvs.getContext('2d');
+  ctx.clearRect(0, 0, W, H);
+  ctx.drawImage(off, 0, 0, W, H);
+  drawPlayhead();
+}
+
+function startSpecFade(oldOff, newOff, view) {
+  specFadeOldOff = oldOff; specFadeNewOff = newOff; specFadeView = view;
+  specFadeStart = performance.now();
+  if (specFadeRAF) cancelAnimationFrame(specFadeRAF);
+  animSpecFade();
+}
+function animSpecFade() {
+  const t = Math.min((performance.now() - specFadeStart) / 300, 1);
+  if (currentView !== specFadeView) return;
+  const W = Math.round(specCvs.clientWidth * dpr);
+  const H = Math.round(specCvs.clientHeight * dpr);
+  specCvs.width = W; specCvs.height = H;
+  const ctx = specCvs.getContext('2d');
+  ctx.clearRect(0, 0, W, H);
+  if (specFadeOldOff && t < 1) { ctx.globalAlpha = 1 - t; ctx.drawImage(specFadeOldOff, 0, 0, W, H); }
+  if (specFadeNewOff) { ctx.globalAlpha = t; ctx.drawImage(specFadeNewOff, 0, 0, W, H); }
+  ctx.globalAlpha = 1;
+  drawPlayhead();
+  if (t < 1) specFadeRAF = requestAnimationFrame(animSpecFade);
+  else { drawStrip(specFadeNewOff); }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// View tabs
+// ═══════════════════════════════════════════════════════════════════════
+
+function setView(v) {
+  if (v === currentView) return;
+  const prevOff = currentOff();
+  currentView = v;
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.view === v));
+  lgA.style.display = v === 'A'   ? '' : 'none';
+  lgB.style.display = v === 'B'   ? '' : 'none';
+  lgM.style.display = v === 'mod' ? '' : 'none';
+  const newOff = currentOff();
+  if (newOff) startSpecFade(prevOff, newOff, v);
+  else drawSpec();
+  // Switch audio to match the new view seamlessly.
+  if (isPlaying && audioCtx && currentBuf()) {
+    const elapsed = audioCtx.currentTime - playStart;
+    const pos = playingDuration > 0
+      ? (looping ? elapsed % playingDuration : Math.min(elapsed, playingDuration))
+      : 0;
+    startPlayback(pos);
+  }
+}
+
+document.querySelectorAll('.tab').forEach(tab => tab.addEventListener('click', () => setView(tab.dataset.view)));
+
+// ═══════════════════════════════════════════════════════════════════════
+// Scree drawing
+// ═══════════════════════════════════════════════════════════════════════
+
+function clearScrees() {
+  sA = null; sB = null; compMask = null;
+  [screeCvsA, screeCvsB].forEach(cvs => {
+    const ctx = cvs.getContext('2d');
+    ctx.clearRect(0, 0, cvs.width, cvs.height);
+  });
+  screeCountA.textContent = '';
+  screeCountB.textContent = '';
+}
+
+function drawOneScree(cvs, sVals, countEl) {
+  if (!sVals || !compMask) return;
+  const C  = sVals.length;
+  const cW = Math.round(cvs.clientWidth  * dpr);
+  const cH = Math.round(cvs.clientHeight * dpr);
+  if (!cW || !cH) return;
+  cvs.width = cW; cvs.height = cH;
+  const ctx = cvs.getContext('2d');
+  ctx.clearRect(0, 0, cW, cH);
+  const maxS = sVals[0] || 1;
+  const barW = cW / C;
+  let activeN = 0;
+  for (let k = 0; k < C; k++) {
+    const active = !!compMask[k];
+    if (active) activeN++;
+    const barH = Math.max(1, (sVals[k] / maxS) * (cH - 2));
+    ctx.fillStyle = active ? '#c8902a' : '#333';
+    ctx.fillRect(k * barW, cH - barH, Math.max(1, barW - 1), barH);
+    if (active) {
+      ctx.fillStyle = 'rgba(255,200,80,0.7)';
+      ctx.fillRect(k * barW, cH - barH, Math.max(1, barW - 1), Math.min(2 * dpr, barH));
+    }
+  }
+  if (countEl) countEl.textContent = `${activeN} / ${C}`;
+}
+
+function drawScrees() {
+  drawOneScree(screeCvsA, sA, screeCountA);
+  drawOneScree(screeCvsB, sB, screeCountB);
+}
+
+function handleScreeClick(e, cvs) {
+  if (!sA || !compMask) return;
+  const rect = cvs.getBoundingClientRect();
+  const xFrac = (e.clientX - rect.left) / rect.width;
+  const C = compMask.length;
+  const k = Math.floor(xFrac * C);
+  if (k < 0 || k >= C) return;
+
+  if (shiftHeld && lastClickedComp >= 0) {
+    const lo = Math.min(lastClickedComp, k), hi = Math.max(lastClickedComp, k);
+    for (let i = lo; i <= hi; i++) compMask[i] = 1;
+    for (let i = 0; i < lo; i++) compMask[i] = 0;
+    for (let i = hi + 1; i < C; i++) compMask[i] = 0;
+  } else {
+    compMask[k] = compMask[k] ? 0 : 1;
+    lastClickedComp = k;
+  }
+  drawScrees();
+  scheduleApply();
+}
+
+screeCvsA.addEventListener('click', e => handleScreeClick(e, screeCvsA));
+screeCvsB.addEventListener('click', e => handleScreeClick(e, screeCvsB));
+
+// ═══════════════════════════════════════════════════════════════════════
+// Controls
+// ═══════════════════════════════════════════════════════════════════════
+
+function updateMathPanel() {
+  $('mathPanel').innerHTML =
+    `<div class="meq">E<sub>new</sub>[c,t] = &Sigma;<sub>k</sub> U<sub>eff</sub>[c,k] &middot; S<sub>eff</sub>[k] &middot; V<sub>eff</sub>[k,t]</div>` +
+    `<div class="mwhere">` +
+      `U<sub>eff</sub>[c,k] = (1&minus;&alpha;<sub>U</sub>)&thinsp;U<sub>A</sub>[c,k] + &alpha;<sub>U</sub>&thinsp;U<sub>B</sub>[c,k] &emsp;` +
+      `S<sub>eff</sub>[k] = (1&minus;&alpha;<sub>S</sub>)&thinsp;S<sub>A</sub>[k] + &alpha;<sub>S</sub>&thinsp;S<sub>B</sub>[k] &emsp;` +
+      `V<sub>eff</sub>[k,t] = (1&minus;&alpha;<sub>V</sub>)&thinsp;V<sub>A</sub>[k,t] + &alpha;<sub>V</sub>&thinsp;V<sub>B</sub>[k,t]` +
+      ` &nbsp;<span style="color:var(--accent)">[active k]</span>` +
+    `</div>` +
+    `<div class="mkey">SVD on raw embeddings (no mean centering) &nbsp;&middot;&nbsp; inactive k: zeroed out</div>`;
+}
+
+const SLIDERS = [
+  { sl: sliderU, disp: displayU, key: 'U' },
+  { sl: sliderS, disp: displayS, key: 'S' },
+  { sl: sliderV, disp: displayV, key: 'V' },
+];
+
+function setAlpha(key, v) {
+  if (key === 'U') alphaU = v;
+  if (key === 'S') alphaS = v;
+  if (key === 'V') alphaV = v;
+}
+
+SLIDERS.forEach(({ sl, disp, key }) => {
+  sl.addEventListener('input', () => {
+    const v = parseInt(sl.value) / 100;
+    if (shiftHeld) {
+      // Move all sliders to the same value
+      alphaU = alphaS = alphaV = v;
+      SLIDERS.forEach(s => {
+        s.sl.value = sl.value;
+        s.disp.textContent = v.toFixed(2);
+      });
+    } else {
+      setAlpha(key, v);
+      disp.textContent = v.toFixed(2);
+    }
+  });
+  sl.addEventListener('change', scheduleApply);
+});
+
+document.querySelectorAll('.ipt-label').forEach(lbl => {
+  lbl.addEventListener('click', () => {
+    applyPoint = lbl.dataset.point;
+    document.querySelectorAll('.ipt-label').forEach(l => l.classList.toggle('active', l.dataset.point === applyPoint));
+    positionPipelineLabels();
+    if (!capturesDirty) {
+      svd4Ready = false;
+      triggerSVD4();
+    }
+  });
+});
+
+function scheduleApply() {
+  if (!svd4Ready) return;
+  clearTimeout(applyTimer);
+  applyTimer = setTimeout(triggerApply, 80);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Worker
+// ═══════════════════════════════════════════════════════════════════════
+
+function initWorker() {
+  if (worker) worker.terminate();
+  worker = new Worker('encodec-worker.js?v=' + Date.now());
+  worker.postMessage({ type: 'init', modelsBaseUrl: MODELS_BASE });
+  worker.onmessage = onWorkerMsg;
+}
+
+function onWorkerMsg(e) {
+  const msg = e.data;
+
+  if (msg.type === 'svd4_progress') {
+    setStatus(msg.message);
+    if (msg.value !== undefined) {
+      progWrap.style.display = 'block';
+      progBar.style.width = Math.round(msg.value * 100) + '%';
+    }
+    return;
+  }
+
+  if (msg.type === 'svd4_ready') {
+    progWrap.style.display = 'none';
+    sA = msg.sA; sB = msg.sB;
+    compMask = new Uint8Array(msg.C).fill(1); // all active by default
+    svd4Ready = true;
+    drawScrees();
+    setStatus('SVD ready — adjust controls to apply.');
+    scheduleApply();
+    return;
+  }
+
+  if (msg.type === 'svd4_error') {
+    setStatus(msg.message, true);
+    return;
+  }
+
+  if (msg.jobId !== activeJobId) return;
+
+  if (msg.type === 'progress') {
+    progBar.style.width = Math.round(msg.value * 100) + '%';
+    setStatus(msg.status);
+
+  } else if (msg.type === 'result') {
+    progWrap.style.display = 'none';
+
+    if (encodePhase === 'A') {
+      const prevOff = offA;
+      decodedA = msg.decoded; sourceSR = mp.getSampleRate();
+      if (audioCtx) { bufA = makeAudioBuf(decodedA); refreshPlayback('A'); }
+      stftA = computeSTFT(decodedA);
+      offA  = makeOffscreen(stftA, PLASMA);
+      drawPipeline();
+      setStatus('Source A encoded — encoding B…');
+      if (currentView === 'A') startSpecFade(prevOff, offA, 'A'); else drawSpec();
+      startEncodeB();
+
+    } else if (encodePhase === 'B') {
+      const prevOff = offB;
+      decodedB = msg.decoded;
+      if (audioCtx) { bufB = makeAudioBuf(decodedB); refreshPlayback('B'); }
+      stftB = computeSTFT(decodedB);
+      offB  = makeOffscreen(stftB, OCEAN);
+      capturesDirty = false;
+      encodePhase   = null;
+      playBtn.disabled = false; loopBtn.disabled = false;
+      drawPipeline();
+      if (currentView === 'B') startSpecFade(prevOff, offB, 'B'); else drawSpec();
+      setStatus('Both encoded — computing SVD…');
+      triggerSVD4();
+
+    } else if (encodePhase === 'mod') {
+      const prevOff = offMod;
+      modAudio = msg.decoded;
+      if (audioCtx) { bufMod = makeAudioBuf(modAudio); refreshPlayback('mod'); }
+      stftMod = computeSTFT(modAudio);
+      offMod  = makeOffscreen(stftMod, HOT);
+      encodePhase = null;
+      progWrap.style.display = 'none';
+      if (currentView === 'mod') startSpecFade(prevOff, offMod, 'mod');
+      else setView('mod');
+      setStatus(`Done. U=${alphaU.toFixed(2)}  S=${alphaS.toFixed(2)}  V=${alphaV.toFixed(2)}`);
+    }
+
+  } else if (msg.type === 'error') {
+    progWrap.style.display = 'none';
+    encodePhase = null;
+    setStatus(msg.message, true);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Encode flow
+// ═══════════════════════════════════════════════════════════════════════
+
+// Build audio from a source panel (matches exp3's buildAligned pattern).
+async function buildAligned(panel, finalLen, sr) {
+  const type = panel.getType();
+  if (type !== 'file') return generateSource(type, panel.getFreq(), finalLen / sr, sr);
+  const f = panel.getFile();
+  if (!f) throw new Error('No file selected.');
+  const raw = await loadFile(f, sr);
+  if (raw.length === finalLen) return raw;
+  if (raw.length >  finalLen) return raw.slice(0, finalLen);
+  return loopToLength(raw, finalLen);
+}
+
+async function triggerEncode() {
+  if (!worker) return;
+  const sr       = mp.getSampleRate();
+  const targetSec = Math.min(parseFloat(durEl.value) || 4, MAX_S);
+  const finalLen  = Math.round(targetSec * sr);
+
+  let audioA, audioB;
+  try {
+    setStatus('Loading A…');
+    audioA = await buildAligned(panelA, finalLen, sr);
+    setStatus('Loading B…');
+    audioB = await buildAligned(panelB, finalLen, sr);
+  } catch (err) { setStatus(err.message, true); return; }
+
+  // Both same length by construction (buildAligned trims/loops to finalLen).
+  rawAudioA = audioA;
+  rawAudioB = audioB;
+  sourceSR  = sr;
+
+  capturesDirty = true;
+  svd4Ready = false;
+  offMod = null; modAudio = null; bufMod = null;
+  clearScrees();
+  playBtn.disabled = true; loopBtn.disabled = true;
+
+  encodePhase = 'A';
+  activeJobId = ++jobSeq;
+  progWrap.style.display = 'block';
+  progBar.style.width = '0%';
+  setStatus('Encoding A…');
+
+  worker.postMessage({
+    type: 'encode', source: 'A', jobId: activeJobId,
+    audio: rawAudioA.slice(),
+    modelHz:   mp.getModelHz(),
+    bwKbps:    mp.getBwKbps(),
+    streaming: mp.isStreaming(),
+    frameSize: mp.getFrameSize(),
+  });
+}
+
+function startEncodeB() {
+  encodePhase = 'B';
+  activeJobId = ++jobSeq;
+  progWrap.style.display = 'block';
+  progBar.style.width = '0%';
+  setStatus('Encoding B…');
+  worker.postMessage({
+    type: 'encode', source: 'B', jobId: activeJobId,
+    audio: rawAudioB.slice(),
+    modelHz:   mp.getModelHz(),
+    bwKbps:    mp.getBwKbps(),
+    streaming: mp.isStreaming(),
+    frameSize: mp.getFrameSize(),
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// SVD4 compute
+// ═══════════════════════════════════════════════════════════════════════
+
+function triggerSVD4() {
+  if (!worker || capturesDirty) return;
+  worker.postMessage({ type: 'compute_svd4', applyPoint });
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Apply SVD4
+// ═══════════════════════════════════════════════════════════════════════
+
+function triggerApply() {
+  if (!svd4Ready || !compMask) return;
+  worker.postMessage({ type: 'cancel', jobId: activeJobId });
+  encodePhase = 'mod';
+  activeJobId = ++jobSeq;
+  progWrap.style.display = 'block';
+  progBar.style.width = '0%';
+  setStatus('Applying…');
+  worker.postMessage({
+    type:      'apply_svd4',
+    jobId:     activeJobId,
+    modelHz:   mp.getModelHz(),
+    bwKbps:    mp.getBwKbps(),
+    alphaU, alphaS, alphaV,
+    compMask:  compMask.slice(),
+    applyPoint,
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Auto-encode scheduling
+// ═══════════════════════════════════════════════════════════════════════
+
+let encodeTimer = null;
+function scheduleEncode(delay = 600) {
+  clearTimeout(encodeTimer);
+  encodeTimer = setTimeout(() => triggerEncode(), delay);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Playback
+// ═══════════════════════════════════════════════════════════════════════
+
+function currentBuf() {
+  if (currentView === 'A')   return bufA;
+  if (currentView === 'B')   return bufB;
+  if (currentView === 'mod') return bufMod;
+  return null;
+}
+
+// If the given view is currently playing, restart playback with the new buffer
+// at the current playback position so audio stays in sync with the spectrogram.
+function refreshPlayback(view) {
+  if (!isPlaying || currentView !== view || !audioCtx) return;
+  const elapsed = audioCtx.currentTime - playStart;
+  const pos = playingDuration > 0
+    ? (looping ? elapsed % playingDuration : Math.min(elapsed, playingDuration))
+    : 0;
+  startPlayback(pos);
+}
+
+function startPlayback(fromSec = 0) {
+  ensureAudioCtx();
+  const buf = currentBuf(); if (!buf) return;
+  stopPlayback();
+  isPlaying = true; playBtn.textContent = '⏹';
+  const dur = buf.duration;
+  playingDuration = dur;
+  seekOffset = Math.max(0, Math.min(fromSec, dur));
+
+  playGain = audioCtx.createGain(); playGain.gain.value = 1;
+  playGain.connect(audioCtx.destination);
+  playNode = audioCtx.createBufferSource();
+  playNode.buffer = buf; playNode.connect(playGain);
+  if (looping) { playNode.loop = true; playNode.loopStart = 0; playNode.loopEnd = dur; }
+  playNode.start(0, seekOffset);
+  playStart = audioCtx.currentTime - seekOffset;
+  playNode.onended = () => { if (!looping) stopPlayback(); };
+  if (phRAF) cancelAnimationFrame(phRAF); animPlayhead();
+}
+
+function stopPlayback() {
+  if (playNode) { try { playNode.stop(); } catch (_) {} playNode = null; }
+  if (playGain) { playGain.disconnect(); playGain = null; }
+  isPlaying = false; playBtn.textContent = '▶';
+  if (phRAF) { cancelAnimationFrame(phRAF); phRAF = null; }
+  drawPlayhead();
+}
+
+function animPlayhead() {
+  if (!isPlaying) return;
+  const elapsed = audioCtx.currentTime - playStart;
+  currentScrubFrac = looping
+    ? (elapsed % playingDuration) / playingDuration
+    : Math.min(elapsed / playingDuration, 1);
+  drawPlayhead();
+  phRAF = requestAnimationFrame(animPlayhead);
+}
+
+function drawPlayhead() {
+  const W = Math.round(phCvs.clientWidth * dpr);
+  const H = Math.round(phCvs.clientHeight * dpr);
+  phCvs.width = W; phCvs.height = H;
+  const ctx = phCvs.getContext('2d');
+  ctx.clearRect(0, 0, W, H);
+  if (!isPlaying && !isDraggingPlayhead) return;
+  const x = Math.round(currentScrubFrac * W);
+  ctx.strokeStyle = 'rgba(255,255,255,0.85)';
+  ctx.lineWidth = dpr;
+  ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke();
+}
+
+playBtn.addEventListener('click', () => { isPlaying ? stopPlayback() : startPlayback(seekOffset); });
+loopBtn.addEventListener('click', () => {
+  looping = !looping; loopBtn.classList.toggle('active', looping);
+  if (isPlaying) { const t = audioCtx.currentTime - playStart; stopPlayback(); startPlayback(t); }
+});
+
+phCvs.addEventListener('mousedown', e => {
+  isDraggingPlayhead = true;
+  currentScrubFrac = e.offsetX / phCvs.clientWidth;
+  seekOffset = currentScrubFrac * (playingDuration || 0);
+  drawPlayhead();
+});
+window.addEventListener('mousemove', e => {
+  if (!isDraggingPlayhead) return;
+  const rect = phCvs.getBoundingClientRect();
+  currentScrubFrac = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+  seekOffset = currentScrubFrac * (playingDuration || 0);
+  drawPlayhead();
+});
+window.addEventListener('mouseup', () => {
+  if (!isDraggingPlayhead) return;
+  isDraggingPlayhead = false;
+  if (isPlaying) { stopPlayback(); startPlayback(seekOffset); }
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// Pipeline visualization
+// ═══════════════════════════════════════════════════════════════════════
+
+const COL_A_RGB = [204, 51,  51];
+const COL_B_RGB = [ 51, 102, 204];
+
+function drawPipeline() {
+  const cvs = $('pipelineCanvas');
+  const W = Math.round(cvs.clientWidth * dpr);
+  const H = Math.round(cvs.clientHeight * dpr);
+  if (!W || !H) return;
+  cvs.width = W; cvs.height = H;
+  const ctx = cvs.getContext('2d');
+  ctx.clearRect(0, 0, W, H);
+
+  const px = (f) => Math.round(f * W);
+  const hasA = !!decodedA, hasB = !!decodedB;
+
+  // Layout proportions (mirroring exp2/3 style)
+  // [encAudio | gap | encSeg | gap | enc_lat/vq | gap | svd | gap | swap | gap | decAudio | gap | out]
+  const secs = [0.08, 0.02, 0.11, 0.02, 0.11, 0.02, 0.06, 0.02, 0.10, 0.02, 0.11, 0.02, 0.06, 0.02, 0.11, 0.02, 0.08];
+  const tot  = secs.reduce((a, b) => a + b, 0);
+  const padX = 10 * dpr;
+  const usW  = W - 2 * padX;
+  const left  = i => padX + secs.slice(0, i).reduce((a, b) => a + b, 0) / tot * usW;
+  const width = i => secs[i] / tot * usW;
+  const ctr   = i => left(i) + width(i) / 2;
+
+  const yA = H * 0.35, yB = H * 0.65, yMid = H * 0.5;
+  const rA = [204, 51, 51], rB = [51, 102, 204];
+  const BOX_H = 14 * dpr, CORNER = 3 * dpr;
+
+  function rgba([r,g,b], a=1) { return `rgba(${r},${g},${b},${a})`; }
+  function box(x, y, w, h, col, active=true) {
+    ctx.beginPath();
+    ctx.roundRect(x, y - h/2, w, h, CORNER);
+    ctx.fillStyle = active ? rgba(col, 0.85) : rgba(col, 0.25);
+    ctx.fill();
+  }
+  function line(x1, y1, x2, y2, col, dashed=false) {
+    ctx.beginPath();
+    ctx.setLineDash(dashed ? [3*dpr, 3*dpr] : []);
+    ctx.strokeStyle = col;
+    ctx.lineWidth = dpr;
+    ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+  function label(txt, x, y, col='rgba(255,255,255,0.6)') {
+    ctx.fillStyle = col; ctx.font = `${9*dpr}px sans-serif`;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(txt, x, y);
+  }
+
+  // Row A: Encode Audio → enc_lat → SVD-A
+  // Row B: Encode Audio → enc_lat → SVD-B
+  // Both converge → Swap → Decode Audio → Out
+
+  // Section indices: 0=EncAudio, 2=EncSeg, 4=EncLat/VQ, 6=SVD, 8=Swap, 10=DecAudio, 12=Out
+  // (we'll map to our secs array)
+  const sEnc=0, sEncSeg=2, sLat=4, sSVD=6, sSwap=8, sDec=10, sOut=12;
+
+  // A path
+  line(left(sEnc)+width(sEnc), yA, left(sEncSeg), yA, rgba(rA, 0.6));
+  box(left(sEnc), yA, width(sEnc), BOX_H, rA, hasA);
+  label('Encode\nAudio', ctr(sEnc), yA);
+
+  line(left(sEncSeg)+width(sEncSeg), yA, left(sLat), yA, rgba(rA, 0.6));
+  box(left(sEncSeg), yA, width(sEncSeg), BOX_H, rA, hasA);
+  label('Enc Seg', ctr(sEncSeg), yA);
+
+  line(left(sLat)+width(sLat), yA, left(sSVD), yA, rgba(rA, 0.6));
+  const latActive = applyPoint === 'encoder_latents';
+  box(left(sLat), yA, width(sLat), BOX_H, rA, hasA);
+  label(latActive ? 'Enc Lat' : 'VQ Emb', ctr(sLat), yA);
+
+  line(left(sSVD)+width(sSVD), yA, ctr(sSVD+2), yA, rgba(rA, 0.6));
+  line(ctr(sSVD+2), yA, ctr(sSVD+2), yMid, rgba(rA, 0.6)); // descend to mid
+  box(left(sSVD), yA, width(sSVD), BOX_H, rA, hasA);
+  label('SVD-A', ctr(sSVD), yA);
+
+  // B path
+  line(left(sEnc)+width(sEnc), yB, left(sEncSeg), yB, rgba(rB, 0.6));
+  box(left(sEnc), yB, width(sEnc), BOX_H, rB, hasB);
+  label('Encode\nAudio', ctr(sEnc), yB);
+
+  line(left(sEncSeg)+width(sEncSeg), yB, left(sLat), yB, rgba(rB, 0.6));
+  box(left(sEncSeg), yB, width(sEncSeg), BOX_H, rB, hasB);
+  label('Enc Seg', ctr(sEncSeg), yB);
+
+  line(left(sLat)+width(sLat), yB, left(sSVD), yB, rgba(rB, 0.6));
+  box(left(sLat), yB, width(sLat), BOX_H, rB, hasB);
+  label(latActive ? 'Enc Lat' : 'VQ Emb', ctr(sLat), yB);
+
+  line(left(sSVD)+width(sSVD), yB, ctr(sSVD+2), yB, rgba(rB, 0.6));
+  line(ctr(sSVD+2), yB, ctr(sSVD+2), yMid, rgba(rB, 0.6)); // ascend to mid
+  box(left(sSVD), yB, width(sSVD), BOX_H, rB, hasB);
+  label('SVD-B', ctr(sSVD), yB);
+
+  // Convergence → Swap → Decode → Out
+  const swapActive = hasA && hasB;
+  const dirCol = rA; // A is always recipient
+  line(ctr(sSVD+2), yMid, left(sSwap), yMid, rgba(dirCol, 0.7));
+  box(left(sSwap), yMid, width(sSwap), BOX_H, dirCol, swapActive);
+  label('Swap', ctr(sSwap), yMid);
+
+  line(left(sSwap)+width(sSwap), yMid, left(sDec), yMid, rgba(dirCol, 0.7));
+  box(left(sDec), yMid, width(sDec), BOX_H, dirCol, swapActive);
+  label('Dec\nAudio', ctr(sDec), yMid);
+
+  line(left(sDec)+width(sDec), yMid, left(sOut), yMid, rgba(dirCol, 0.7));
+  box(left(sOut), yMid, width(sOut), BOX_H, dirCol, !!modAudio);
+  label('Out', ctr(sOut), yMid);
+
+  positionPipelineLabels();
+}
+
+function positionPipelineLabels() {
+  const panel = $('pipelinePanel');
+  const panelW = panel.clientWidth;
+  if (!panelW) return;
+
+  const secs = [0.08, 0.02, 0.11, 0.02, 0.11, 0.02, 0.06, 0.02, 0.10, 0.02, 0.11, 0.02, 0.06, 0.02, 0.11, 0.02, 0.08];
+  const tot  = secs.reduce((a, b) => a + b, 0);
+  const padX = 10;
+  const usW  = panelW - 2 * padX;
+  const ctr  = i => padX + (secs.slice(0, i).reduce((a,b)=>a+b,0) + secs[i]/2) / tot * usW;
+
+  $('togEncLatents').style.left = ctr(4) + 'px';
+  $('togQuantEmb').style.left   = ctr(4) + 'px'; // same column, just different label
+}
+
+// Resize
+const ro = new ResizeObserver(() => {
+  drawPipeline();
+  drawSpec();
+  drawScrees();
+});
+ro.observe($('pipelinePanel'));
+ro.observe($('specArea'));
+ro.observe($('screePanel'));
+
+// ═══════════════════════════════════════════════════════════════════════
+// Keyboard
+// ═══════════════════════════════════════════════════════════════════════
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'Shift') shiftHeld = true;
+  if (e.key === ' ' && !e.target.matches('input, select, button, textarea')) {
+    e.preventDefault();
+    if (isPlaying) stopPlayback(); else startPlayback(seekOffset);
+  }
+});
+document.addEventListener('keyup',  e => { if (e.key === 'Shift') shiftHeld = false; });
+window.addEventListener('blur',     () => { shiftHeld = false; });
+
+// ═══════════════════════════════════════════════════════════════════════
+// Boot
+// ═══════════════════════════════════════════════════════════════════════
+
+initWorker();
+drawPipeline();
+updateMathPanel();
+scheduleEncode(800);
+
+</script>
+</body>
+</html>

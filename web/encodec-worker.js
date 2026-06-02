@@ -1213,12 +1213,12 @@ async function deltaTransfer48k(capsA, capsB, applyPoint, mode, strength, startF
 // Jacobi cyclic eigendecomposition for a real symmetric n×n matrix.
 // Returns { eigenvalues: Float32Array(n), eigenvectors: Float32Array(n×n) }
 // sorted by descending eigenvalue. eigenvectors[:,k] is the k-th eigenvector.
-function symmetricEigen(flatA, n) {
+function symmetricEigen(flatA, n, maxSweeps = 30, onSweep = null) {
   const A = flatA.slice();
   const V = new Float32Array(n * n);
   for (let i = 0; i < n; i++) V[i * n + i] = 1.0;
 
-  for (let sweep = 0; sweep < 30; sweep++) {
+  for (let sweep = 0; sweep < maxSweeps; sweep++) {
     let offNorm = 0;
     for (let p = 0; p < n; p++)
       for (let q = p + 1; q < n; q++)
@@ -1248,6 +1248,7 @@ function symmetricEigen(flatA, n) {
         }
       }
     }
+    if (onSweep) onSweep(sweep + 1, maxSweeps);
   }
 
   const order = Array.from({ length: n }, (_, i) => i).sort((a, b) => A[b*n+b] - A[a*n+a]);
@@ -1413,6 +1414,465 @@ function runGetEmbDeltas(msg) {
 }
 
 // ---------------------------------------------------------------------------
+// SVD4 — per-source SVD for experiment4
+// ---------------------------------------------------------------------------
+
+// Full SVD of a source's raw embeddings via covariance eigendecomposition.
+// Returns { U[C×C], S[C], Vt[C×totalT], Ec[C×totalT], mean[C], C, totalT }.
+function computeFullSVD(caps, applyPoint, totalT, onSweep = null) {
+  const C  = getCapEmb(caps[0], applyPoint).dims[1];
+
+  // Concatenate embeddings along T, up to totalT frames.
+  const E = new Float32Array(C * totalT);
+  let tOff = 0;
+  for (let i = 0; i < caps.length && tOff < totalT; i++) {
+    const { emb, dims } = getCapEmb(caps[i], applyPoint);
+    const T = Math.min(dims[2], totalT - tOff);
+    for (let c = 0; c < C; c++)
+      for (let t = 0; t < T; t++)
+        E[c * totalT + tOff + t] = emb[c * dims[2] + t];
+    tOff += T;
+  }
+
+  // Second-moment matrix cov[i,j] = Σ_t E[i,t]*E[j,t] / totalT (no centering).
+  // Component 1 will capture the dominant embedding direction including DC.
+  const cov = new Float32Array(C * C);
+  for (let i = 0; i < C; i++)
+    for (let j = i; j < C; j++) {
+      let s = 0;
+      for (let t = 0; t < totalT; t++) s += E[i * totalT + t] * E[j * totalT + t];
+      cov[i*C+j] = cov[j*C+i] = s / totalT;
+    }
+  // 8 sweeps is sufficient for approximating the principal directions.
+  const { eigenvalues, eigenvectors } = symmetricEigen(cov, C, 8, onSweep);
+
+  const S = new Float32Array(C);
+  for (let k = 0; k < C; k++) S[k] = Math.sqrt(Math.max(0, eigenvalues[k]));
+
+  // Vt[k,t] = (Σ_c U[c,k] * E[c,t]) / S[k]
+  const Vt = new Float32Array(C * totalT);
+  for (let k = 0; k < C; k++) {
+    const sk = Math.max(S[k], 1e-10);
+    for (let t = 0; t < totalT; t++) {
+      let v = 0;
+      for (let c = 0; c < C; c++) v += eigenvectors[c * C + k] * E[c * totalT + t];
+      Vt[k * totalT + t] = v / sk;
+    }
+  }
+
+  return { U: eigenvectors, S, Vt, E, C, totalT };
+}
+
+// Compute SVD for both sources and store in captureCache.{A,B}.svd4.
+// Posts { type: 'svd4_ready', sA, sB, C, totalT } when done.
+function runComputeSVD4(msg) {
+  try {
+    const { applyPoint = 'encoder_latents' } = msg;
+    const capsA = captureCache.A, capsB = captureCache.B;
+    if (!capsA || !capsB) { self.postMessage({ type: 'svd4_error', message: 'Encode both sources first.' }); return; }
+
+    const getCapsArr = caps => {
+      if (caps.mode === 'single') return [caps.cap];
+      if (caps.mode === 'ola48') return caps.segments.map(s => s.cap);
+      return caps.chunks.map(c => c.cap);
+    };
+
+    const cA = getCapsArr(capsA), cB = getCapsArr(capsB);
+    const TA = cA.reduce((s, c) => s + getCapEmb(c, applyPoint).dims[2], 0);
+    const TB = cB.reduce((s, c) => s + getCapEmb(c, applyPoint).dims[2], 0);
+    const totalT = Math.min(TA, TB);
+
+    self.postMessage({ type: 'svd4_progress', message: 'SVD A — sweep 0/8', value: 0 });
+    const svdA = computeFullSVD(cA, applyPoint, totalT, (sweep, total) =>
+      self.postMessage({ type: 'svd4_progress',
+        message: `SVD A — sweep ${sweep}/${total}`,
+        value: sweep / total * 0.5 }));
+
+    self.postMessage({ type: 'svd4_progress', message: 'SVD B — sweep 0/8', value: 0.5 });
+    const svdB = computeFullSVD(cB, applyPoint, totalT, (sweep, total) =>
+      self.postMessage({ type: 'svd4_progress',
+        message: `SVD B — sweep ${sweep}/${total}`,
+        value: 0.5 + sweep / total * 0.5 }));
+
+    self.postMessage({ type: 'svd4_progress', message: 'Building caches…' });
+
+    const buildCache = (svd, caps, capsArr) => {
+      const rawTs = capsArr.map(c => getCapEmb(c, applyPoint).dims[2]);
+      const segTs = [];
+      let rem = totalT;
+      for (const t of rawTs) { if (rem <= 0) break; segTs.push(Math.min(t, rem)); rem -= t; }
+      const n = segTs.length;
+
+      let segsInfo = null, segScales = null;
+      if (caps.mode === 'ola48') {
+        segsInfo  = caps.segments.slice(0, n).map(s => ({ offset: s.offset, validEnd: s.validEnd }));
+        segScales = caps.segments.slice(0, n).map(s => ({ scale: s.cap.scale, scaleDims: s.cap.scaleDims }));
+      } else if (caps.mode === 'ola24') {
+        segsInfo = caps.chunks.slice(0, n).map(c => ({ srcS: c.srcS, srcE: c.srcE, off: c.off }));
+      }
+      const totalLen = caps.mode === 'ola48' ? segsInfo[n - 1].validEnd : caps.totalLen;
+
+      return { ...svd, segTs, mode: caps.mode, segsInfo, segScales, win: caps.win || null, totalLen };
+    };
+
+    captureCache.A.svd4 = buildCache(svdA, capsA, cA);
+    captureCache.B.svd4 = buildCache(svdB, capsB, cB);
+
+    const sA = svdA.S.slice(), sB = svdB.S.slice();
+    self.postMessage({ type: 'svd4_ready', sA, sB, C: svdA.C, totalT }, [sA.buffer, sB.buffer]);
+  } catch (err) {
+    self.postMessage({ type: 'svd4_error', message: 'SVD failed: ' + err.message });
+  }
+}
+
+// Decode a modified [C, totalT] embedding matrix back to audio using the
+// recipient source's OLA layout and segment scales.
+async function decodeSVD4(Enew, C, totalT, svd4, applyPoint, modelHz, jobId, overrideScales = null) {
+  const { segTs, mode, segsInfo, win, totalLen } = svd4;
+  const segScales = overrideScales ?? svd4.segScales;
+  const is48k = modelHz === '48k';
+
+  if (mode === 'single') {
+    const dims = [1, C, totalT];
+    let finalEmb = Enew, finalDims = dims;
+    if (applyPoint === 'encoder_latents') {
+      const qOut = await sessions.quantEnc.run({ emb: new ort.Tensor('float32', Enew, dims) });
+      const dOut = await sessions.decCodes.run({ codes: qOut.codes });
+      finalEmb = new Float32Array(dOut.emb.data); finalDims = dOut.emb.dims.slice();
+    }
+    const dec = await decodeFromLatents(finalEmb, finalDims, null, null, modelHz, zeroState(1), zeroState(1));
+    return dec.outAudio.slice(0, totalLen);
+  }
+
+  const outBuf = new Float32Array(totalLen);
+  const wgtBuf = new Float32Array(totalLen);
+  let hDec = zeroState(1), cDec = zeroState(1);
+  let tOff = 0;
+
+  for (let s = 0; s < segTs.length; s++) {
+    if (currentJobId !== jobId) return null;
+    const T = segTs[s];
+
+    const segEmb = new Float32Array(C * T);
+    for (let c = 0; c < C; c++)
+      for (let t = 0; t < T; t++)
+        segEmb[c * T + t] = Enew[c * totalT + tOff + t];
+    const dims = [1, C, T];
+
+    let finalEmb = segEmb, finalDims = dims;
+    if (applyPoint === 'encoder_latents') {
+      const qOut = await sessions.quantEnc.run({ emb: new ort.Tensor('float32', segEmb, dims) });
+      const dOut = await sessions.decCodes.run({ codes: qOut.codes });
+      finalEmb = new Float32Array(dOut.emb.data); finalDims = dOut.emb.dims.slice();
+    }
+
+    const sc = segScales ? segScales[s] : null;
+    const dec = await decodeFromLatents(finalEmb, finalDims, sc?.scale || null, sc?.scaleDims || null, modelHz, hDec, cDec);
+    hDec = dec.hDecNew; cDec = dec.cDecNew;
+
+    if (is48k) {
+      const { offset, validEnd } = segsInfo[s];
+      for (let i = 0; i < validEnd - offset; i++) {
+        outBuf[offset + i] += TRI_WIN_48[i] * dec.outAudio[i];
+        wgtBuf[offset + i] += TRI_WIN_48[i];
+      }
+    } else {
+      const { srcS, srcE, off } = segsInfo[s];
+      for (let i = srcS - off; i < srcE - off; i++) {
+        outBuf[off + i] += win[i] * dec.outAudio[i];
+        wgtBuf[off + i] += win[i];
+      }
+    }
+
+    tOff += T;
+    self.postMessage({ type: 'progress', jobId, value: 0.3 + 0.7 * (s + 1) / segTs.length,
+                       status: `Decoding… ${Math.round((s + 1) / segTs.length * 100)} %` });
+  }
+
+  for (let i = 0; i < totalLen; i++) if (wgtBuf[i] > 0) outBuf[i] /= wgtBuf[i];
+  return outBuf;
+}
+
+// Apply SVD4 component swap and decode.
+async function runApplySVD4(msg) {
+  const { jobId, modelHz, bwKbps, swapMode, direction, strength, compMask, applyPoint } = msg;
+  try {
+    await ensureSessions(modelHz, bwKbps);
+    if (currentJobId !== jobId) return;
+
+    const sv4A = captureCache.A?.svd4, sv4B = captureCache.B?.svd4;
+    if (!sv4A || !sv4B) { self.postMessage({ type: 'error', jobId, message: 'Compute SVD first.' }); return; }
+
+    // A is always recipient, B is always donor.
+    const recip = sv4A;
+    const donor = sv4B;
+    const { U: Ur, S: Sr, Vt: Vtr, E: ER, C, totalT } = recip;
+    const { U: Ud, S: Sd, Vt: Vtd, E: ED, segScales: scalesD } = donor;
+    const { alphaU = 0, alphaS = 0, alphaV = 0 } = msg;
+
+    // Detect pure-endpoint cases — use E directly to avoid SVD round-trip error.
+    const allActive = compMask.every(v => v > 0);
+    const pureA = allActive && alphaU === 0 && alphaS === 0 && alphaV === 0;
+    const pureB = allActive && alphaU === 1 && alphaS === 1 && alphaV === 1;
+
+    self.postMessage({ type: 'progress', jobId, value: 0.05, status: 'Building modified embedding…' });
+
+    const Enew = new Float32Array(C * totalT);
+
+    if (pureA) {
+      Enew.set(ER);
+    } else if (pureB) {
+      Enew.set(ED);
+    } else {
+      for (let t = 0; t < totalT; t++) {
+        for (let c = 0; c < C; c++) {
+          let val = 0;
+          for (let k = 0; k < C; k++) {
+            if (compMask[k]) {
+              const uEff = Ur[c*C+k] + (Ud[c*C+k] - Ur[c*C+k]) * alphaU;
+              const sEff = Sr[k]     + (Sd[k]     - Sr[k])     * alphaS;
+              const vEff = Vtr[k*totalT+t] + (Vtd[k*totalT+t] - Vtr[k*totalT+t]) * alphaV;
+              val += uEff * sEff * vEff;
+            } // inactive k: zeroed out — contributes nothing
+          }
+          Enew[c*totalT+t] = val;
+        }
+      }
+    }
+
+    // Blend per-segment scales (A→B) proportional to how far the sliders lean toward B.
+    const scaleAlpha = pureB ? 1 : (alphaU + alphaS + alphaV) / 3;
+    let effectiveScales = recip.segScales;
+    if (scaleAlpha > 0 && recip.segScales && scalesD) {
+      effectiveScales = recip.segScales.map((rsc, s) => {
+        const dsc = scalesD[s];
+        if (!rsc?.scale || !dsc?.scale) return rsc;
+        const blended = new Float32Array(rsc.scale.length);
+        for (let i = 0; i < blended.length; i++)
+          blended[i] = rsc.scale[i] + (dsc.scale[i] - rsc.scale[i]) * scaleAlpha;
+        return { scale: blended, scaleDims: rsc.scaleDims };
+      });
+    }
+
+    self.postMessage({ type: 'progress', jobId, value: 0.3, status: 'Decoding…' });
+
+    const decoded = await decodeSVD4(Enew, C, totalT, recip, applyPoint, modelHz, jobId, effectiveScales);
+    if (decoded === null) return;
+    self.postMessage({ type: 'result', jobId, decoded }, [decoded.buffer]);
+  } catch (err) {
+    self.postMessage({ type: 'error', jobId, message: err.message });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Joint SVD (Experiment 5)
+// ---------------------------------------------------------------------------
+
+// Compute a single SVD on the horizontally-concatenated embedding matrix [E_A | E_B].
+// This yields a shared basis U and per-source coordinate matrices VtA, VtB.
+function computeJointSVD(cA, cB, applyPoint, totalT, onSweep = null) {
+  const C = getCapEmb(cA[0], applyPoint).dims[1];
+
+  // Build E_A and E_B each of shape [C, totalT].
+  function buildE(caps) {
+    const E = new Float32Array(C * totalT);
+    let tOff = 0;
+    for (let i = 0; i < caps.length && tOff < totalT; i++) {
+      const { emb, dims } = getCapEmb(caps[i], applyPoint);
+      const T = Math.min(dims[2], totalT - tOff);
+      for (let c = 0; c < C; c++)
+        for (let t = 0; t < T; t++)
+          E[c * totalT + tOff + t] = emb[c * dims[2] + t];
+      tOff += T;
+    }
+    return E;
+  }
+
+  const EA = buildE(cA);
+  const EB = buildE(cB);
+  const T2 = totalT * 2; // joint time dimension
+
+  // Second-moment matrix on E_joint = [EA | EB] (shape [C, T2]).
+  // cov[i,j] = (Σ_t EA[i,t]*EA[j,t] + Σ_t EB[i,t]*EB[j,t]) / T2
+  const cov = new Float32Array(C * C);
+  for (let i = 0; i < C; i++) {
+    for (let j = i; j < C; j++) {
+      let s = 0;
+      for (let t = 0; t < totalT; t++) s += EA[i * totalT + t] * EA[j * totalT + t];
+      for (let t = 0; t < totalT; t++) s += EB[i * totalT + t] * EB[j * totalT + t];
+      cov[i*C+j] = cov[j*C+i] = s / T2;
+    }
+  }
+
+  const { eigenvalues, eigenvectors } = symmetricEigen(cov, C, 8, onSweep);
+  const U = eigenvectors; // [C, C] — shared basis
+
+  const S = new Float32Array(C);
+  for (let k = 0; k < C; k++) S[k] = Math.sqrt(Math.max(0, eigenvalues[k]));
+
+  // Project each source onto the shared basis: Vt[k,t] = (U[:,k] · E[:,t]) / S[k]
+  function projectVt(E) {
+    const Vt = new Float32Array(C * totalT);
+    for (let k = 0; k < C; k++) {
+      const sk = Math.max(S[k], 1e-10);
+      for (let t = 0; t < totalT; t++) {
+        let v = 0;
+        for (let c = 0; c < C; c++) v += U[c * C + k] * E[c * totalT + t];
+        Vt[k * totalT + t] = v / sk;
+      }
+    }
+    return Vt;
+  }
+
+  const VtA = projectVt(EA);
+  const VtB = projectVt(EB);
+
+  return { U, S, VtA, VtB, EA, EB, C, totalT };
+}
+
+// Compute joint SVD and store result; posts svd5_ready when done.
+function runComputeSVD5(msg) {
+  try {
+    const { applyPoint = 'encoder_latents' } = msg;
+    const capsA = captureCache.A, capsB = captureCache.B;
+    if (!capsA || !capsB) {
+      self.postMessage({ type: 'svd5_error', message: 'Encode both sources first.' });
+      return;
+    }
+
+    const getCapsArr = caps => {
+      if (caps.mode === 'single') return [caps.cap];
+      if (caps.mode === 'ola48') return caps.segments.map(s => s.cap);
+      return caps.chunks.map(c => c.cap);
+    };
+
+    const cA = getCapsArr(capsA), cB = getCapsArr(capsB);
+    const TA = cA.reduce((s, c) => s + getCapEmb(c, applyPoint).dims[2], 0);
+    const TB = cB.reduce((s, c) => s + getCapEmb(c, applyPoint).dims[2], 0);
+    const totalT = Math.min(TA, TB);
+
+    self.postMessage({ type: 'svd5_progress', message: 'Joint SVD — sweep 0/8', value: 0 });
+    const joint = computeJointSVD(cA, cB, applyPoint, totalT, (sweep, total) =>
+      self.postMessage({ type: 'svd5_progress',
+        message: `Joint SVD — sweep ${sweep}/${total}`,
+        value: sweep / total }));
+
+    self.postMessage({ type: 'svd5_progress', message: 'Building caches…' });
+
+    // Segment layout taken from capsA (A is always the recipient for decoding).
+    const rawTs = cA.map(c => getCapEmb(c, applyPoint).dims[2]);
+    const segTs = [];
+    let rem = totalT;
+    for (const t of rawTs) { if (rem <= 0) break; segTs.push(Math.min(t, rem)); rem -= t; }
+    const n = segTs.length;
+
+    let segsInfo = null, segScales = null;
+    if (capsA.mode === 'ola48') {
+      segsInfo  = capsA.segments.slice(0, n).map(s => ({ offset: s.offset, validEnd: s.validEnd }));
+      segScales = capsA.segments.slice(0, n).map(s => ({ scale: s.cap.scale, scaleDims: s.cap.scaleDims }));
+    } else if (capsA.mode === 'ola24') {
+      segsInfo = capsA.chunks.slice(0, n).map(c => ({ srcS: c.srcS, srcE: c.srcE, off: c.off }));
+    }
+    const totalLen = capsA.mode === 'ola48'
+      ? segsInfo[n - 1].validEnd
+      : capsA.totalLen;
+
+    captureCache.svd5 = {
+      ...joint,
+      segTs, mode: capsA.mode, segsInfo, segScales,
+      win: capsA.win || null, totalLen,
+    };
+
+    const sJoint = joint.S.slice();
+    self.postMessage({ type: 'svd5_ready', sJoint, C: joint.C, totalT },
+      [sJoint.buffer]);
+  } catch (err) {
+    self.postMessage({ type: 'svd5_error', message: 'Joint SVD failed: ' + err.message });
+  }
+}
+
+// Apply interpolation in the shared V space and decode.
+async function runApplySVD5(msg) {
+  const { jobId, modelHz, bwKbps, alphaV = 0, compMask, applyPoint,
+          sMode = 'none', sScale = 1.0, sTilt = 0.0, softWeights = null } = msg;
+  try {
+    await ensureSessions(modelHz, bwKbps);
+    if (currentJobId !== jobId) return;
+
+    const sv5 = captureCache.svd5;
+    if (!sv5) { self.postMessage({ type: 'error', jobId, message: 'Compute joint SVD first.' }); return; }
+
+    const { U, S, VtA, VtB, EA, EB, C, totalT } = sv5;
+
+    // Compute effective S weight per component.
+    const Seff = new Float32Array(C);
+    for (let k = 0; k < C; k++) {
+      let w;
+      if (sMode === 'soft') {
+        w = softWeights ? softWeights[k] : (compMask[k] ? 1 : 0);
+      } else {
+        w = compMask[k] ? 1 : 0;
+        if (sMode === 'scale') w *= sScale;
+        else if (sMode === 'tilt') w *= Math.exp(-sTilt * k / Math.max(C - 1, 1));
+      }
+      Seff[k] = S[k] * w;
+    }
+
+    const allActive = compMask.every(v => v > 0);
+    const pureA = sMode === 'none' && allActive && alphaV === 0;
+    const pureB = sMode === 'none' && allActive && alphaV === 1;
+
+    self.postMessage({ type: 'progress', jobId, value: 0.05, status: 'Building modified embedding…' });
+
+    const Enew = new Float32Array(C * totalT);
+
+    if (pureA) {
+      Enew.set(EA);
+    } else if (pureB) {
+      Enew.set(EB);
+    } else {
+      for (let t = 0; t < totalT; t++) {
+        for (let c = 0; c < C; c++) {
+          let val = 0;
+          for (let k = 0; k < C; k++) {
+            if (Seff[k] !== 0) {
+              const vEff = VtA[k * totalT + t] + (VtB[k * totalT + t] - VtA[k * totalT + t]) * alphaV;
+              val += U[c * C + k] * Seff[k] * vEff;
+            }
+          }
+          Enew[c * totalT + t] = val;
+        }
+      }
+    }
+
+    // Blend per-segment scales proportional to alphaV.
+    const scalesA = sv5.segScales;
+    const scalesB = captureCache.B?.mode === 'ola48'
+      ? captureCache.B.segments?.map(s => ({ scale: s.cap.scale, scaleDims: s.cap.scaleDims }))
+      : null;
+    let effectiveScales = scalesA;
+    if (alphaV > 0 && scalesA && scalesB) {
+      effectiveScales = scalesA.map((rsc, s) => {
+        const dsc = scalesB[s];
+        if (!rsc?.scale || !dsc?.scale) return rsc;
+        const blended = new Float32Array(rsc.scale.length);
+        for (let i = 0; i < blended.length; i++)
+          blended[i] = rsc.scale[i] + (dsc.scale[i] - rsc.scale[i]) * alphaV;
+        return { scale: blended, scaleDims: rsc.scaleDims };
+      });
+    }
+
+    self.postMessage({ type: 'progress', jobId, value: 0.3, status: 'Decoding…' });
+
+    const decoded = await decodeSVD4(Enew, C, totalT, sv5, applyPoint, modelHz, jobId, effectiveScales);
+    if (decoded === null) return;
+    self.postMessage({ type: 'result', jobId, decoded }, [decoded.buffer]);
+  } catch (err) {
+    self.postMessage({ type: 'error', jobId, message: err.message });
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Message dispatcher
 // ---------------------------------------------------------------------------
 
@@ -1429,7 +1889,7 @@ self.onmessage = (e) => {
       runJob(msg);
       break;
     case 'encode':
-      // Experiment2/3: encode one source, cache captures, return decoded audio
+      // Experiment2/3/4: encode one source, cache captures, return decoded audio
       currentJobId = msg.jobId;
       runEncode(msg);
       break;
@@ -1446,6 +1906,24 @@ self.onmessage = (e) => {
     case 'get_emb_deltas':
       // Experiment3: return B embedding frame deltas for visualization (does not cancel jobs)
       runGetEmbDeltas(msg);
+      break;
+    case 'compute_svd4':
+      // Experiment4: compute per-source SVD and store in cache (synchronous)
+      runComputeSVD4(msg);
+      break;
+    case 'apply_svd4':
+      // Experiment4: apply SVD component swap and decode
+      currentJobId = msg.jobId;
+      runApplySVD4(msg);
+      break;
+    case 'compute_svd5':
+      // Experiment5: compute joint SVD on concatenated A+B embeddings
+      runComputeSVD5(msg);
+      break;
+    case 'apply_svd5':
+      // Experiment5: interpolate in shared V space and decode
+      currentJobId = msg.jobId;
+      runApplySVD5(msg);
       break;
     case 'cancel':
       currentJobId = -1;
