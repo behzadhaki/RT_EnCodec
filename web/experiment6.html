@@ -104,6 +104,9 @@
         <label>Level</label>
         <select id="levelSelect"></select>
       </div>
+      <span style="flex:1"></span>
+      <button class="tog active" id="togExplore">Explore</button>
+      <button class="tog"        id="togDraw">Draw Path</button>
     </div>
 
     <div id="umapWrap">
@@ -175,6 +178,36 @@ const levelWrap    = document.getElementById('levelWrap');
 const levelSelect  = document.getElementById('levelSelect');
 const nNeighborsEl = document.getElementById('nNeighbors');
 const minDistEl    = document.getElementById('minDist');
+const togExplore   = document.getElementById('togExplore');
+const togDraw      = document.getElementById('togDraw');
+
+const trajSection = document.createElement('div');
+trajSection.className = 'section';
+trajSection.innerHTML = `
+  <div class="section-title">Trajectory</div>
+  <div class="row">
+    <span class="lbl">Duration</span>
+    <input type="number" id="trajDuration" value="4" min="0.5" max="30" step="0.5">
+    <span style="font-size:11px;color:var(--muted);margin-left:2px">s</span>
+  </div>
+  <div class="row" style="gap:5px;margin-top:2px">
+    <button class="tog" id="clearTraj" style="flex:1">Clear</button>
+    <button class="tog" id="playTraj"  style="flex:1">Play</button>
+    <button class="tog" id="loopTraj"  style="flex:1">Loop</button>
+  </div>
+`.trim();
+controls.appendChild(trajSection);
+
+const trajDurationEl = document.getElementById('trajDuration');
+document.getElementById('clearTraj').addEventListener('click', () => {
+  userTrajectory = []; rawDrawPoints = []; trajAnchorPos = -1; trajAudioBuf = null;
+  renderScatter(); setStatus('Trajectory cleared.');
+});
+document.getElementById('playTraj').addEventListener('click', playTrajectory);
+document.getElementById('loopTraj').addEventListener('click', () => {
+  trajLooping = !trajLooping;
+  document.getElementById('loopTraj').classList.toggle('active', trajLooping);
+});
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
@@ -197,6 +230,17 @@ let audioCtx         = null;
 let playJobId        = -1;
 let lastTransform    = null;
 let selectedPoint    = null; // { src, idx }
+let canvasMode       = 'explore'; // 'explore' | 'draw'
+let userTrajectory   = [];        // [[umapX, umapY], …] resampled path
+let rawDrawPoints    = [];
+let isDrawing        = false;
+let trajAnchorPos    = -1;        // 0..1 during playback, -1 = off
+let trajPlayStartTime = null;
+let trajAudioBuf      = null;      // cached AudioBuffer for loop
+let trajLooping       = false;
+let isShiftDragging   = false;
+let shiftDragStart    = null;     // [umapX, umapY] at drag start
+let shiftDragBaseTraj = null;     // trajectory snapshot at drag start
 const dpr = devicePixelRatio || 1;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -272,6 +316,17 @@ function onWorkerMsg(e) {
     return;
   }
 
+  if (msg.type === 'trajectory_audio_exp6') {
+    if (msg.jobId === playJobId && audioCtx) {
+      const sr  = mp.getSampleRate();
+      const buf = audioCtx.createBuffer(1, msg.decoded.length, sr);
+      buf.copyToChannel(msg.decoded, 0);
+      trajAudioBuf = buf;
+      startTrajPlayback(buf, sr);
+    }
+    return;
+  }
+
   if (msg.jobId !== undefined && msg.jobId !== activeJobId) return;
 
   if (msg.type === 'progress') {
@@ -289,7 +344,7 @@ function onWorkerMsg(e) {
     }
 
   } else if (msg.type === 'embeddings_exp6') {
-    currentEmbeds = msg;
+    currentEmbeds = msg; // includes scalesA / scalesB (Float32Array or null)
     populateLevelSelect(msg.codesDimsA[1]);
     triggerUMAP();
 
@@ -558,22 +613,166 @@ function renderScatter() {
       ctx.restore();
     }
   }
+
+  // ── Trajectory overlay ────────────────────────────────────────────────────
+  if (userTrajectory.length >= 2) {
+    ctx.save();
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth   = 2 * dpr;
+    ctx.globalAlpha = 0.75;
+    ctx.setLineDash([4 * dpr, 3 * dpr]);
+    ctx.beginPath();
+    ctx.moveTo(toX(userTrajectory[0][0]), toY(userTrajectory[0][1]));
+    for (let i = 1; i < userTrajectory.length; i++)
+      ctx.lineTo(toX(userTrajectory[i][0]), toY(userTrajectory[i][1]));
+    ctx.stroke();
+
+    // start/end markers
+    ctx.setLineDash([]);
+    ctx.globalAlpha = 1;
+    ctx.fillStyle   = '#44ff88';
+    ctx.beginPath();
+    ctx.arc(toX(userTrajectory[0][0]), toY(userTrajectory[0][1]), 4 * dpr, 0, 2 * Math.PI);
+    ctx.fill();
+    ctx.fillStyle = '#ff4466';
+    ctx.beginPath();
+    ctx.arc(toX(userTrajectory[userTrajectory.length-1][0]), toY(userTrajectory[userTrajectory.length-1][1]), 4 * dpr, 0, 2 * Math.PI);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // ── Moving anchor ─────────────────────────────────────────────────────────
+  if (trajAnchorPos >= 0 && userTrajectory.length >= 2) {
+    const ti  = trajAnchorPos * (userTrajectory.length - 1);
+    const lo  = Math.floor(ti), hi = Math.min(lo + 1, userTrajectory.length - 1);
+    const t   = ti - lo;
+    const ax  = userTrajectory[lo][0] + t * (userTrajectory[hi][0] - userTrajectory[lo][0]);
+    const ay  = userTrajectory[lo][1] + t * (userTrajectory[hi][1] - userTrajectory[lo][1]);
+    ctx.save();
+    ctx.fillStyle   = '#ffd700';
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth   = 1.5 * dpr;
+    ctx.beginPath();
+    ctx.arc(toX(ax), toY(ay), 6 * dpr, 0, 2 * Math.PI);
+    ctx.fill();
+    ctx.stroke();
+    ctx.restore();
+  }
 }
 
-// ── Click to play ─────────────────────────────────────────────────────────────
+// ── Mode toggles ──────────────────────────────────────────────────────────────
+
+togExplore.addEventListener('click', () => {
+  canvasMode = 'explore';
+  togExplore.classList.add('active'); togDraw.classList.remove('active');
+  umapCanvas.style.cursor = 'crosshair';
+});
+
+togDraw.addEventListener('click', () => {
+  canvasMode = 'draw';
+  togDraw.classList.add('active'); togExplore.classList.remove('active');
+  umapCanvas.style.cursor = 'crosshair';
+  setStatus('Click and drag on the UMAP to draw a trajectory.');
+});
+
+// ── Canvas helpers ────────────────────────────────────────────────────────────
+
+function canvasToUmap(e) {
+  const { xMin, yMin, scale, offX, offY, H } = lastTransform;
+  const rect  = umapCanvas.getBoundingClientRect();
+  const physX = (e.clientX - rect.left) * dpr;
+  const physY = (e.clientY - rect.top)  * dpr;
+  return [(physX - offX) / scale + xMin, (H - physY - offY) / scale + yMin];
+}
+
+function resamplePath(pts, maxN) {
+  if (pts.length < 2) return pts.slice();
+  const arcLen = [0];
+  for (let i = 1; i < pts.length; i++) {
+    const dx = pts[i][0] - pts[i-1][0], dy = pts[i][1] - pts[i-1][1];
+    arcLen.push(arcLen[i-1] + Math.sqrt(dx*dx + dy*dy));
+  }
+  const total = arcLen[arcLen.length - 1];
+  if (total < 1e-12) return [pts[0].slice()];
+  const N = Math.min(maxN, pts.length);
+  const out = [];
+  for (let i = 0; i < N; i++) {
+    const tgt = total * i / (N - 1);
+    let lo = 0, hi = pts.length - 1;
+    while (lo < hi - 1) { const mid = (lo + hi) >> 1; if (arcLen[mid] <= tgt) lo = mid; else hi = mid; }
+    if (arcLen[hi] === arcLen[lo]) { out.push(pts[lo].slice()); continue; }
+    const t = (tgt - arcLen[lo]) / (arcLen[hi] - arcLen[lo]);
+    out.push([pts[lo][0] + t * (pts[hi][0] - pts[lo][0]), pts[lo][1] + t * (pts[hi][1] - pts[lo][1])]);
+  }
+  return out;
+}
+
+// ── Freehand drawing ──────────────────────────────────────────────────────────
 
 umapCanvas.style.cursor = 'crosshair';
 
+umapCanvas.addEventListener('mousedown', e => {
+  if (!lastTransform) return;
+  if (e.shiftKey && userTrajectory.length >= 2) {
+    isShiftDragging   = true;
+    shiftDragStart    = canvasToUmap(e);
+    shiftDragBaseTraj = userTrajectory.map(p => [p[0], p[1]]);
+    umapCanvas.style.cursor = 'move';
+    return;
+  }
+  if (canvasMode !== 'draw') return;
+  isDrawing = true;
+  rawDrawPoints = [canvasToUmap(e)];
+  userTrajectory = rawDrawPoints.slice();
+  trajAnchorPos = -1;
+  renderScatter();
+});
+
+umapCanvas.addEventListener('mousemove', e => {
+  if (isShiftDragging) {
+    const [cx, cy] = canvasToUmap(e);
+    const dx = cx - shiftDragStart[0], dy = cy - shiftDragStart[1];
+    userTrajectory = shiftDragBaseTraj.map(([x, y]) => [x + dx, y + dy]);
+    renderScatter();
+    return;
+  }
+  if (!isDrawing) return;
+  const pt = canvasToUmap(e);
+  const last = rawDrawPoints[rawDrawPoints.length - 1];
+  const dx = (pt[0] - last[0]) * lastTransform.scale;
+  const dy = (pt[1] - last[1]) * lastTransform.scale;
+  if (dx*dx + dy*dy < (2 * dpr) ** 2) return;
+  rawDrawPoints.push(pt);
+  userTrajectory = rawDrawPoints;
+  renderScatter();
+});
+
+const finishShiftDrag = () => {
+  if (!isShiftDragging) return;
+  isShiftDragging = false; shiftDragStart = null; shiftDragBaseTraj = null;
+  umapCanvas.style.cursor = 'crosshair';
+  autoRegenerate();
+};
+
+const finishDraw = () => {
+  if (!isDrawing) return;
+  isDrawing = false;
+  userTrajectory = rawDrawPoints.length >= 2 ? resamplePath(rawDrawPoints, 300) : [];
+  renderScatter();
+  if (userTrajectory.length >= 2) autoRegenerate();
+};
+
+umapCanvas.addEventListener('mouseup', e    => { finishShiftDrag(); finishDraw(); });
+umapCanvas.addEventListener('mouseleave', e => { finishShiftDrag(); finishDraw(); });
+
+// ── Click to play (explore mode) ──────────────────────────────────────────────
+
 umapCanvas.addEventListener('click', async e => {
+  if (canvasMode !== 'explore') return;
   if (!coordsA || !coordsB || !lastTransform || !currentEmbeds) return;
   if (encodePhase !== null) return;
 
-  const { xMin, yMin, scale, offX, offY, H } = lastTransform;
-  const rect  = umapCanvas.getBoundingClientRect();
-  const physX = (e.clientX - rect.left)  * dpr;
-  const physY = (e.clientY - rect.top)   * dpr;
-  const umapX = (physX - offX) / scale + xMin;
-  const umapY = (H - physY - offY) / scale + yMin;
+  const [umapX, umapY] = canvasToUmap(e);
 
   let bestDist = Infinity, bestSrc = null, bestIdx = -1;
   for (let i = 0; i < coordsA.length; i++) {
@@ -605,6 +804,115 @@ umapCanvas.addEventListener('click', async e => {
     modelHz: mp.getModelHz(), bwKbps: mp.getBwKbps(),
   });
 });
+
+// ── Trajectory playback ───────────────────────────────────────────────────────
+
+function startTrajPlayback(buf, sr) {
+  const src = audioCtx.createBufferSource();
+  src.buffer = buf;
+  src.connect(audioCtx.destination);
+  trajPlayStartTime = audioCtx.currentTime;
+  src.start();
+  requestAnimationFrame(animateTrajAnchor);
+  setStatus(`Playing trajectory (${(buf.length / sr).toFixed(1)} s)${trajLooping ? ' — looping' : ''}…`);
+}
+
+function animateTrajAnchor() {
+  if (!trajPlayStartTime || !audioCtx) return;
+  const elapsed  = audioCtx.currentTime - trajPlayStartTime;
+  const duration = parseFloat(trajDurationEl.value) || 4;
+  trajAnchorPos  = Math.min(elapsed / duration, 1);
+  renderScatter();
+  if (trajAnchorPos < 1) {
+    requestAnimationFrame(animateTrajAnchor);
+  } else if (trajLooping && trajAudioBuf) {
+    startTrajPlayback(trajAudioBuf, mp.getSampleRate());
+  } else {
+    trajAnchorPos     = -1;
+    trajPlayStartTime = null;
+    renderScatter();
+    setStatus('Trajectory playback done.');
+  }
+}
+
+function autoRegenerate() {
+  if (userTrajectory.length < 2 || !currentEmbeds || !coordsA || !coordsB) {
+    if (userTrajectory.length >= 2) setStatus('Path drawn. Encode sources and run UMAP to play.');
+    return;
+  }
+  trajPlayStartTime = null; // stop any running animation loop
+  playTrajectory();
+}
+
+async function playTrajectory() {
+  if (!userTrajectory || userTrajectory.length < 2) { setStatus('Draw a trajectory first.', true); return; }
+  if (!currentEmbeds)                                { setStatus('Encode both sources first.', true); return; }
+  if (!coordsA || !coordsB)                          { setStatus('Run UMAP first.', true); return; }
+
+  const duration     = parseFloat(trajDurationEl.value) || 4;
+  const framesPerSec = coordsA.length / srcWidget.getDuration();
+  const N            = Math.max(2, Math.round(duration * framesPerSec));
+
+  const [, D, T_A] = currentEmbeds.embQuantDimsA;
+  const [, , T_B]  = currentEmbeds.embQuantDimsB;
+
+  const getFrame = (src, idx) => {
+    const emb = src === 'A' ? currentEmbeds.embQuantA : currentEmbeds.embQuantB;
+    const T   = src === 'A' ? T_A : T_B;
+    const f   = new Float32Array(D);
+    for (let d = 0; d < D; d++) f[d] = emb[d * T + idx];
+    return f;
+  };
+
+  const blended = new Float32Array(D * N);
+  let scaleAcc = 0;
+
+  for (let i = 0; i < N; i++) {
+    const frac = i / (N - 1);
+    const ti   = frac * (userTrajectory.length - 1);
+    const lo   = Math.floor(ti), hi = Math.min(lo + 1, userTrajectory.length - 1);
+    const t    = ti - lo;
+    const px   = userTrajectory[lo][0] + t * (userTrajectory[hi][0] - userTrajectory[lo][0]);
+    const py   = userTrajectory[lo][1] + t * (userTrajectory[hi][1] - userTrajectory[lo][1]);
+
+    let d1 = Infinity, d2 = Infinity;
+    let src1 = null, idx1 = -1, src2 = null, idx2 = -1;
+    for (let j = 0; j < coordsA.length; j++) {
+      const d = (coordsA[j][0] - px) ** 2 + (coordsA[j][1] - py) ** 2;
+      if (d < d1) { d2=d1; src2=src1; idx2=idx1; d1=d; src1='A'; idx1=j; }
+      else if (d < d2) { d2=d; src2='A'; idx2=j; }
+    }
+    for (let j = 0; j < coordsB.length; j++) {
+      const d = (coordsB[j][0] - px) ** 2 + (coordsB[j][1] - py) ** 2;
+      if (d < d1) { d2=d1; src2=src1; idx2=idx1; d1=d; src1='B'; idx1=j; }
+      else if (d < d2) { d2=d; src2='B'; idx2=j; }
+    }
+
+    const f1  = getFrame(src1, idx1);
+    const f2  = idx2 >= 0 ? getFrame(src2, idx2) : f1;
+    const sd1 = Math.sqrt(d1), sd2 = idx2 >= 0 ? Math.sqrt(d2) : 0;
+    const sum = sd1 + sd2;
+    const w1  = sum > 1e-12 ? sd2 / sum : 1;
+    const w2  = 1 - w1;
+    for (let d = 0; d < D; d++) blended[d * N + i] = w1 * f1[d] + w2 * f2[d];
+    const getScale = (src, idx) => {
+      const arr = src === 'A' ? currentEmbeds.scalesA : currentEmbeds.scalesB;
+      return arr ? (arr[idx] || 1) : 1;
+    };
+    scaleAcc += w1 * getScale(src1, idx1) + w2 * (idx2 >= 0 ? getScale(src2, idx2) : getScale(src1, idx1));
+  }
+
+  if (!audioCtx) audioCtx = new AudioContext();
+  playJobId = ++jobSeq;
+  setStatus(`Decoding ${N} frames (${duration} s)…`);
+
+  worker.postMessage({
+    type: 'decode_trajectory_exp6', jobId: playJobId,
+    embQuant: blended, dims: [1, D, N],
+    meanScale: scaleAcc / N,
+    modelHz: mp.getModelHz(), bwKbps: mp.getBwKbps(),
+  }, [blended.buffer]);
+}
 </script>
 </body>
 </html>

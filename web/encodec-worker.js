@@ -1930,6 +1930,26 @@ function flattenCaps(caps) {
            codes, codesType: first.codesType, codesDims: [1, K, totalT] };
 }
 
+// Return a Float32Array(T) of per-frame scale scalars for 48k sources,
+// or null for 24k (where scale is not used).
+function flattenScales(caps) {
+  let capList;
+  if (caps.mode === 'single')     capList = [caps.cap];
+  else if (caps.mode === 'ola24') capList = caps.chunks.map(c => c.cap);
+  else                            capList = caps.segments.map(s => s.cap);
+  if (!capList[0].scale) return null; // 24k has no scale
+  const totalT = capList.reduce((s, c) => s + Number(c.codesDims[2]), 0);
+  const out = new Float32Array(totalT);
+  let tOff = 0;
+  for (const cap of capList) {
+    const T_i = Number(cap.codesDims[2]);
+    // cap.scale is [1,1,1] — treat the first element as the segment scalar
+    out.fill(cap.scale[0], tOff, tOff + T_i);
+    tOff += T_i;
+  }
+  return out;
+}
+
 // Return the per-segment cap that contains flattened frame index `frameIdx`.
 // Used to retrieve the 48k scale for the relevant segment.
 function getCapForFrame(caps, frameIdx) {
@@ -1987,6 +2007,61 @@ async function runPlayFrameExp6(msg) {
     self.postMessage({ type: 'frame_audio_exp6', jobId, decoded }, [decoded.buffer]);
   } catch (err) {
     self.postMessage({ type: 'error', jobId, message: 'Frame decode: ' + err.message });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Experiment6: decode a blended trajectory embedding sequence
+// ---------------------------------------------------------------------------
+
+async function runDecodeTrajectoryExp6(msg) {
+  const { jobId, embQuant, dims, modelHz, bwKbps } = msg;
+  try {
+    await ensureSessions(modelHz, bwKbps);
+
+    const [, D, N] = dims;
+    let decoded;
+
+    if (modelHz === '48k') {
+      // 48k decoder expects at most SEG_48/HOP_48 = 150 frames per call (same as OLA path).
+      // Pull scale from captureCache using the same lookup as runPlayFrameExp6 — this gives
+      // the correct tensor shape straight from the ONNX encoder output.
+      const caps    = captureCache.A || captureCache.B;
+      const refCap  = !caps           ? null
+                    : caps.mode === 'single'  ? caps.cap
+                    : caps.mode === 'ola24'   ? caps.chunks[0].cap
+                    :                           caps.segments[0].cap;
+      const scale     = refCap?.scale     ? refCap.scale.slice()                           : new Float32Array([1.0]);
+      const scaleDims = refCap?.scaleDims ? [...refCap.scaleDims].map(Number)              : [1, 1, 1];
+
+      const CHUNK_T  = SEG_48 / HOP_48;  // 150
+      const outParts = [];
+      let hDec = zeroState(1), cDec = zeroState(1);
+
+      for (let t = 0; t < N; t += CHUNK_T) {
+        const chunk_T  = Math.min(CHUNK_T, N - t);
+        const chunkEmb = new Float32Array(D * chunk_T);
+        for (let d = 0; d < D; d++)
+          for (let i = 0; i < chunk_T; i++)
+            chunkEmb[d * chunk_T + i] = embQuant[d * N + t + i];
+
+        const res = await decodeFromLatents(chunkEmb, [1, D, chunk_T], scale, scaleDims, modelHz, hDec, cDec);
+        hDec = res.hDecNew; cDec = res.cDecNew;
+        outParts.push(res.outAudio);
+      }
+
+      const totalSamples = outParts.reduce((s, p) => s + p.length, 0);
+      decoded = new Float32Array(totalSamples);
+      let off = 0;
+      for (const p of outParts) { decoded.set(p, off); off += p.length; }
+    } else {
+      const res = await decodeFromLatents(embQuant, dims, null, null, modelHz, zeroState(1), zeroState(1));
+      decoded = new Float32Array(res.outAudio);
+    }
+
+    self.postMessage({ type: 'trajectory_audio_exp6', jobId, decoded }, [decoded.buffer]);
+  } catch (err) {
+    self.postMessage({ type: 'error', jobId, message: 'Trajectory decode: ' + err.message });
   }
 }
 
@@ -2071,6 +2146,12 @@ self.onmessage = (e) => {
         const embQuantB = flatB.emb_quant.slice();
         const codesA    = codesToInt32(flatA.codes, flatA.codesType);
         const codesB    = codesToInt32(flatB.codes, flatB.codesType);
+        const scalesA   = flattenScales(capsA); // Float32Array(T_A) or null
+        const scalesB   = flattenScales(capsB); // Float32Array(T_B) or null
+
+        const transfers = [embQuantA.buffer, embQuantB.buffer, codesA.buffer, codesB.buffer];
+        if (scalesA) transfers.push(scalesA.buffer);
+        if (scalesB) transfers.push(scalesB.buffer);
 
         self.postMessage({
           type:      'embeddings_exp6',
@@ -2079,7 +2160,8 @@ self.onmessage = (e) => {
           embQuantB, embQuantDimsB: toNumDims(flatB.embQuantDims),
           codesA,    codesDimsA:   toNumDims(flatA.codesDims),
           codesB,    codesDimsB:   toNumDims(flatB.codesDims),
-        }, [embQuantA.buffer, embQuantB.buffer, codesA.buffer, codesB.buffer]);
+          scalesA,   scalesB,
+        }, transfers);
       } catch (err) {
         self.postMessage({ type: 'error', jobId: msg.jobId, message: 'Embedding extract: ' + err.message });
       }
@@ -2087,6 +2169,9 @@ self.onmessage = (e) => {
     }
     case 'play_frame_exp6':
       runPlayFrameExp6(msg);
+      break;
+    case 'decode_trajectory_exp6':
+      runDecodeTrajectoryExp6(msg);
       break;
     case 'cancel':
       currentJobId = -1;
