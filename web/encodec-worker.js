@@ -1608,12 +1608,15 @@ async function runApplySVD4(msg) {
     const donor = sv4B;
     const { U: Ur, S: Sr, Vt: Vtr, E: ER, C, totalT } = recip;
     const { U: Ud, S: Sd, Vt: Vtd, E: ED, segScales: scalesD } = donor;
-    const { alphaU = 0, alphaS = 0, alphaV = 0 } = msg;
+    const { mode = 'usv', alphaU = 0, alphaS = 0, alphaV = 0, alphaUS = 0 } = msg;
+    const isUSV = mode === 'us_v';
 
     // Detect pure-endpoint cases — use E directly to avoid SVD round-trip error.
     const allActive = compMask.every(v => v > 0);
-    const pureA = allActive && alphaU === 0 && alphaS === 0 && alphaV === 0;
-    const pureB = allActive && alphaU === 1 && alphaS === 1 && alphaV === 1;
+    const pureA = allActive && (isUSV ? alphaUS === 0 && alphaV === 0
+                                      : alphaU  === 0 && alphaS === 0 && alphaV === 0);
+    const pureB = allActive && (isUSV ? alphaUS === 1 && alphaV === 1
+                                      : alphaU  === 1 && alphaS === 1 && alphaV === 1);
 
     self.postMessage({ type: 'progress', jobId, value: 0.05, status: 'Building modified embedding…' });
 
@@ -1623,6 +1626,22 @@ async function runApplySVD4(msg) {
       Enew.set(ER);
     } else if (pureB) {
       Enew.set(ED);
+    } else if (isUSV) {
+      for (let t = 0; t < totalT; t++) {
+        for (let c = 0; c < C; c++) {
+          let val = 0;
+          for (let k = 0; k < C; k++) {
+            if (compMask[k]) {
+              const usA  = Ur[c*C+k] * Sr[k];
+              const usB  = Ud[c*C+k] * Sd[k];
+              const usEff = usA + (usB - usA) * alphaUS;
+              const vEff  = Vtr[k*totalT+t] + (Vtd[k*totalT+t] - Vtr[k*totalT+t]) * alphaV;
+              val += usEff * vEff;
+            }
+          }
+          Enew[c*totalT+t] = val;
+        }
+      }
     } else {
       for (let t = 0; t < totalT; t++) {
         for (let c = 0; c < C; c++) {
@@ -1633,15 +1652,16 @@ async function runApplySVD4(msg) {
               const sEff = Sr[k]     + (Sd[k]     - Sr[k])     * alphaS;
               const vEff = Vtr[k*totalT+t] + (Vtd[k*totalT+t] - Vtr[k*totalT+t]) * alphaV;
               val += uEff * sEff * vEff;
-            } // inactive k: zeroed out — contributes nothing
+            }
           }
           Enew[c*totalT+t] = val;
         }
       }
     }
 
-    // Blend per-segment scales (A→B) proportional to how far the sliders lean toward B.
-    const scaleAlpha = pureB ? 1 : (alphaU + alphaS + alphaV) / 3;
+    // Blend per-segment scales proportional to how far the sliders lean toward B.
+    const scaleAlpha = pureB ? 1 : (isUSV ? (alphaUS + alphaV) / 2
+                                           : (alphaU + alphaS + alphaV) / 3);
     let effectiveScales = recip.segScales;
     if (scaleAlpha > 0 && recip.segScales && scalesD) {
       effectiveScales = recip.segScales.map((rsc, s) => {
@@ -1873,6 +1893,104 @@ async function runApplySVD5(msg) {
 }
 
 // ---------------------------------------------------------------------------
+// Experiment6 helpers — shared by get_embeddings_exp6 and runPlayFrameExp6
+// ---------------------------------------------------------------------------
+
+// Flatten all segment caps into one concatenated cap along T.
+function flattenCaps(caps) {
+  const toN = d => Number(d);
+  let capList;
+  if (caps.mode === 'single')     capList = [caps.cap];
+  else if (caps.mode === 'ola24') capList = caps.chunks.map(c => c.cap);
+  else                            capList = caps.segments.map(s => s.cap); // ola48
+
+  if (capList.length === 1) return capList[0];
+
+  const first  = capList[0];
+  const D      = toN(first.embQuantDims[1]);
+  const K      = toN(first.codesDims[1]);
+  const totalT = capList.reduce((s, c) => s + toN(c.codesDims[2]), 0);
+
+  const emb_quant = new Float32Array(D * totalT);
+  const codes = first.codesType === 'int64'
+    ? new BigInt64Array(K * totalT) : new Int32Array(K * totalT);
+
+  let tOff = 0;
+  for (const cap of capList) {
+    const T_i = toN(cap.codesDims[2]);
+    for (let d = 0; d < D; d++)
+      for (let t = 0; t < T_i; t++)
+        emb_quant[d * totalT + tOff + t] = cap.emb_quant[d * T_i + t];
+    for (let k = 0; k < K; k++)
+      for (let t = 0; t < T_i; t++)
+        codes[k * totalT + tOff + t] = cap.codes[k * T_i + t];
+    tOff += T_i;
+  }
+  return { emb_quant, embQuantDims: [1, D, totalT],
+           codes, codesType: first.codesType, codesDims: [1, K, totalT] };
+}
+
+// Return the per-segment cap that contains flattened frame index `frameIdx`.
+// Used to retrieve the 48k scale for the relevant segment.
+function getCapForFrame(caps, frameIdx) {
+  if (caps.mode === 'single') return caps.cap;
+  const chunks = caps.mode === 'ola24' ? caps.chunks : caps.segments;
+  let cum = 0;
+  for (const chunk of chunks) {
+    const T_i = Number(chunk.cap.codesDims[2]);
+    if (frameIdx < cum + T_i) return chunk.cap;
+    cum += T_i;
+  }
+  return chunks[chunks.length - 1].cap;
+}
+
+// ---------------------------------------------------------------------------
+// Experiment6: decode a context window around a clicked frame
+// ---------------------------------------------------------------------------
+
+async function runPlayFrameExp6(msg) {
+  const { jobId, source, startFrame, endFrame, bestIdx, modelHz, bwKbps } = msg;
+  try {
+    await ensureSessions(modelHz, bwKbps);
+
+    const caps = captureCache[source];
+    if (!caps) throw new Error('No capture for source ' + source);
+
+    const flat    = flattenCaps(caps);
+    const K       = Number(flat.codesDims[1]);
+    const T       = Number(flat.codesDims[2]);
+    const nFrames = endFrame - startFrame;
+
+    // Extract window and convert to BigInt64 (decode_codes expects int64)
+    const codes64 = new BigInt64Array(K * nFrames);
+    for (let k = 0; k < K; k++)
+      for (let t = 0; t < nFrames; t++) {
+        const v = flat.codes[k * T + startFrame + t];
+        codes64[k * nFrames + t] = typeof v === 'bigint' ? v : BigInt(v);
+      }
+
+    const codesTensor = new ort.Tensor('int64', codes64, [1, K, nFrames]);
+    const decOut  = await sessions.decCodes.run({ codes: codesTensor });
+    const emb     = new Float32Array(decOut.emb.data);
+    const dims    = [...decOut.emb.dims].map(Number);
+
+    // For 48k, retrieve scale from the segment containing the clicked frame.
+    let scale = null, scaleDims = null;
+    if (modelHz === '48k') {
+      const segCap = getCapForFrame(caps, bestIdx);
+      scale     = segCap.scale;
+      scaleDims = segCap.scaleDims ? [...segCap.scaleDims].map(Number) : null;
+    }
+
+    const result  = await decodeFromLatents(emb, dims, scale, scaleDims, modelHz, zeroState(1), zeroState(1));
+    const decoded = result.outAudio;
+    self.postMessage({ type: 'frame_audio_exp6', jobId, decoded }, [decoded.buffer]);
+  } catch (err) {
+    self.postMessage({ type: 'error', jobId, message: 'Frame decode: ' + err.message });
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Message dispatcher
 // ---------------------------------------------------------------------------
 
@@ -1924,6 +2042,51 @@ self.onmessage = (e) => {
       // Experiment5: interpolate in shared V space and decode
       currentJobId = msg.jobId;
       runApplySVD5(msg);
+      break;
+    case 'get_embeddings_exp6': {
+      // Experiment6: return quantized embeddings + codes for both sources.
+      // captureCache entries are wrapped structs (mode: single/ola24/ola48);
+      // flatten across all segments before sending.
+      const capsA = captureCache.A, capsB = captureCache.B;
+      if (!capsA || !capsB) {
+        self.postMessage({ type: 'error', jobId: msg.jobId, message: 'Encode both sources first.' });
+        break;
+      }
+
+      try {
+        const flatA = flattenCaps(capsA);
+        const flatB = flattenCaps(capsB);
+
+        function toNumDims(dims) { return [...dims].map(d => Number(d)); }
+        function codesToInt32(codes, type) {
+          if (type === 'int64') {
+            const out = new Int32Array(codes.length);
+            for (let i = 0; i < codes.length; i++) out[i] = Number(codes[i]);
+            return out;
+          }
+          return new Int32Array(codes);
+        }
+
+        const embQuantA = flatA.emb_quant.slice();
+        const embQuantB = flatB.emb_quant.slice();
+        const codesA    = codesToInt32(flatA.codes, flatA.codesType);
+        const codesB    = codesToInt32(flatB.codes, flatB.codesType);
+
+        self.postMessage({
+          type:      'embeddings_exp6',
+          jobId:     msg.jobId,
+          embQuantA, embQuantDimsA: toNumDims(flatA.embQuantDims),
+          embQuantB, embQuantDimsB: toNumDims(flatB.embQuantDims),
+          codesA,    codesDimsA:   toNumDims(flatA.codesDims),
+          codesB,    codesDimsB:   toNumDims(flatB.codesDims),
+        }, [embQuantA.buffer, embQuantB.buffer, codesA.buffer, codesB.buffer]);
+      } catch (err) {
+        self.postMessage({ type: 'error', jobId: msg.jobId, message: 'Embedding extract: ' + err.message });
+      }
+      break;
+    }
+    case 'play_frame_exp6':
+      runPlayFrameExp6(msg);
       break;
     case 'cancel':
       currentJobId = -1;

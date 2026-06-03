@@ -1,0 +1,610 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Exp 6 — Codebook UMAP</title>
+<link rel="stylesheet" href="encodec.css">
+<style>
+:root { --lbl-w: 5.5em; }
+#frame { grid-template-columns: 210px 1fr; }
+
+#vizArea {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--bg);
+}
+
+#modeBar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+#levelWrap {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-left: 6px;
+}
+
+#levelWrap label { font-size: 11px; color: var(--muted); }
+
+#levelSelect {
+  font-size: 11px;
+  background: #1c1c1c;
+  border: 1px solid var(--border2);
+  color: var(--text);
+  padding: 2px 4px;
+  border-radius: 3px;
+}
+
+#umapWrap {
+  flex: 1;
+  position: relative;
+  overflow: hidden;
+}
+
+#umapCanvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+
+#legendBar {
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  padding: 4px 10px;
+  border-top: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+#legendBar span { font-size: 11px; color: var(--muted); }
+.ldot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 3px; vertical-align: middle; }
+
+#statusWrap {
+  padding: 4px 10px;
+  border-top: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+#statusBar { font-size: 11px; color: var(--muted); }
+
+#progressWrap {
+  height: 3px;
+  background: var(--surface);
+  border-radius: 2px;
+  margin-top: 3px;
+  display: none;
+}
+
+#progressBar {
+  height: 100%;
+  width: 0%;
+  background: var(--accent);
+  border-radius: 2px;
+  transition: width 0.08s;
+}
+</style>
+</head>
+<body>
+<div id="frame">
+  <div id="controls"></div>
+
+  <div id="vizArea">
+    <div id="modeBar">
+      <button class="tog active" id="togCombined">Combined</button>
+      <button class="tog"        id="togPerLevel">Per level</button>
+      <div id="levelWrap" style="display:none">
+        <label>Level</label>
+        <select id="levelSelect"></select>
+      </div>
+    </div>
+
+    <div id="umapWrap">
+      <canvas id="umapCanvas"></canvas>
+    </div>
+
+    <div id="legendBar">
+      <span><span class="ldot" style="background:#c87800"></span>Source A</span>
+      <span><span class="ldot" style="background:#2090c0"></span>Source B</span>
+    </div>
+
+    <div id="statusWrap">
+      <span id="statusBar">Encode both sources to compute UMAP.</span>
+      <div id="progressWrap"><div id="progressBar"></div></div>
+    </div>
+  </div>
+</div>
+
+<script type="module">
+'use strict';
+
+import { createDoubleSourceWidget } from './lib/double-source-widget.js';
+import { createModelPanel }         from './lib/model-panel.js';
+
+const MODELS_BASE = new URL('../serialization/encodec_onnx_exports', location.href).href;
+
+// ── Controls ──────────────────────────────────────────────────────────────────
+
+const controls = document.getElementById('controls');
+
+const srcWidget = createDoubleSourceWidget({
+  defaultDur: 4,
+  onChange: delay => scheduleEncode(delay),
+});
+controls.appendChild(srcWidget.element);
+const { panelA, panelB } = srcWidget;
+
+const mp = createModelPanel({
+  defaultModel: '24k',
+  onChange: () => { currentEmbeds = null; scheduleEncode(0); },
+});
+controls.appendChild(mp.modelSection);
+controls.appendChild(mp.modeSection);
+
+const umapSection = document.createElement('div');
+umapSection.className = 'section';
+umapSection.innerHTML = `
+  <div class="section-title">UMAP</div>
+  <div class="row">
+    <span class="lbl">Neighbors</span>
+    <input type="number" id="nNeighbors" value="15" min="3" max="100" step="1">
+  </div>
+  <div class="row">
+    <span class="lbl">Min dist</span>
+    <input type="number" id="minDist" value="0.1" min="0.0" max="0.99" step="0.05">
+  </div>
+`.trim();
+controls.appendChild(umapSection);
+
+// ── DOM refs ──────────────────────────────────────────────────────────────────
+
+const umapCanvas   = document.getElementById('umapCanvas');
+const statusBar    = document.getElementById('statusBar');
+const progWrap     = document.getElementById('progressWrap');
+const progBar      = document.getElementById('progressBar');
+const togCombined  = document.getElementById('togCombined');
+const togPerLevel  = document.getElementById('togPerLevel');
+const levelWrap    = document.getElementById('levelWrap');
+const levelSelect  = document.getElementById('levelSelect');
+const nNeighborsEl = document.getElementById('nNeighbors');
+const minDistEl    = document.getElementById('minDist');
+
+// ── State ─────────────────────────────────────────────────────────────────────
+
+let worker        = null;
+let jobSeq        = 0;
+let activeJobId   = -1;
+let encodePhase   = null;
+let pendingAudioB = null;
+let currentEmbeds = null;
+let codebooks     = null;
+let codebooksFor  = null;
+let umapMode      = 'combined';
+let umapLevel     = 0;
+let coordsA       = null;
+let coordsB       = null;
+let encodeTimer      = null;
+let umapWorker       = null;
+let activeUMAPJobId  = -1;
+let audioCtx         = null;
+let playJobId        = -1;
+let lastTransform    = null;
+let selectedPoint    = null; // { src, idx }
+const dpr = devicePixelRatio || 1;
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+function setStatus(msg, isError = false) {
+  statusBar.textContent = msg;
+  statusBar.style.color = isError ? '#f66' : '';
+}
+
+// ── Canvas resize ─────────────────────────────────────────────────────────────
+
+function resizeCanvas() {
+  const wrap = umapCanvas.parentElement;
+  const W = wrap.clientWidth, H = wrap.clientHeight;
+  umapCanvas.width  = W * dpr;
+  umapCanvas.height = H * dpr;
+  renderScatter();
+}
+new ResizeObserver(resizeCanvas).observe(umapCanvas.parentElement);
+
+// ── Workers ───────────────────────────────────────────────────────────────────
+
+function initWorker() {
+  if (worker) worker.terminate();
+  worker = new Worker('encodec-worker.js?v=' + Date.now());
+  worker.postMessage({ type: 'init', modelsBaseUrl: MODELS_BASE });
+  worker.onmessage = onWorkerMsg;
+}
+
+function initUMAPWorker() {
+  if (umapWorker) umapWorker.terminate();
+  umapWorker = new Worker(new URL('./umap-worker.js', import.meta.url), { type: 'module' });
+  umapWorker.onmessage = onUMAPWorkerMsg;
+}
+
+function onUMAPWorkerMsg({ data: msg }) {
+  if (msg.jobId !== activeUMAPJobId) return;
+
+  if (msg.type === 'umap_progress') {
+    const pct = Math.round(msg.epoch / msg.nEpochs * 100);
+    progBar.style.width = pct + '%';
+    setStatus(`UMAP — epoch ${msg.epoch} / ${msg.nEpochs}`);
+
+  } else if (msg.type === 'umap_result') {
+    const { result, T_A, T_B } = msg;
+    coordsA = [];
+    coordsB = [];
+    for (let i = 0; i < T_A; i++) coordsA.push([result[i * 2], result[i * 2 + 1]]);
+    for (let i = 0; i < T_B; i++) coordsB.push([result[(T_A + i) * 2], result[(T_A + i) * 2 + 1]]);
+    progWrap.style.display = 'none';
+    setStatus(`Done — ${T_A} frames (A) · ${T_B} frames (B)`);
+    renderScatter();
+
+  } else if (msg.type === 'umap_error') {
+    progWrap.style.display = 'none';
+    setStatus(msg.message, true);
+  }
+}
+
+function onWorkerMsg(e) {
+  const msg = e.data;
+
+  if (msg.type === 'frame_audio_exp6') {
+    if (msg.jobId === playJobId && audioCtx) {
+      const buf = audioCtx.createBuffer(1, msg.decoded.length, mp.getSampleRate());
+      buf.copyToChannel(msg.decoded, 0);
+      const src = audioCtx.createBufferSource();
+      src.buffer = buf;
+      src.connect(audioCtx.destination);
+      src.start();
+      setStatus(`Playing frame ${selectedPoint?.idx} (${selectedPoint?.src})…`);
+    }
+    return;
+  }
+
+  if (msg.jobId !== undefined && msg.jobId !== activeJobId) return;
+
+  if (msg.type === 'progress') {
+    progBar.style.width = Math.round((msg.value ?? 0) * 100) + '%';
+    if (msg.status) setStatus(msg.status);
+
+  } else if (msg.type === 'result') {
+    if (encodePhase === 'A') {
+      startEncodeB();
+    } else if (encodePhase === 'B') {
+      encodePhase = null;
+      progBar.style.width = '100%';
+      setStatus('Fetching embeddings…');
+      worker.postMessage({ type: 'get_embeddings_exp6', jobId: activeJobId });
+    }
+
+  } else if (msg.type === 'embeddings_exp6') {
+    currentEmbeds = msg;
+    populateLevelSelect(msg.codesDimsA[1]);
+    triggerUMAP();
+
+  } else if (msg.type === 'error') {
+    progWrap.style.display = 'none';
+    setStatus(msg.message, true);
+  }
+}
+
+// ── Encode ────────────────────────────────────────────────────────────────────
+
+function scheduleEncode(delay = 0) {
+  clearTimeout(encodeTimer);
+  encodeTimer = setTimeout(startEncode, delay);
+}
+
+async function startEncode() {
+  if (!worker) initWorker();
+
+  const sr       = mp.getSampleRate();
+  const finalLen = Math.round(srcWidget.getDuration() * sr);
+
+  let audioA, audioB;
+  try {
+    setStatus('Loading A…');
+    audioA = await srcWidget.buildAudio(panelA, finalLen, sr);
+    setStatus('Loading B…');
+    audioB = await srcWidget.buildAudio(panelB, finalLen, sr);
+  } catch (err) { setStatus(err.message, true); return; }
+
+  coordsA = coordsB = null;
+  renderScatter();
+
+  pendingAudioB = audioB;
+  encodePhase   = 'A';
+  activeJobId   = ++jobSeq;
+
+  progWrap.style.display = 'block';
+  progBar.style.width    = '0%';
+  setStatus('Encoding A…');
+
+  worker.postMessage({
+    type:      'encode', source: 'A', jobId: activeJobId,
+    audio:     audioA.slice(),
+    modelHz:   mp.getModelHz(),
+    bwKbps:    mp.getBwKbps(),
+    streaming: mp.isStreaming(),
+    frameSize: mp.getFrameSize(),
+  });
+}
+
+function startEncodeB() {
+  encodePhase = 'B';
+  setStatus('Encoding B…');
+  worker.postMessage({
+    type:      'encode', source: 'B', jobId: activeJobId,
+    audio:     pendingAudioB.slice(),
+    modelHz:   mp.getModelHz(),
+    bwKbps:    mp.getBwKbps(),
+    streaming: mp.isStreaming(),
+    frameSize: mp.getFrameSize(),
+  });
+  pendingAudioB = null;
+}
+
+// ── Level selector ────────────────────────────────────────────────────────────
+
+function populateLevelSelect(K) {
+  levelSelect.innerHTML = '';
+  for (let k = 0; k < K; k++) {
+    const opt = document.createElement('option');
+    opt.value = k;
+    opt.textContent = `Level ${k + 1}`;
+    levelSelect.appendChild(opt);
+  }
+  umapLevel = 0;
+}
+
+levelSelect.addEventListener('change', () => {
+  umapLevel = parseInt(levelSelect.value);
+  triggerUMAP();
+});
+
+// ── Mode toggle ───────────────────────────────────────────────────────────────
+
+togCombined.addEventListener('click', () => {
+  if (umapMode === 'combined') return;
+  umapMode = 'combined';
+  togCombined.classList.add('active');
+  togPerLevel.classList.remove('active');
+  levelWrap.style.display = 'none';
+  triggerUMAP();
+});
+
+togPerLevel.addEventListener('click', () => {
+  if (umapMode === 'per_level') return;
+  umapMode = 'per_level';
+  togPerLevel.classList.add('active');
+  togCombined.classList.remove('active');
+  levelWrap.style.display = '';
+  triggerUMAP();
+});
+
+[nNeighborsEl, minDistEl].forEach(el => el.addEventListener('change', triggerUMAP));
+
+// ── Codebook loading ──────────────────────────────────────────────────────────
+
+async function ensureCodebooks() {
+  const modelHz = mp.getModelHz();
+  if (codebooks && codebooksFor === modelHz) return codebooks;
+  setStatus('Loading codebooks…');
+  const base = `${MODELS_BASE}/${modelHz}`;
+  const [binRes, jsonRes] = await Promise.all([
+    fetch(`${base}/codebooks.bin`),
+    fetch(`${base}/codebooks.json`),
+  ]);
+  if (!binRes.ok || !jsonRes.ok) throw new Error('Could not load codebooks for ' + modelHz);
+  const meta = await jsonRes.json();
+  const buf  = await binRes.arrayBuffer();
+  codebooks    = { data: new Float32Array(buf), n_q: meta.n_q, vocab_size: meta.vocab_size, dim: meta.dim };
+  codebooksFor = modelHz;
+  return codebooks;
+}
+
+// ── Frame extraction ──────────────────────────────────────────────────────────
+
+// emb_quant layout: [1, D, T] flattened → index [d, t] = embQuant[d*T + t]
+function embQuantToFrames(embQuant, dims) {
+  const [, D, T] = dims;
+  const frames = [];
+  for (let t = 0; t < T; t++) {
+    const f = new Float32Array(D);
+    for (let d = 0; d < D; d++) f[d] = embQuant[d * T + t];
+    frames.push(f);
+  }
+  return frames;
+}
+
+// codes layout: [1, K, T] flattened → index [k, t] = codes[k*T + t]
+function codebookLookupFrames(cb, codes, dims, level) {
+  const [, , T] = dims;
+  const { data, vocab_size, dim } = cb;
+  const frames = [];
+  for (let t = 0; t < T; t++) {
+    const idx = codes[level * T + t];
+    const off = level * vocab_size * dim + idx * dim;
+    frames.push(data.slice(off, off + dim));
+  }
+  return frames;
+}
+
+// ── UMAP ──────────────────────────────────────────────────────────────────────
+
+function triggerUMAP() {
+  if (!currentEmbeds) return;
+  runUMAP().catch(err => setStatus(err.message, true));
+}
+
+async function runUMAP() {
+  if (!currentEmbeds) return;
+
+  let framesA, framesB;
+  if (umapMode === 'combined') {
+    framesA = embQuantToFrames(currentEmbeds.embQuantA, currentEmbeds.embQuantDimsA);
+    framesB = embQuantToFrames(currentEmbeds.embQuantB, currentEmbeds.embQuantDimsB);
+  } else {
+    const cb = await ensureCodebooks();
+    framesA = codebookLookupFrames(cb, currentEmbeds.codesA, currentEmbeds.codesDimsA, umapLevel);
+    framesB = codebookLookupFrames(cb, currentEmbeds.codesB, currentEmbeds.codesDimsB, umapLevel);
+  }
+
+  const T_A = framesA.length;
+  const T_B = framesB.length;
+  const D   = framesA[0].length;
+
+  // Pack into a single transferable flat Float32Array
+  const flat = new Float32Array((T_A + T_B) * D);
+  framesA.forEach((f, i) => flat.set(f, i * D));
+  framesB.forEach((f, i) => flat.set(f, (T_A + i) * D));
+
+  const nNeighbors = Math.min(
+    Math.max(2, parseInt(nNeighborsEl.value) || 15),
+    Math.max(2, Math.floor((T_A + T_B) / 3))
+  );
+  const minDist = parseFloat(minDistEl.value) || 0.1;
+
+  if (!umapWorker) initUMAPWorker();
+  activeUMAPJobId = ++jobSeq;
+
+  progWrap.style.display = 'block';
+  progBar.style.width = '0%';
+  setStatus(`UMAP — starting… (${T_A + T_B} frames)`);
+
+  umapWorker.postMessage(
+    { type: 'compute_umap', jobId: activeUMAPJobId, flat, T_A, T_B, D, nNeighbors, minDist },
+    [flat.buffer]
+  );
+}
+
+// ── Scatter plot ──────────────────────────────────────────────────────────────
+
+function renderScatter() {
+  const ctx = umapCanvas.getContext('2d');
+  const W = umapCanvas.width, H = umapCanvas.height;
+  ctx.clearRect(0, 0, W, H);
+  if (!coordsA || !coordsB || !W || !H) return;
+
+  // Compute bounds across all points
+  let xMin = Infinity, xMax = -Infinity, yMin = Infinity, yMax = -Infinity;
+  for (const [x, y] of [...coordsA, ...coordsB]) {
+    if (x < xMin) xMin = x; if (x > xMax) xMax = x;
+    if (y < yMin) yMin = y; if (y > yMax) yMax = y;
+  }
+
+  const pad   = 28 * dpr;
+  const rangeX = xMax - xMin || 1;
+  const rangeY = yMax - yMin || 1;
+  const scale  = Math.min((W - 2 * pad) / rangeX, (H - 2 * pad) / rangeY);
+  const offX   = (W - rangeX * scale) / 2;
+  const offY   = (H - rangeY * scale) / 2;
+  const toX    = x => offX + (x - xMin) * scale;
+  const toY    = y => H - offY - (y - yMin) * scale;
+
+  lastTransform = { xMin, yMin, scale, offX, offY, H };
+
+  function drawTrail(coords, color) {
+    if (coords.length < 2) return;
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.lineWidth   = 0.8 * dpr;
+    ctx.globalAlpha = 0.18;
+    ctx.beginPath();
+    ctx.moveTo(toX(coords[0][0]), toY(coords[0][1]));
+    for (let i = 1; i < coords.length; i++) {
+      ctx.lineTo(toX(coords[i][0]), toY(coords[i][1]));
+    }
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawDots(coords, color) {
+    const r = 2.5 * dpr;
+    ctx.fillStyle = color;
+    for (const [x, y] of coords) {
+      ctx.beginPath();
+      ctx.arc(toX(x), toY(y), r, 0, 2 * Math.PI);
+      ctx.fill();
+    }
+  }
+
+  drawTrail(coordsA, '#c87800');
+  drawTrail(coordsB, '#2090c0');
+  drawDots(coordsA, '#c87800');
+  drawDots(coordsB, '#2090c0');
+
+  if (selectedPoint) {
+    const coords = selectedPoint.src === 'A' ? coordsA : coordsB;
+    const pt = coords[selectedPoint.idx];
+    if (pt) {
+      ctx.save();
+      ctx.strokeStyle = '#fff';
+      ctx.lineWidth   = 1.5 * dpr;
+      ctx.beginPath();
+      ctx.arc(toX(pt[0]), toY(pt[1]), 6 * dpr, 0, 2 * Math.PI);
+      ctx.stroke();
+      ctx.restore();
+    }
+  }
+}
+
+// ── Click to play ─────────────────────────────────────────────────────────────
+
+umapCanvas.style.cursor = 'crosshair';
+
+umapCanvas.addEventListener('click', async e => {
+  if (!coordsA || !coordsB || !lastTransform || !currentEmbeds) return;
+  if (encodePhase !== null) return;
+
+  const { xMin, yMin, scale, offX, offY, H } = lastTransform;
+  const rect  = umapCanvas.getBoundingClientRect();
+  const physX = (e.clientX - rect.left)  * dpr;
+  const physY = (e.clientY - rect.top)   * dpr;
+  const umapX = (physX - offX) / scale + xMin;
+  const umapY = (H - physY - offY) / scale + yMin;
+
+  let bestDist = Infinity, bestSrc = null, bestIdx = -1;
+  for (let i = 0; i < coordsA.length; i++) {
+    const d = (coordsA[i][0] - umapX) ** 2 + (coordsA[i][1] - umapY) ** 2;
+    if (d < bestDist) { bestDist = d; bestSrc = 'A'; bestIdx = i; }
+  }
+  for (let i = 0; i < coordsB.length; i++) {
+    const d = (coordsB[i][0] - umapX) ** 2 + (coordsB[i][1] - umapY) ** 2;
+    if (d < bestDist) { bestDist = d; bestSrc = 'B'; bestIdx = i; }
+  }
+  if (bestIdx < 0) return;
+
+  selectedPoint = { src: bestSrc, idx: bestIdx };
+  renderScatter();
+
+  const T = bestSrc === 'A' ? currentEmbeds.codesDimsA[2] : currentEmbeds.codesDimsB[2];
+  const framesPerSec = (bestSrc === 'A' ? coordsA.length : coordsB.length) / srcWidget.getDuration();
+  const half       = Math.max(1, Math.round(framesPerSec * 0.5));
+  const startFrame = Math.max(0, bestIdx - half);
+  const endFrame   = Math.min(T, bestIdx + half);
+
+  if (!audioCtx) audioCtx = new AudioContext();
+
+  playJobId = ++jobSeq;
+  setStatus(`Decoding frame ${bestIdx} (${bestSrc})…`);
+  worker.postMessage({
+    type: 'play_frame_exp6', jobId: playJobId,
+    source: bestSrc, bestIdx, startFrame, endFrame,
+    modelHz: mp.getModelHz(), bwKbps: mp.getBwKbps(),
+  });
+});
+</script>
+</body>
+</html>

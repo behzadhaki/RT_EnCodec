@@ -151,19 +151,30 @@
     </div>
 
     <div id="swapCtrlPanel">
-      <div class="swap-row" style="flex:1; min-width:120px" title="Blend basis directions: A=0, B=1. Shift+drag moves all sliders.">
+      <div class="toggle-row" id="svd4ModeRow" style="margin-bottom:5px">
+        <button class="tog active" id="togModeUSV">U · S · V</button>
+        <button class="tog"        id="togModeUS_V">US · V</button>
+      </div>
+      <div class="swap-row" id="rowU" style="flex:1; min-width:120px" title="Blend basis directions: A=0, B=1. Shift+drag moves all sliders.">
         <span class="swap-lbl">U</span>
         <span class="sl-ep">A</span>
         <input type="range" class="alpha-sl" id="sliderU" min="0" max="100" value="0" step="1">
         <span class="sl-ep">B</span>
         <span class="swap-val" id="displayU">0.00</span>
       </div>
-      <div class="swap-row" style="flex:1; min-width:120px" title="Blend singular values: A=0, B=1. Shift+drag moves all sliders.">
+      <div class="swap-row" id="rowS" style="flex:1; min-width:120px" title="Blend singular values: A=0, B=1. Shift+drag moves all sliders.">
         <span class="swap-lbl">S</span>
         <span class="sl-ep">A</span>
         <input type="range" class="alpha-sl" id="sliderS" min="0" max="100" value="0" step="1">
         <span class="sl-ep">B</span>
         <span class="swap-val" id="displayS">0.00</span>
+      </div>
+      <div class="swap-row" id="rowUS" style="display:none; flex:1; min-width:120px" title="Blend U·S (scaled directions): A=0, B=1. Shift+drag moves all sliders.">
+        <span class="swap-lbl">U·S</span>
+        <span class="sl-ep">A</span>
+        <input type="range" class="alpha-sl" id="sliderUS" min="0" max="100" value="0" step="1">
+        <span class="sl-ep">B</span>
+        <span class="swap-val" id="displayUS">0.00</span>
       </div>
       <div class="swap-row" style="flex:1; min-width:120px" title="Blend temporal patterns: A=0, B=1. Shift+drag moves all sliders.">
         <span class="swap-lbl">V</span>
@@ -236,7 +247,8 @@ let offA  = null, offB  = null, offMod  = null;
 
 let currentView  = 'A';
 let applyPoint   = 'encoder_latents';
-let alphaU = 0, alphaS = 0, alphaV = 0;
+let alphaU = 0, alphaS = 0, alphaV = 0, alphaUS = 0;
+let svd4Mode = 'usv'; // 'usv' = U·S·V separate | 'us_v' = US combined + V
 let sA = null, sB = null;         // Float32Array — singular values
 let compMask = null;              // Uint8Array(C) — shared component on/off
 let svd4Ready    = false;
@@ -279,6 +291,9 @@ const actOvl         = $('activationOverlay');
 const sliderU = $('sliderU'), displayU = $('displayU');
 const sliderS = $('sliderS'), displayS = $('displayS');
 const sliderV = $('sliderV'), displayV = $('displayV');
+const sliderUS = $('sliderUS'), displayUS = $('displayUS');
+const rowU = $('rowU'), rowS = $('rowS'), rowUS = $('rowUS');
+const togModeUSV = $('togModeUSV'), togModeUS_V = $('togModeUS_V');
 const screeCvsA      = $('screeCvsA');
 const screeCvsB      = $('screeCvsB');
 const screeCountA    = $('screeCountA');
@@ -492,25 +507,40 @@ function updateMathPanel() {
     `<div class="mkey">SVD on raw embeddings (no mean centering) &nbsp;&middot;&nbsp; inactive k: zeroed out</div>`;
 }
 
-const SLIDERS = [
-  { sl: sliderU, disp: displayU, key: 'U' },
-  { sl: sliderS, disp: displayS, key: 'S' },
-  { sl: sliderV, disp: displayV, key: 'V' },
+const SLIDERS_USV  = [
+  { sl: sliderU,  disp: displayU,  key: 'U'  },
+  { sl: sliderS,  disp: displayS,  key: 'S'  },
+  { sl: sliderV,  disp: displayV,  key: 'V'  },
+];
+const SLIDERS_US_V = [
+  { sl: sliderUS, disp: displayUS, key: 'US' },
+  { sl: sliderV,  disp: displayV,  key: 'V'  },
 ];
 
-function setAlpha(key, v) {
-  if (key === 'U') alphaU = v;
-  if (key === 'S') alphaS = v;
-  if (key === 'V') alphaV = v;
+function activeSliders() {
+  return svd4Mode === 'us_v' ? SLIDERS_US_V : SLIDERS_USV;
 }
 
-SLIDERS.forEach(({ sl, disp, key }) => {
+function setAlpha(key, v) {
+  if (key === 'U')  alphaU  = v;
+  if (key === 'S')  alphaS  = v;
+  if (key === 'V')  alphaV  = v;
+  if (key === 'US') alphaUS = v;
+}
+
+function resetSliders() {
+  alphaU = alphaS = alphaV = alphaUS = 0;
+  [...SLIDERS_USV, { sl: sliderUS, disp: displayUS }].forEach(({ sl, disp }) => {
+    sl.value = 0; disp.textContent = '0.00';
+  });
+}
+
+[...SLIDERS_USV, { sl: sliderUS, disp: displayUS, key: 'US' }].forEach(({ sl, disp, key }) => {
   sl.addEventListener('input', () => {
     const v = parseInt(sl.value) / 100;
     if (shiftHeld) {
-      // Move all sliders to the same value
-      alphaU = alphaS = alphaV = v;
-      SLIDERS.forEach(s => {
+      activeSliders().forEach(s => {
+        setAlpha(s.key, v);
         s.sl.value = sl.value;
         s.disp.textContent = v.toFixed(2);
       });
@@ -520,6 +550,30 @@ SLIDERS.forEach(({ sl, disp, key }) => {
     }
   });
   sl.addEventListener('change', scheduleApply);
+});
+
+togModeUSV.addEventListener('click', () => {
+  if (svd4Mode === 'usv') return;
+  svd4Mode = 'usv';
+  togModeUSV.classList.add('active');
+  togModeUS_V.classList.remove('active');
+  rowU.style.display = '';
+  rowS.style.display = '';
+  rowUS.style.display = 'none';
+  resetSliders();
+  scheduleApply();
+});
+
+togModeUS_V.addEventListener('click', () => {
+  if (svd4Mode === 'us_v') return;
+  svd4Mode = 'us_v';
+  togModeUS_V.classList.add('active');
+  togModeUSV.classList.remove('active');
+  rowU.style.display = 'none';
+  rowS.style.display = 'none';
+  rowUS.style.display = '';
+  resetSliders();
+  scheduleApply();
 });
 
 document.querySelectorAll('.ipt-label').forEach(lbl => {
@@ -623,7 +677,9 @@ function onWorkerMsg(e) {
       progWrap.style.display = 'none';
       if (currentView === 'mod') startSpecFade(prevOff, offMod, 'mod');
       else setView('mod');
-      setStatus(`Done. U=${alphaU.toFixed(2)}  S=${alphaS.toFixed(2)}  V=${alphaV.toFixed(2)}`);
+      setStatus(svd4Mode === 'us_v'
+        ? `Done. US=${alphaUS.toFixed(2)}  V=${alphaV.toFixed(2)}`
+        : `Done. U=${alphaU.toFixed(2)}  S=${alphaS.toFixed(2)}  V=${alphaV.toFixed(2)}`);
     }
 
   } else if (msg.type === 'error') {
@@ -715,15 +771,24 @@ function triggerApply() {
   progWrap.style.display = 'block';
   progBar.style.width = '0%';
   setStatus('Applying…');
-  worker.postMessage({
+  const applyMsg = {
     type:      'apply_svd4',
     jobId:     activeJobId,
     modelHz:   mp.getModelHz(),
     bwKbps:    mp.getBwKbps(),
-    alphaU, alphaS, alphaV,
     compMask:  compMask.slice(),
     applyPoint,
-  });
+  };
+  if (svd4Mode === 'us_v') {
+    applyMsg.mode = 'us_v';
+    applyMsg.alphaUS = alphaUS;
+    applyMsg.alphaV  = alphaV;
+  } else {
+    applyMsg.alphaU = alphaU;
+    applyMsg.alphaS = alphaS;
+    applyMsg.alphaV = alphaV;
+  }
+  worker.postMessage(applyMsg);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
