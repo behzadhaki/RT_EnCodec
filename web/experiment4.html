@@ -316,13 +316,13 @@ const panelB = createSourcePanel({
 controls.appendChild(panelB.element);
 
 const durSection = document.createElement('div');
-durSection.className = 'ctrl-section';
+durSection.className = 'section';
 durSection.innerHTML = `
-  <div class="section-label">DURATION</div>
-  <div class="ctrl-row">
-    <span class="ctrl-lbl">Target</span>
-    <input type="number" min="0.5" max="${MAX_S}" step="0.5" value="4" style="width:48px">
-    <span class="ctrl-unit">s</span>
+  <div class="section-title">Duration</div>
+  <div class="row">
+    <span class="lbl">Target</span>
+    <input type="number" min="0.5" max="${MAX_S}" step="0.5" value="4">
+    <span class="unit">s</span>
   </div>`;
 controls.appendChild(durSection);
 const durEl = durSection.querySelector('input');
