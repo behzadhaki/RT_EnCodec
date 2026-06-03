@@ -78,6 +78,8 @@ const { panelA, panelB } = srcWidget;
 | `buildAudio(panel, finalLen, sr)` | `async` — generates or loads audio, trims/loops to `finalLen` samples, then applies volume and gate. Returns `Float32Array`. |
 | `buildBothAudios(finalLen, sr)` | `async` convenience — calls `buildAudio` for both panels sequentially. Returns `{ audioA, audioB }`. |
 
+A **Swap A / B** button is rendered between the two panels. Clicking it swaps all source state (type, file, freq, volume, gate) and fires `onChange(0)`.
+
 **Example**
 
 ```js

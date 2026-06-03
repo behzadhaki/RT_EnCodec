@@ -54,13 +54,25 @@ export function createDoubleSourceWidget({
     showVol: true, showGate: true, showSilence: true,
     onChange, onFilePicked,
   });
-  el.appendChild(panelA.element);
 
   const panelB = createSourcePanel({
     title: 'Source B', defaultFreq: defaultFreqB,
     showVol: true, showGate: true, showSilence: true,
     onChange, onFilePicked,
   });
+
+  const swapSection = document.createElement('div');
+  swapSection.className = 'section';
+  swapSection.innerHTML = `<button class="tog" style="width:100%">⇅ Swap A / B</button>`;
+  swapSection.querySelector('button').addEventListener('click', () => {
+    const stateA = panelA.getState();
+    panelA.setState(panelB.getState());
+    panelB.setState(stateA);
+    onChange(0);
+  });
+
+  el.appendChild(panelA.element);
+  el.appendChild(swapSection);
   el.appendChild(panelB.element);
 
   durInput.addEventListener('input', () => onChange(500));

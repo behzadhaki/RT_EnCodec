@@ -24,6 +24,8 @@
  *   isGateEnabled()
  *   getGateFreq() — gate repetition rate (Hz)
  *   getGateDecay()— gate decay (ms)
+ *   getState()    — snapshot of all panel state (for swap / copy)
+ *   setState(s)   — restore a snapshot; updates UI and visibility
  *   setEnabled(bool) — enable/disable all controls
  */
 export function createSourcePanel({
@@ -144,6 +146,35 @@ export function createSourcePanel({
     isGateEnabled: () => gateEnabled,
     getGateFreq:   () => gateFreqEl ? (parseFloat(gateFreqEl.value) || 4)  : 4,
     getGateDecay:  () => gateDecEl  ? (parseFloat(gateDecEl.value)  || 0)  : 0,
+    getState() {
+      return {
+        type: typeEl.value,
+        freq: parseFloat(freqEl.value) || 440,
+        file: currentFile,
+        fileName: currentFile ? fileBtnEl.textContent : null,
+        volume: volEl ? parseFloat(volEl.value) : 1,
+        gateEnabled,
+        gateFreq: gateFreqEl ? (parseFloat(gateFreqEl.value) || 4) : 4,
+        gateDecay: gateDecEl  ? (parseFloat(gateDecEl.value)  || 0) : 0,
+      };
+    },
+    setState(s) {
+      typeEl.value = s.type;
+      freqEl.value = s.freq;
+      currentFile = s.file;
+      fileBtnEl.textContent = s.fileName || 'choose file…';
+      if (volEl) volEl.value = s.volume;
+      if (gateTogEl) {
+        gateEnabled = s.gateEnabled;
+        gateTogEl.textContent = gateEnabled ? 'On' : 'Off';
+        gateTogEl.classList.toggle('active', gateEnabled);
+        gateRateRow.style.display = gateEnabled ? '' : 'none';
+        gateDecRow.style.display  = gateEnabled ? '' : 'none';
+      }
+      if (gateFreqEl) gateFreqEl.value = s.gateFreq;
+      if (gateDecEl)  gateDecEl.value  = s.gateDecay;
+      updateVisibility();
+    },
     setEnabled(on) {
       [typeEl, freqEl, fileInputEl, volEl, gateTogEl, gateFreqEl, gateDecEl]
         .filter(Boolean).forEach(el => { el.disabled = !on; });
