@@ -8,14 +8,7 @@
 <style>
 :root { --lbl-w: 5.2em; }
 #frame { grid-template-columns: 210px 1fr; }
-#runBtn {
-  width: 100%; margin-top: 0.7em; padding: 5px;
-  background: var(--accent-lo); border: 1px solid var(--accent);
-  color: var(--text); border-radius: 3px; font-size: 13px;
-  font-weight: 600; cursor: pointer;
-}
-#runBtn:hover { filter: brightness(1.2); }
-#runBtn:disabled { opacity: 0.4; cursor: default; filter: none; }
+
 </style>
 </head>
 <body>
@@ -60,9 +53,9 @@
 <script type="module">
 'use strict';
 
-import { createSourcePanel } from './lib/source-panel.js';
+import { createSingleSourceWidget } from './lib/single-source-widget.js';
 import { createModelPanel   } from './lib/model-panel.js';
-import { generateSource, loadFile, normalizePeak, MAX_S } from './lib/audio-utils.js';
+import { normalizePeak } from './lib/audio-utils.js';
 import { computeSTFT, stftToOffscreen, drawStrip, PLASMA, HOT } from './lib/stft.js';
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -77,36 +70,14 @@ const MODELS_BASE = new URL('../serialization/encodec_onnx_exports', location.hr
 
 const controls = document.getElementById('controls');
 
-// Source section
-const srcPanel = createSourcePanel({ title: 'Source', defaultFreq: 440, showVol: true, showGate: true, showSilence: true });
-controls.appendChild(srcPanel.element);
-
-// Duration section (experiment-local: appears inside Source in original, now separate)
-const durSection = document.createElement('div');
-durSection.className = 'section';
-durSection.innerHTML = `
-  <div class="section-title">Duration</div>
-  <div class="row">
-    <span class="lbl">Duration</span>
-    <input type="number" id="dur" value="2" min="0.1" max="10" step="0.1">
-    <span class="unit">s</span>
-  </div>
-`.trim();
-controls.appendChild(durSection);
-const durInput = durSection.querySelector('#dur');
+const srcWidget = createSingleSourceWidget({ defaultFreq: 440, onChange: delay => scheduleEncode(delay) });
+controls.appendChild(srcWidget.element);
+const srcPanel = srcWidget.panel;
 
 // Model + Mode sections
-const mp = createModelPanel({ onChange: () => { updateNotePanel(); } });
+const mp = createModelPanel({ onChange: () => { updateNotePanel(); scheduleEncode(0); } });
 controls.appendChild(mp.modelSection);
 controls.appendChild(mp.modeSection);
-
-// Run-button section
-const runSection = document.createElement('div');
-runSection.className = 'section';
-runSection.innerHTML = `<button id="runBtn" disabled>Run EnCodec</button>`;
-controls.appendChild(runSection);
-const runBtn = runSection.querySelector('#runBtn');
-runBtn.disabled = false;
 
 // ═══════════════════════════════════════════════════════════════════════
 // State
@@ -153,7 +124,7 @@ const lgDec     = $('lgDec');
 // ═══════════════════════════════════════════════════════════════════════
 
 function ensureAudioCtx() {
-  if (!audioCtx) { audioCtx = new AudioContext(); actOvl.style.display = 'none'; }
+  if (!audioCtx) { audioCtx = new AudioContext(); actOvl.style.display = 'none'; scheduleEncode(); }
 }
 actOvl.addEventListener('click', ensureAudioCtx);
 
@@ -230,40 +201,37 @@ function onWorkerMsg(e) {
     stftDec = computeSTFT(decodedAudio);
     offDec  = null;
     setStatus(`Done — ${(decodedAudio.length / sourceSR).toFixed(2)} s decoded`);
-    runBtn.disabled = false;
     playBtn.disabled = false;
     drawSpec();
 
   } else if (msg.type === 'error') {
     progWrap.style.display = 'none';
     setStatus('Error: ' + msg.message, true);
-    runBtn.disabled = false;
   }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Run button
+// Auto-run
 // ═══════════════════════════════════════════════════════════════════════
 
-runBtn.addEventListener('click', async () => {
-  ensureAudioCtx();
+let encodeTimer = null;
+function scheduleEncode(delay = 0) {
+  clearTimeout(encodeTimer);
+  encodeTimer = setTimeout(() => { if (audioCtx) runEncodec(); }, delay);
+}
+
+async function runEncodec() {
   stopPlayback();
   decodedAudio = null; stftDec = null; offDec = null;
   playBtn.disabled = true;
 
   sourceSR = mp.getSampleRate();
-  const dur = Math.min(parseFloat(durInput.value) || 2, MAX_S);
 
   let audio;
-  if (srcPanel.getType() === 'file') {
-    if (!srcPanel.getFile()) { setStatus('No file selected.', true); return; }
-    setStatus('Loading file…');
-    try { audio = await loadFile(srcPanel.getFile(), sourceSR); }
-    catch (err) { setStatus('Could not load file: ' + err.message, true); return; }
-  } else {
-    audio = generateSource(srcPanel.getType(), srcPanel.getFreq(), dur, sourceSR);
-    audio = normalizePeak(audio, 0.8);
-  }
+  setStatus('Loading…');
+  try { audio = await srcWidget.buildAudio(sourceSR); }
+  catch (err) { setStatus(err.message, true); return; }
+  if (srcPanel.getType() !== 'file') audio = normalizePeak(audio, 0.8);
 
   sourceAudio = audio;
   stftSrc     = computeSTFT(sourceAudio);
@@ -272,7 +240,6 @@ runBtn.addEventListener('click', async () => {
 
   if (!worker) initWorker();
 
-  runBtn.disabled = true;
   progWrap.style.display = 'block';
   progBar.style.width = '0%';
   setStatus('Queuing…');
@@ -287,7 +254,7 @@ runBtn.addEventListener('click', async () => {
     streaming: mp.isStreaming(),
     frameSize: mp.getFrameSize(),
   });
-});
+}
 
 // ═══════════════════════════════════════════════════════════════════════
 // Playback

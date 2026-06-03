@@ -250,10 +250,10 @@
 <script type="module">
 'use strict';
 
-import { createSourcePanel }    from './lib/source-panel.js';
+import { createDoubleSourceWidget } from './lib/double-source-widget.js';
 import { createModelPanel }     from './lib/model-panel.js';
 import {
-  generateSource, applyPulseGate, loadFile, getAudioFileDuration, loopToLength, MAX_S,
+  MAX_S,
 } from './lib/audio-utils.js';
 import {
   computeSTFT, stftToOffscreen, drawStrip as _drawStrip, PLASMA, OCEAN, HOT, cmap,
@@ -298,44 +298,12 @@ const MODE_NOTES = {
 
 const controls = document.getElementById('controls');
 
-const panelA = createSourcePanel({
-  title: 'Source A', defaultFreq: 440,
-  showVol: true, showGate: true, showSilence: true,
-  onChange: (delay) => scheduleFullRecalc(delay),
-  onFilePicked: async (file) => {
-    const fileDur = await getAudioFileDuration(file);
-    const current = parseFloat(durEl.value) || 2;
-    if (fileDur > current) durEl.value = fileDur.toFixed(2);
-  },
+const srcWidget = createDoubleSourceWidget({
+  defaultDur: 2, minDur: 0.1, maxDur: 10, stepDur: 0.1,
+  onChange: delay => scheduleFullRecalc(delay),
 });
-controls.appendChild(panelA.element);
-
-const panelB = createSourcePanel({
-  title: 'Source B', defaultFreq: 880,
-  showVol: true, showGate: true, showSilence: true,
-  onChange: (delay) => scheduleFullRecalc(delay),
-  onFilePicked: async (file) => {
-    const fileDur = await getAudioFileDuration(file);
-    const current = parseFloat(durEl.value) || 2;
-    if (fileDur > current) durEl.value = fileDur.toFixed(2);
-  },
-});
-controls.appendChild(panelB.element);
-
-// Duration section
-const durSection = document.createElement('div');
-durSection.className = 'section';
-durSection.innerHTML = `
-  <div class="section-title">Duration</div>
-  <div class="row">
-    <span class="lbl">Target</span>
-    <input type="number" value="2" min="0.1" max="10" step="0.1">
-    <span class="unit">s</span>
-  </div>
-`.trim();
-controls.appendChild(durSection);
-const durEl = durSection.querySelector('input');
-durEl.addEventListener('input', () => scheduleFullRecalc(500));
+controls.appendChild(srcWidget.element);
+const { panelA, panelB } = srcWidget;
 
 // Model + Mode sections
 const mp = createModelPanel({
@@ -1713,42 +1681,22 @@ new ResizeObserver(() => drawPipeline()).observe($('pipelinePanel'));
 // Audio generation helpers
 // ═══════════════════════════════════════════════════════════════════════
 
-async function buildAligned(panel, finalLen, sr) {
-  const type = panel.getType();
-  if (type !== 'file') {
-    return generateSource(type, panel.getFreq(), finalLen / sr, sr);
-  }
-  const f = panel.getFile();
-  if (!f) throw new Error(`No file selected for "${panel.element.querySelector('.section-title').textContent}".`);
-  const raw = await loadFile(f, sr);
-  if (raw.length === finalLen) return raw;
-  if (raw.length >  finalLen) return raw.slice(0, finalLen);
-  return loopToLength(raw, finalLen);
-}
-
 async function buildBothAudios(token) {
   const sr        = mp.getSampleRate();
-  const targetSec = Math.min(parseFloat(durEl.value) || 2, MAX_S);
+  const targetSec = srcWidget.getDuration();
   const finalLen  = Math.round(targetSec * sr);
 
   setStatus('Loading A…');
   let audioA;
-  try { audioA = await buildAligned(panelA, finalLen, sr); }
+  try { audioA = await srcWidget.buildAudio(panelA, finalLen, sr); }
   catch (err) { throw err; }
   if (recalcToken !== token) return null;
 
   setStatus('Loading B…');
   let audioB;
-  try { audioB = await buildAligned(panelB, finalLen, sr); }
+  try { audioB = await srcWidget.buildAudio(panelB, finalLen, sr); }
   catch (err) { throw err; }
   if (recalcToken !== token) return null;
-
-  const volA = panelA.getVolume(), volB = panelB.getVolume();
-  if (volA !== 1) audioA = audioA.map(x => x * volA);
-  if (volB !== 1) audioB = audioB.map(x => x * volB);
-
-  if (panelA.isGateEnabled()) audioA = applyPulseGate(audioA, sr, panelA.getGateFreq(), panelA.getGateDecay());
-  if (panelB.isGateEnabled()) audioB = applyPulseGate(audioB, sr, panelB.getGateFreq(), panelB.getGateDecay());
 
   return { audioA, audioB };
 }

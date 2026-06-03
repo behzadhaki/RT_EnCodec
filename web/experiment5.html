@@ -201,10 +201,10 @@
 <script type="module">
 'use strict';
 
-import { createSourcePanel }    from './lib/source-panel.js';
+import { createDoubleSourceWidget } from './lib/double-source-widget.js';
 import { createModelPanel }     from './lib/model-panel.js';
 import {
-  generateSource, applyPulseGate, loadFile, getAudioFileDuration, loopToLength, MAX_S,
+  MAX_S,
 } from './lib/audio-utils.js';
 import {
   computeSTFT, stftToOffscreen, drawStrip as _drawStrip, PLASMA, OCEAN, HOT, cmap,
@@ -286,42 +286,11 @@ const lgA = $('lgA'), lgB = $('lgB'), lgM = $('lgM');
 
 const controls = $('controls');
 
-const panelA = createSourcePanel({
-  label: 'SOURCE A', color: 'A',
-  showVol: true, showGate: true, showSilence: true,
-  onFilePicked: async file => {
-    const fileDur = await getAudioFileDuration(file);
-    const current = parseFloat(durEl.value) || 4;
-    if (fileDur < current) durEl.value = fileDur.toFixed(1);
-  },
-  onChange: delay => scheduleEncode(delay),
+const srcWidget = createDoubleSourceWidget({
+  defaultDur: 4, onChange: delay => scheduleEncode(delay),
 });
-controls.appendChild(panelA.element);
-
-const panelB = createSourcePanel({
-  label: 'SOURCE B', color: 'B',
-  showVol: true, showGate: true, showSilence: true,
-  onFilePicked: async file => {
-    const fileDur = await getAudioFileDuration(file);
-    const current = parseFloat(durEl.value) || 4;
-    if (fileDur < current) durEl.value = fileDur.toFixed(1);
-  },
-  onChange: delay => scheduleEncode(delay),
-});
-controls.appendChild(panelB.element);
-
-const durSection = document.createElement('div');
-durSection.className = 'section';
-durSection.innerHTML = `
-  <div class="section-title">Duration</div>
-  <div class="row">
-    <span class="lbl">Target</span>
-    <input type="number" min="0.5" max="${MAX_S}" step="0.5" value="4">
-    <span class="unit">s</span>
-  </div>`;
-controls.appendChild(durSection);
-const durEl = durSection.querySelector('input');
-durEl.addEventListener('change', () => scheduleEncode(200));
+controls.appendChild(srcWidget.element);
+const { panelA, panelB } = srcWidget;
 
 const mp = createModelPanel({
   defaultModel: '48k',
@@ -726,33 +695,21 @@ function onWorkerMsg(e) {
 // Encode flow
 // ═══════════════════════════════════════════════════════════════════════
 
-// Build audio from a source panel (matches exp3's buildAligned pattern).
-async function buildAligned(panel, finalLen, sr) {
-  const type = panel.getType();
-  if (type !== 'file') return generateSource(type, panel.getFreq(), finalLen / sr, sr);
-  const f = panel.getFile();
-  if (!f) throw new Error('No file selected.');
-  const raw = await loadFile(f, sr);
-  if (raw.length === finalLen) return raw;
-  if (raw.length >  finalLen) return raw.slice(0, finalLen);
-  return loopToLength(raw, finalLen);
-}
-
 async function triggerEncode() {
   if (!worker) return;
   const sr       = mp.getSampleRate();
-  const targetSec = Math.min(parseFloat(durEl.value) || 4, MAX_S);
+  const targetSec = srcWidget.getDuration();
   const finalLen  = Math.round(targetSec * sr);
 
   let audioA, audioB;
   try {
     setStatus('Loading A…');
-    audioA = await buildAligned(panelA, finalLen, sr);
+    audioA = await srcWidget.buildAudio(panelA, finalLen, sr);
     setStatus('Loading B…');
-    audioB = await buildAligned(panelB, finalLen, sr);
+    audioB = await srcWidget.buildAudio(panelB, finalLen, sr);
   } catch (err) { setStatus(err.message, true); return; }
 
-  // Both same length by construction (buildAligned trims/loops to finalLen).
+  // Both same length by construction (buildAudio trims/loops to finalLen).
   rawAudioA = audioA;
   rawAudioB = audioB;
   sourceSR  = sr;
