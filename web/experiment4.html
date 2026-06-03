@@ -293,6 +293,7 @@ const controls = $('controls');
 
 const panelA = createSourcePanel({
   label: 'SOURCE A', color: 'A',
+  showVol: true, showGate: true, showSilence: true,
   onFilePicked: async file => {
     const fileDur = await getAudioFileDuration(file);
     const current = parseFloat(durEl.value) || 4;
@@ -304,6 +305,7 @@ controls.appendChild(panelA.element);
 
 const panelB = createSourcePanel({
   label: 'SOURCE B', color: 'B',
+  showVol: true, showGate: true, showSilence: true,
   onFilePicked: async file => {
     const fileDur = await getAudioFileDuration(file);
     const current = parseFloat(durEl.value) || 4;

@@ -78,7 +78,7 @@ const MODELS_BASE = new URL('../serialization/encodec_onnx_exports', location.hr
 const controls = document.getElementById('controls');
 
 // Source section
-const srcPanel = createSourcePanel({ title: 'Source', defaultFreq: 440 });
+const srcPanel = createSourcePanel({ title: 'Source', defaultFreq: 440, showVol: true, showGate: true, showSilence: true });
 controls.appendChild(srcPanel.element);
 
 // Duration section (experiment-local: appears inside Source in original, now separate)
