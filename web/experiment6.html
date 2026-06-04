@@ -156,6 +156,13 @@ umapSection.className = 'section';
 umapSection.innerHTML = `
   <div class="section-title">UMAP</div>
   <div class="row">
+    <span class="lbl">Embedding</span>
+    <div style="display:flex;gap:3px">
+      <button class="tog active" id="togPreVQ">Pre-VQ</button>
+      <button class="tog"        id="togPostVQ">Post-VQ</button>
+    </div>
+  </div>
+  <div class="row">
     <span class="lbl">Neighbors</span>
     <input type="number" id="nNeighbors" value="15" min="3" max="100" step="1">
   </div>
@@ -178,6 +185,19 @@ const levelWrap    = document.getElementById('levelWrap');
 const levelSelect  = document.getElementById('levelSelect');
 const nNeighborsEl = document.getElementById('nNeighbors');
 const minDistEl    = document.getElementById('minDist');
+const togPreVQ     = document.getElementById('togPreVQ');
+const togPostVQ    = document.getElementById('togPostVQ');
+
+togPreVQ.addEventListener('click', () => {
+  embSpace = 'pre_vq';
+  togPreVQ.classList.add('active'); togPostVQ.classList.remove('active');
+  triggerUMAP();
+});
+togPostVQ.addEventListener('click', () => {
+  embSpace = 'post_vq';
+  togPostVQ.classList.add('active'); togPreVQ.classList.remove('active');
+  triggerUMAP();
+});
 const togExplore   = document.getElementById('togExplore');
 const togDraw      = document.getElementById('togDraw');
 
@@ -185,7 +205,12 @@ const trajSection = document.createElement('div');
 trajSection.className = 'section';
 trajSection.innerHTML = `
   <div class="section-title">Trajectory</div>
-  <div class="row">
+  <div class="row" style="gap:3px">
+    <button class="tog active" id="togDrawMode" style="flex:1">Draw</button>
+    <button class="tog"        id="togCodeMode" style="flex:1">Code</button>
+    <button class="tog"        id="togSnapMode" style="flex:1">Snap</button>
+  </div>
+  <div class="row" id="durRow">
     <span class="lbl">Duration</span>
     <input type="number" id="trajDuration" value="4" min="0.5" max="30" step="0.5">
     <span style="font-size:11px;color:var(--muted);margin-left:2px">s</span>
@@ -199,8 +224,31 @@ trajSection.innerHTML = `
 controls.appendChild(trajSection);
 
 const trajDurationEl = document.getElementById('trajDuration');
+const durRow         = document.getElementById('durRow');
+
+document.getElementById('togDrawMode').addEventListener('click', () => {
+  pathMode = 'draw';
+  document.getElementById('togDrawMode').classList.add('active');
+  document.getElementById('togCodeMode').classList.remove('active');
+  durRow.style.display = '';
+  codePathFrames = null; renderScatter();
+});
+const setPathMode = (mode) => {
+  pathMode = mode;
+  document.getElementById('togDrawMode').classList.toggle('active', mode === 'draw');
+  document.getElementById('togCodeMode').classList.toggle('active', mode === 'code');
+  document.getElementById('togSnapMode').classList.toggle('active', mode === 'snap');
+  durRow.style.display = mode === 'code' ? 'none' : '';
+  codePathFrames = null; snapFrames = null; snapPlayFrames = null;
+  renderScatter(); autoRegenerate();
+};
+document.getElementById('togCodeMode').addEventListener('click', () => setPathMode('code'));
+document.getElementById('togSnapMode').addEventListener('click', () => setPathMode('snap'));
+
 document.getElementById('clearTraj').addEventListener('click', () => {
-  userTrajectory = []; rawDrawPoints = []; trajAnchorPos = -1; trajAudioBuf = null;
+  userTrajectory = []; rawDrawPoints = []; trajAnchorPos = -1;
+  trajAudioBuf = null; codePathFrames = null;
+  snapFrames = null; snapPlayFrames = null;
   renderScatter(); setStatus('Trajectory cleared.');
 });
 document.getElementById('playTraj').addEventListener('click', playTrajectory);
@@ -221,6 +269,7 @@ let codebooks     = null;
 let codebooksFor  = null;
 let umapMode      = 'combined';
 let umapLevel     = 0;
+let embSpace      = 'pre_vq'; // 'pre_vq' | 'post_vq'
 let coordsA       = null;
 let coordsB       = null;
 let encodeTimer      = null;
@@ -238,6 +287,11 @@ let trajAnchorPos    = -1;        // 0..1 during playback, -1 = off
 let trajPlayStartTime = null;
 let trajAudioBuf      = null;      // cached AudioBuffer for loop
 let trajLooping       = false;
+let pathMode          = 'draw';   // 'draw' | 'code' | 'snap'
+let codePathFrames    = null;     // [{src,idx}] from graph search
+let snapFrames        = null;     // snap waypoints for viz
+let snapPlayFrames    = null;     // full snap sequence (with pre-roll) for playback
+let trajCurrentDuration = 0;     // actual playback duration (set at play time)
 let isShiftDragging   = false;
 let shiftDragStart    = null;     // [umapX, umapY] at drag start
 let shiftDragBaseTraj = null;     // trajectory snapshot at drag start
@@ -508,8 +562,13 @@ async function runUMAP() {
 
   let framesA, framesB;
   if (umapMode === 'combined') {
-    framesA = embQuantToFrames(currentEmbeds.embQuantA, currentEmbeds.embQuantDimsA);
-    framesB = embQuantToFrames(currentEmbeds.embQuantB, currentEmbeds.embQuantDimsB);
+    if (embSpace === 'pre_vq') {
+      framesA = embQuantToFrames(currentEmbeds.embEncA, currentEmbeds.embEncDimsA);
+      framesB = embQuantToFrames(currentEmbeds.embEncB, currentEmbeds.embEncDimsB);
+    } else {
+      framesA = embQuantToFrames(currentEmbeds.embQuantA, currentEmbeds.embQuantDimsA);
+      framesB = embQuantToFrames(currentEmbeds.embQuantB, currentEmbeds.embQuantDimsB);
+    }
   } else {
     const cb = await ensureCodebooks();
     framesA = codebookLookupFrames(cb, currentEmbeds.codesA, currentEmbeds.codesDimsA, umapLevel);
@@ -641,22 +700,95 @@ function renderScatter() {
     ctx.restore();
   }
 
-  // ── Moving anchor ─────────────────────────────────────────────────────────
-  if (trajAnchorPos >= 0 && userTrajectory.length >= 2) {
-    const ti  = trajAnchorPos * (userTrajectory.length - 1);
-    const lo  = Math.floor(ti), hi = Math.min(lo + 1, userTrajectory.length - 1);
-    const t   = ti - lo;
-    const ax  = userTrajectory[lo][0] + t * (userTrajectory[hi][0] - userTrajectory[lo][0]);
-    const ay  = userTrajectory[lo][1] + t * (userTrajectory[hi][1] - userTrajectory[lo][1]);
+  // ── Snap overlay ──────────────────────────────────────────────────────────
+  if (pathMode === 'snap' && snapFrames && snapFrames.length >= 2) {
+    const ptOf = ({src, idx}) => src === 'A' ? coordsA[idx] : coordsB[idx];
     ctx.save();
-    ctx.fillStyle   = '#ffd700';
-    ctx.strokeStyle = '#fff';
+    ctx.strokeStyle = '#ff9944';
     ctx.lineWidth   = 1.5 * dpr;
+    ctx.globalAlpha = 0.85;
     ctx.beginPath();
-    ctx.arc(toX(ax), toY(ay), 6 * dpr, 0, 2 * Math.PI);
-    ctx.fill();
+    for (let i = 0; i < snapFrames.length; i++) {
+      const [x, y] = ptOf(snapFrames[i]);
+      i === 0 ? ctx.moveTo(toX(x), toY(y)) : ctx.lineTo(toX(x), toY(y));
+    }
     ctx.stroke();
+    ctx.fillStyle   = '#ff9944';
+    ctx.globalAlpha = 0.65;
+    for (const f of snapFrames) {
+      const [x, y] = ptOf(f);
+      ctx.beginPath(); ctx.arc(toX(x), toY(y), 3 * dpr, 0, 2 * Math.PI); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    const [sx, sy] = ptOf(snapFrames[0]);
+    const [ex, ey] = ptOf(snapFrames[snapFrames.length - 1]);
+    ctx.fillStyle = '#44ff88';
+    ctx.beginPath(); ctx.arc(toX(sx), toY(sy), 4 * dpr, 0, 2 * Math.PI); ctx.fill();
+    ctx.fillStyle = '#ff4466';
+    ctx.beginPath(); ctx.arc(toX(ex), toY(ey), 4 * dpr, 0, 2 * Math.PI); ctx.fill();
     ctx.restore();
+  }
+
+  // ── Code path overlay ─────────────────────────────────────────────────────
+  if (pathMode === 'code' && codePathFrames && codePathFrames.length >= 2) {
+    const ptOf = ({src, idx}) => src === 'A' ? coordsA[idx] : coordsB[idx];
+    ctx.save();
+    // Line through actual frame positions
+    ctx.strokeStyle = '#44ddaa';
+    ctx.lineWidth   = 1.5 * dpr;
+    ctx.globalAlpha = 0.85;
+    ctx.beginPath();
+    for (let i = 0; i < codePathFrames.length; i++) {
+      const [x, y] = ptOf(codePathFrames[i]);
+      i === 0 ? ctx.moveTo(toX(x), toY(y)) : ctx.lineTo(toX(x), toY(y));
+    }
+    ctx.stroke();
+    // Dots at each frame
+    ctx.fillStyle   = '#44ddaa';
+    ctx.globalAlpha = 0.55;
+    for (const f of codePathFrames) {
+      const [x, y] = ptOf(f);
+      ctx.beginPath(); ctx.arc(toX(x), toY(y), 2.5 * dpr, 0, 2 * Math.PI); ctx.fill();
+    }
+    // Start (green) / end (red) caps
+    ctx.globalAlpha = 1;
+    const [sx, sy] = ptOf(codePathFrames[0]);
+    const [ex, ey] = ptOf(codePathFrames[codePathFrames.length - 1]);
+    ctx.fillStyle = '#44ff88';
+    ctx.beginPath(); ctx.arc(toX(sx), toY(sy), 4 * dpr, 0, 2 * Math.PI); ctx.fill();
+    ctx.fillStyle = '#ff4466';
+    ctx.beginPath(); ctx.arc(toX(ex), toY(ey), 4 * dpr, 0, 2 * Math.PI); ctx.fill();
+    ctx.restore();
+  }
+
+  // ── Moving anchor ─────────────────────────────────────────────────────────
+  if (trajAnchorPos >= 0) {
+    let ax, ay;
+    if (pathMode === 'snap' && snapPlayFrames && snapPlayFrames.length >= 2) {
+      const fi = Math.min(Math.floor(trajAnchorPos * (snapPlayFrames.length - 1)), snapPlayFrames.length - 1);
+      const f  = snapPlayFrames[fi];
+      [ax, ay] = f.src === 'A' ? coordsA[f.idx] : coordsB[f.idx];
+    } else if (pathMode === 'code' && codePathFrames && codePathFrames.length >= 2) {
+      const fi = Math.min(Math.floor(trajAnchorPos * (codePathFrames.length - 1)), codePathFrames.length - 1);
+      const f  = codePathFrames[fi];
+      [ax, ay] = f.src === 'A' ? coordsA[f.idx] : coordsB[f.idx];
+    } else if (userTrajectory.length >= 2) {
+      const ti = trajAnchorPos * (userTrajectory.length - 1);
+      const lo = Math.floor(ti), hi = Math.min(lo + 1, userTrajectory.length - 1);
+      const t  = ti - lo;
+      ax = userTrajectory[lo][0] + t * (userTrajectory[hi][0] - userTrajectory[lo][0]);
+      ay = userTrajectory[lo][1] + t * (userTrajectory[hi][1] - userTrajectory[lo][1]);
+    }
+    if (ax !== undefined) {
+      ctx.save();
+      ctx.fillStyle   = '#ffd700';
+      ctx.strokeStyle = '#fff';
+      ctx.lineWidth   = 1.5 * dpr;
+      ctx.beginPath();
+      ctx.arc(toX(ax), toY(ay), 6 * dpr, 0, 2 * Math.PI);
+      ctx.fill(); ctx.stroke();
+      ctx.restore();
+    }
   }
 }
 
@@ -811,16 +943,17 @@ function startTrajPlayback(buf, sr) {
   const src = audioCtx.createBufferSource();
   src.buffer = buf;
   src.connect(audioCtx.destination);
-  trajPlayStartTime = audioCtx.currentTime;
+  trajPlayStartTime   = audioCtx.currentTime;
+  trajCurrentDuration = buf.length / sr;
   src.start();
   requestAnimationFrame(animateTrajAnchor);
-  setStatus(`Playing trajectory (${(buf.length / sr).toFixed(1)} s)${trajLooping ? ' — looping' : ''}…`);
+  setStatus(`Playing trajectory (${trajCurrentDuration.toFixed(1)} s)${trajLooping ? ' — looping' : ''}…`);
 }
 
 function animateTrajAnchor() {
   if (!trajPlayStartTime || !audioCtx) return;
   const elapsed  = audioCtx.currentTime - trajPlayStartTime;
-  const duration = parseFloat(trajDurationEl.value) || 4;
+  const duration = trajCurrentDuration || parseFloat(trajDurationEl.value) || 4;
   trajAnchorPos  = Math.min(elapsed / duration, 1);
   renderScatter();
   if (trajAnchorPos < 1) {
@@ -835,12 +968,202 @@ function animateTrajAnchor() {
   }
 }
 
+// ── Code-path graph search ────────────────────────────────────────────────────
+
+function buildCodePathGraph() {
+  const nA = coordsA.length, nB = coordsB.length;
+  const N  = nA + nB;
+  const K  = Math.min(Math.max(2, parseInt(nNeighborsEl.value) || 15), 20);
+  const adj = Array.from({length: N}, () => []);
+
+  const cx = i => (i < nA ? coordsA[i] : coordsB[i - nA])[0];
+  const cy = i => (i < nA ? coordsA[i] : coordsB[i - nA])[1];
+  const w  = (i, j) => Math.sqrt((cx(i)-cx(j))**2 + (cy(i)-cy(j))**2);
+
+  // kNN edges (covers temporal + cross-source neighbourhood)
+  for (let i = 0; i < N; i++) {
+    const dists = [];
+    for (let j = 0; j < N; j++) {
+      if (j === i) continue;
+      dists.push([j, (cx(i)-cx(j))**2 + (cy(i)-cy(j))**2]);
+    }
+    dists.sort((a, b) => a[1] - b[1]);
+    for (let k = 0; k < Math.min(K, dists.length); k++) {
+      const [j, d2] = dists[k];
+      adj[i].push({j, w: Math.sqrt(d2)});
+    }
+  }
+  // Guarantee temporal edges are always present
+  for (let i = 1; i < nA; i++) {
+    const d = w(i-1, i);
+    adj[i-1].push({j: i, w: d}); adj[i].push({j: i-1, w: d});
+  }
+  for (let i = 1; i < nB; i++) {
+    const ni = nA+i, np = nA+i-1;
+    const d = w(ni, np);
+    adj[np].push({j: ni, w: d}); adj[ni].push({j: np, w: d});
+  }
+  return adj;
+}
+
+function dijkstra(adj, start, end) {
+  const N    = adj.length;
+  const dist = new Float64Array(N).fill(Infinity);
+  const prev = new Int32Array(N).fill(-1);
+  const done = new Uint8Array(N);
+  dist[start] = 0;
+  for (let iter = 0; iter < N; iter++) {
+    let u = -1;
+    for (let i = 0; i < N; i++) if (!done[i] && (u < 0 || dist[i] < dist[u])) u = i;
+    if (u < 0 || dist[u] === Infinity || u === end) break;
+    done[u] = 1;
+    for (const {j, w} of adj[u]) {
+      const nd = dist[u] + w;
+      if (nd < dist[j]) { dist[j] = nd; prev[j] = u; }
+    }
+  }
+  if (dist[end] === Infinity) return null;
+  const path = [];
+  for (let cur = end; cur >= 0; cur = prev[cur]) path.unshift(cur);
+  return path;
+}
+
+function findCodePath() {
+  if (!userTrajectory || userTrajectory.length < 2 || !coordsA || !coordsB) return null;
+  const nA = coordsA.length;
+
+  const nearestNode = ([px, py]) => {
+    let best = 0, bestD = Infinity;
+    for (let i = 0; i < coordsA.length; i++) {
+      const d = (coordsA[i][0]-px)**2 + (coordsA[i][1]-py)**2;
+      if (d < bestD) { bestD = d; best = i; }
+    }
+    for (let i = 0; i < coordsB.length; i++) {
+      const d = (coordsB[i][0]-px)**2 + (coordsB[i][1]-py)**2;
+      if (d < bestD) { bestD = d; best = nA+i; }
+    }
+    return best;
+  };
+
+  const startNode = nearestNode(userTrajectory[0]);
+  const endNode   = nearestNode(userTrajectory[userTrajectory.length - 1]);
+  if (startNode === endNode) {
+    const s = startNode < nA ? {src:'A', idx:startNode} : {src:'B', idx:startNode-nA};
+    return [s];
+  }
+
+  const nodePath = dijkstra(buildCodePathGraph(), startNode, endNode);
+  if (!nodePath) return null;
+  return nodePath.map(n => n < nA ? {src:'A', idx:n} : {src:'B', idx:n-nA});
+}
+
+// Build a Float32Array(N) of per-frame scale values for 48k trajectory decoding.
+// seq is an array of {src, idx}; returns null for 24k (scales not needed).
+function makeFrameScales(seq) {
+  if (!currentEmbeds.scalesA && !currentEmbeds.scalesB) return null; // 24k
+  const out = new Float32Array(seq.length);
+  for (let i = 0; i < seq.length; i++) {
+    const {src, idx} = seq[i];
+    const arr = src === 'A' ? currentEmbeds.scalesA : currentEmbeds.scalesB;
+    out[i] = arr ? (arr[idx] || 1.0) : 1.0;
+  }
+  return out;
+}
+
+// ── Snap helpers ──────────────────────────────────────────────────────────────
+
+// Sample the drawn path and snap each sample to the nearest UMAP frame.
+// Returns deduplicated [{src,idx}] waypoints.
+function computeSnapWaypoints() {
+  if (!userTrajectory || userTrajectory.length < 2 || !coordsA || !coordsB) return [];
+  const fps = coordsA.length / srcWidget.getDuration();
+  const N   = Math.max(2, Math.round((parseFloat(trajDurationEl.value) || 4) * fps));
+
+  const raw = [];
+  for (let i = 0; i < N; i++) {
+    const frac = i / (N - 1);
+    const ti   = frac * (userTrajectory.length - 1);
+    const lo   = Math.floor(ti), hi = Math.min(lo + 1, userTrajectory.length - 1);
+    const tt   = ti - lo;
+    const px   = userTrajectory[lo][0] + tt * (userTrajectory[hi][0] - userTrajectory[lo][0]);
+    const py   = userTrajectory[lo][1] + tt * (userTrajectory[hi][1] - userTrajectory[lo][1]);
+
+    let bestD = Infinity, bestSrc = 'A', bestIdx = 0;
+    for (let j = 0; j < coordsA.length; j++) {
+      const d = (coordsA[j][0]-px)**2 + (coordsA[j][1]-py)**2;
+      if (d < bestD) { bestD = d; bestSrc = 'A'; bestIdx = j; }
+    }
+    for (let j = 0; j < coordsB.length; j++) {
+      const d = (coordsB[j][0]-px)**2 + (coordsB[j][1]-py)**2;
+      if (d < bestD) { bestD = d; bestSrc = 'B'; bestIdx = j; }
+    }
+    const last = raw[raw.length - 1];
+    if (!last || last.src !== bestSrc || last.idx !== bestIdx) raw.push({src: bestSrc, idx: bestIdx});
+  }
+  return raw;
+}
+
+// Build the full decode sequence from snap waypoints.
+// Pre-roll (K_pre frames from same source) is added:
+//   • before the very first waypoint
+//   • at every source transition or backward jump
+// Within-source forward runs fill naturally (A[i]→A[i+1]→…).
+// For 48k a post-roll is appended after the last waypoint.
+function buildSnapSequence(waypoints, K_pre, K_post) {
+  const T_A = currentEmbeds.embQuantDimsA[2];
+  const T_B = currentEmbeds.embQuantDimsB[2];
+  const getT = src => src === 'A' ? T_A : T_B;
+
+  const addPreroll = (src, idx) => {
+    for (let i = Math.max(0, idx - K_pre); i <= idx; i++) seq.push({src, idx: i});
+  };
+
+  const seq = [];
+
+  // Pre-roll before first waypoint
+  addPreroll(waypoints[0].src, waypoints[0].idx);
+
+  for (let w = 1; w < waypoints.length; w++) {
+    const {src, idx} = waypoints[w];
+    const prev = waypoints[w - 1];
+
+    if (prev.src === src && idx > prev.idx && (idx - prev.idx) <= K_pre) {
+      // Close forward run in same source — fill naturally, LSTM stays warm
+      for (let i = prev.idx + 1; i <= idx; i++) seq.push({src, idx: i});
+    } else {
+      // Far jump (same or different source), or backward — fresh pre-roll
+      addPreroll(src, idx);
+    }
+  }
+
+  // Post-roll after last waypoint (48k only)
+  if (K_post > 0) {
+    const {src: sL, idx: iL} = waypoints[waypoints.length - 1];
+    const T = getT(sL);
+    for (let i = iL + 1; i <= Math.min(T - 1, iL + K_post); i++) seq.push({src: sL, idx: i});
+  }
+
+  // Deduplicate consecutive identical frames
+  if (!seq.length) return [];
+  const out = [seq[0]];
+  for (let i = 1; i < seq.length; i++) {
+    const prev = out[out.length - 1];
+    if (seq[i].src !== prev.src || seq[i].idx !== prev.idx) out.push(seq[i]);
+  }
+  return out;
+}
+
 function autoRegenerate() {
+  // Always update snap waypoint viz when drawing in snap mode
+  if (pathMode === 'snap' && coordsA && coordsB) {
+    snapFrames = computeSnapWaypoints();
+    renderScatter();
+  }
   if (userTrajectory.length < 2 || !currentEmbeds || !coordsA || !coordsB) {
     if (userTrajectory.length >= 2) setStatus('Path drawn. Encode sources and run UMAP to play.');
     return;
   }
-  trajPlayStartTime = null; // stop any running animation loop
+  trajPlayStartTime = null;
   playTrajectory();
 }
 
@@ -849,12 +1172,81 @@ async function playTrajectory() {
   if (!currentEmbeds)                                { setStatus('Encode both sources first.', true); return; }
   if (!coordsA || !coordsB)                          { setStatus('Run UMAP first.', true); return; }
 
+  const [, D, T_A] = currentEmbeds.embQuantDimsA;
+  const [, , T_B]  = currentEmbeds.embQuantDimsB;
+
+  // ── Code-path mode ────────────────────────────────────────────────────────
+  if (pathMode === 'code') {
+    const path = findCodePath();
+    if (!path || path.length === 0) { setStatus('No path found between endpoints.', true); return; }
+    codePathFrames = path;
+    renderScatter();
+
+    const N = path.length;
+    const blended = new Float32Array(D * N);
+    for (let i = 0; i < N; i++) {
+      const {src, idx} = path[i];
+      const emb = src === 'A' ? currentEmbeds.embQuantA : currentEmbeds.embQuantB;
+      const T   = src === 'A' ? T_A : T_B;
+      for (let d = 0; d < D; d++) blended[d * N + i] = emb[d * T + idx];
+    }
+    if (!audioCtx) audioCtx = new AudioContext();
+    playJobId = ++jobSeq;
+    setStatus(`Decoding code path (${N} frames)…`);
+    const codeScales = makeFrameScales(path);
+    const codeXfers  = [blended.buffer];
+    if (codeScales) codeXfers.push(codeScales.buffer);
+    worker.postMessage({
+      type: 'decode_trajectory_exp6', jobId: playJobId,
+      embQuant: blended, dims: [1, D, N],
+      frameScales: codeScales || undefined,
+      modelHz: mp.getModelHz(), bwKbps: mp.getBwKbps(),
+    }, codeXfers);
+    return;
+  }
+
+  // ── Snap mode ─────────────────────────────────────────────────────────────
+  if (pathMode === 'snap') {
+    const waypoints = computeSnapWaypoints();
+    if (!waypoints.length) { setStatus('Draw a path first.', true); return; }
+    snapFrames = waypoints;
+
+    const is48k  = mp.getModelHz() === '48k';
+    const fps    = coordsA.length / srcWidget.getDuration();
+    const K_pre  = Math.max(4, Math.round(fps * 0.05));  // ~0.05 s pre-roll per context window
+    const K_post = is48k ? Math.max(2, Math.round(fps * 0.03)) : 0;
+
+    const seq = buildSnapSequence(waypoints, K_pre, K_post);
+    snapPlayFrames = seq;
+    renderScatter();
+
+    const N = seq.length;
+    const blended = new Float32Array(D * N);
+    for (let i = 0; i < N; i++) {
+      const {src, idx} = seq[i];
+      const emb = src === 'A' ? currentEmbeds.embQuantA : currentEmbeds.embQuantB;
+      const T   = src === 'A' ? T_A : T_B;
+      for (let d = 0; d < D; d++) blended[d * N + i] = emb[d * T + idx];
+    }
+    if (!audioCtx) audioCtx = new AudioContext();
+    playJobId = ++jobSeq;
+    setStatus(`Decoding snap (${N} frames, ~${(N / fps).toFixed(1)} s)…`);
+    const snapScales  = makeFrameScales(seq);
+    const snapXfers   = [blended.buffer];
+    if (snapScales) snapXfers.push(snapScales.buffer);
+    worker.postMessage({
+      type: 'decode_trajectory_exp6', jobId: playJobId,
+      embQuant: blended, dims: [1, D, N],
+      frameScales: snapScales || undefined,
+      modelHz: mp.getModelHz(), bwKbps: mp.getBwKbps(),
+    }, snapXfers);
+    return;
+  }
+
+  // ── Draw-path mode ────────────────────────────────────────────────────────
   const duration     = parseFloat(trajDurationEl.value) || 4;
   const framesPerSec = coordsA.length / srcWidget.getDuration();
   const N            = Math.max(2, Math.round(duration * framesPerSec));
-
-  const [, D, T_A] = currentEmbeds.embQuantDimsA;
-  const [, , T_B]  = currentEmbeds.embQuantDimsB;
 
   const getFrame = (src, idx) => {
     const emb = src === 'A' ? currentEmbeds.embQuantA : currentEmbeds.embQuantB;
@@ -864,8 +1256,9 @@ async function playTrajectory() {
     return f;
   };
 
-  const blended = new Float32Array(D * N);
-  let scaleAcc = 0;
+  const blended     = new Float32Array(D * N);
+  const hasScales   = !!(currentEmbeds.scalesA || currentEmbeds.scalesB);
+  const drawScales  = hasScales ? new Float32Array(N) : null;
 
   for (let i = 0; i < N; i++) {
     const frac = i / (N - 1);
@@ -895,23 +1288,28 @@ async function playTrajectory() {
     const w1  = sum > 1e-12 ? sd2 / sum : 1;
     const w2  = 1 - w1;
     for (let d = 0; d < D; d++) blended[d * N + i] = w1 * f1[d] + w2 * f2[d];
-    const getScale = (src, idx) => {
-      const arr = src === 'A' ? currentEmbeds.scalesA : currentEmbeds.scalesB;
-      return arr ? (arr[idx] || 1) : 1;
-    };
-    scaleAcc += w1 * getScale(src1, idx1) + w2 * (idx2 >= 0 ? getScale(src2, idx2) : getScale(src1, idx1));
+    if (drawScales) {
+      const getScale = (src, idx) => {
+        const arr = src === 'A' ? currentEmbeds.scalesA : currentEmbeds.scalesB;
+        return arr ? (arr[idx] || 1.0) : 1.0;
+      };
+      drawScales[i] = w1 * getScale(src1, idx1)
+                    + w2 * (idx2 >= 0 ? getScale(src2, idx2) : getScale(src1, idx1));
+    }
   }
 
   if (!audioCtx) audioCtx = new AudioContext();
   playJobId = ++jobSeq;
   setStatus(`Decoding ${N} frames (${duration} s)…`);
 
+  const drawXfers = [blended.buffer];
+  if (drawScales) drawXfers.push(drawScales.buffer);
   worker.postMessage({
     type: 'decode_trajectory_exp6', jobId: playJobId,
     embQuant: blended, dims: [1, D, N],
-    meanScale: scaleAcc / N,
+    frameScales: drawScales || undefined,
     modelHz: mp.getModelHz(), bwKbps: mp.getBwKbps(),
-  }, [blended.buffer]);
+  }, drawXfers);
 }
 </script>
 </body>

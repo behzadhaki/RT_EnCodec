@@ -1906,19 +1906,24 @@ function flattenCaps(caps) {
 
   if (capList.length === 1) return capList[0];
 
-  const first  = capList[0];
-  const D      = toN(first.embQuantDims[1]);
-  const K      = toN(first.codesDims[1]);
-  const totalT = capList.reduce((s, c) => s + toN(c.codesDims[2]), 0);
+  const first   = capList[0];
+  const D_enc   = toN(first.embEncDims[1]);
+  const D_quant = toN(first.embQuantDims[1]);
+  const K       = toN(first.codesDims[1]);
+  const totalT  = capList.reduce((s, c) => s + toN(c.codesDims[2]), 0);
 
-  const emb_quant = new Float32Array(D * totalT);
+  const emb_enc   = new Float32Array(D_enc   * totalT);
+  const emb_quant = new Float32Array(D_quant * totalT);
   const codes = first.codesType === 'int64'
     ? new BigInt64Array(K * totalT) : new Int32Array(K * totalT);
 
   let tOff = 0;
   for (const cap of capList) {
     const T_i = toN(cap.codesDims[2]);
-    for (let d = 0; d < D; d++)
+    for (let d = 0; d < D_enc; d++)
+      for (let t = 0; t < T_i; t++)
+        emb_enc[d * totalT + tOff + t] = cap.emb_enc[d * T_i + t];
+    for (let d = 0; d < D_quant; d++)
       for (let t = 0; t < T_i; t++)
         emb_quant[d * totalT + tOff + t] = cap.emb_quant[d * T_i + t];
     for (let k = 0; k < K; k++)
@@ -1926,7 +1931,8 @@ function flattenCaps(caps) {
         codes[k * totalT + tOff + t] = cap.codes[k * T_i + t];
     tOff += T_i;
   }
-  return { emb_quant, embQuantDims: [1, D, totalT],
+  return { emb_enc, embEncDims: [1, D_enc, totalT],
+           emb_quant, embQuantDims: [1, D_quant, totalT],
            codes, codesType: first.codesType, codesDims: [1, K, totalT] };
 }
 
@@ -2015,7 +2021,7 @@ async function runPlayFrameExp6(msg) {
 // ---------------------------------------------------------------------------
 
 async function runDecodeTrajectoryExp6(msg) {
-  const { jobId, embQuant, dims, modelHz, bwKbps } = msg;
+  const { jobId, embQuant, dims, frameScales, modelHz, bwKbps } = msg;
   try {
     await ensureSessions(modelHz, bwKbps);
 
@@ -2023,16 +2029,17 @@ async function runDecodeTrajectoryExp6(msg) {
     let decoded;
 
     if (modelHz === '48k') {
-      // 48k decoder expects at most SEG_48/HOP_48 = 150 frames per call (same as OLA path).
-      // Pull scale from captureCache using the same lookup as runPlayFrameExp6 — this gives
-      // the correct tensor shape straight from the ONNX encoder output.
+      // 48k decoder must be called in ≤150-frame chunks (matches OLA path).
+      // Scale is per-segment in the captures; use the mean of each chunk's per-frame
+      // scale values (provided by the main thread) so each chunk gets its own correct scale.
+      // Fall back to captureCache first-segment scale if frameScales wasn't supplied.
       const caps    = captureCache.A || captureCache.B;
-      const refCap  = !caps           ? null
-                    : caps.mode === 'single'  ? caps.cap
-                    : caps.mode === 'ola24'   ? caps.chunks[0].cap
-                    :                           caps.segments[0].cap;
-      const scale     = refCap?.scale     ? refCap.scale.slice()                           : new Float32Array([1.0]);
-      const scaleDims = refCap?.scaleDims ? [...refCap.scaleDims].map(Number)              : [1, 1, 1];
+      const refCap  = !caps ? null
+                    : caps.mode === 'single' ? caps.cap
+                    : caps.mode === 'ola24'  ? caps.chunks[0].cap
+                    :                          caps.segments[0].cap;
+      const fallbackScale     = refCap?.scale     ? refCap.scale.slice()            : new Float32Array([1.0]);
+      const fallbackScaleDims = refCap?.scaleDims ? [...refCap.scaleDims].map(Number) : [1, 1, 1];
 
       const CHUNK_T  = SEG_48 / HOP_48;  // 150
       const outParts = [];
@@ -2044,6 +2051,17 @@ async function runDecodeTrajectoryExp6(msg) {
         for (let d = 0; d < D; d++)
           for (let i = 0; i < chunk_T; i++)
             chunkEmb[d * chunk_T + i] = embQuant[d * N + t + i];
+
+        // Per-chunk scale: mean of the per-frame values supplied by the main thread.
+        // Always use fallbackScaleDims (real shape from the ONNX encoder output) —
+        // never hardcode [1,1,1]; a shape mismatch silently hangs the 48k decoder.
+        let scale = fallbackScale, scaleDims = fallbackScaleDims;
+        if (frameScales) {
+          let sum = 0;
+          for (let i = t; i < t + chunk_T; i++) sum += frameScales[i];
+          scale     = new Float32Array(fallbackScale.length).fill(sum / chunk_T);
+          scaleDims = fallbackScaleDims;
+        }
 
         const res = await decodeFromLatents(chunkEmb, [1, D, chunk_T], scale, scaleDims, modelHz, hDec, cDec);
         hDec = res.hDecNew; cDec = res.cDecNew;
@@ -2142,6 +2160,8 @@ self.onmessage = (e) => {
           return new Int32Array(codes);
         }
 
+        const embEncA   = flatA.emb_enc.slice();
+        const embEncB   = flatB.emb_enc.slice();
         const embQuantA = flatA.emb_quant.slice();
         const embQuantB = flatB.emb_quant.slice();
         const codesA    = codesToInt32(flatA.codes, flatA.codesType);
@@ -2149,13 +2169,17 @@ self.onmessage = (e) => {
         const scalesA   = flattenScales(capsA); // Float32Array(T_A) or null
         const scalesB   = flattenScales(capsB); // Float32Array(T_B) or null
 
-        const transfers = [embQuantA.buffer, embQuantB.buffer, codesA.buffer, codesB.buffer];
+        const transfers = [embEncA.buffer, embEncB.buffer,
+                           embQuantA.buffer, embQuantB.buffer,
+                           codesA.buffer, codesB.buffer];
         if (scalesA) transfers.push(scalesA.buffer);
         if (scalesB) transfers.push(scalesB.buffer);
 
         self.postMessage({
           type:      'embeddings_exp6',
           jobId:     msg.jobId,
+          embEncA,   embEncDimsA:  toNumDims(flatA.embEncDims),
+          embEncB,   embEncDimsB:  toNumDims(flatB.embEncDims),
           embQuantA, embQuantDimsA: toNumDims(flatA.embQuantDims),
           embQuantB, embQuantDimsB: toNumDims(flatB.embQuantDims),
           codesA,    codesDimsA:   toNumDims(flatA.codesDims),
