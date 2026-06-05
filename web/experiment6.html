@@ -156,11 +156,24 @@ umapSection.className = 'section';
 umapSection.innerHTML = `
   <div class="section-title">UMAP</div>
   <div class="row">
-    <span class="lbl">Embedding</span>
+    <span class="lbl">Space</span>
     <div style="display:flex;gap:3px">
       <button class="tog active" id="togPreVQ">Pre-VQ</button>
       <button class="tog"        id="togPostVQ">Post-VQ</button>
     </div>
+  </div>
+  <div class="row">
+    <span class="lbl">Features</span>
+    <div style="display:flex;gap:3px">
+      <button class="tog active" id="togEmbOnly">Emb</button>
+      <button class="tog"        id="togEmbDelta">Emb+Δ</button>
+      <button class="tog"        id="togDeltaOnly">Δ</button>
+    </div>
+  </div>
+  <div class="row">
+    <span class="lbl">History</span>
+    <input type="number" id="umapWindow" value="1" min="1" max="16" step="1">
+    <span style="font-size:11px;color:var(--muted);margin-left:2px">frames</span>
   </div>
   <div class="row">
     <span class="lbl">Neighbors</span>
@@ -183,8 +196,10 @@ const togCombined  = document.getElementById('togCombined');
 const togPerLevel  = document.getElementById('togPerLevel');
 const levelWrap    = document.getElementById('levelWrap');
 const levelSelect  = document.getElementById('levelSelect');
-const nNeighborsEl = document.getElementById('nNeighbors');
-const minDistEl    = document.getElementById('minDist');
+const nNeighborsEl  = document.getElementById('nNeighbors');
+const minDistEl     = document.getElementById('minDist');
+const umapWindowEl  = document.getElementById('umapWindow');
+umapWindowEl.addEventListener('change', triggerUMAP);
 const togPreVQ     = document.getElementById('togPreVQ');
 const togPostVQ    = document.getElementById('togPostVQ');
 
@@ -196,6 +211,28 @@ togPreVQ.addEventListener('click', () => {
 togPostVQ.addEventListener('click', () => {
   embSpace = 'post_vq';
   togPostVQ.classList.add('active'); togPreVQ.classList.remove('active');
+  triggerUMAP();
+});
+
+const togEmbOnly  = document.getElementById('togEmbOnly');
+const togEmbDelta = document.getElementById('togEmbDelta');
+togEmbOnly.addEventListener('click', () => {
+  embMode = 'emb';
+  togEmbOnly.classList.add('active'); togEmbDelta.classList.remove('active');
+  triggerUMAP();
+});
+togEmbDelta.addEventListener('click', () => {
+  embMode = 'emb+delta';
+  togEmbDelta.classList.add('active');
+  togEmbOnly.classList.remove('active'); togDeltaOnly.classList.remove('active');
+  triggerUMAP();
+});
+
+const togDeltaOnly = document.getElementById('togDeltaOnly');
+togDeltaOnly.addEventListener('click', () => {
+  embMode = 'delta';
+  togDeltaOnly.classList.add('active');
+  togEmbOnly.classList.remove('active'); togEmbDelta.classList.remove('active');
   triggerUMAP();
 });
 const togExplore   = document.getElementById('togExplore');
@@ -214,6 +251,15 @@ trajSection.innerHTML = `
     <span class="lbl">Duration</span>
     <input type="number" id="trajDuration" value="4" min="0.5" max="30" step="0.5">
     <span style="font-size:11px;color:var(--muted);margin-left:2px">s</span>
+  </div>
+  <div class="row" id="snapDurRow" style="display:none;gap:3px">
+    <button class="tog active" id="togSnapAuto"  style="flex:1">Auto</button>
+    <button class="tog"        id="togSnapFixed" style="flex:1">Fixed</button>
+  </div>
+  <div class="row" id="ctxSwapRow" style="display:none">
+    <span class="lbl">Ctx swap</span>
+    <input type="range" id="ctxSwapSlider" min="0" max="2" step="0.02" value="0" style="flex:1">
+    <span id="ctxSwapVal" style="font-size:11px;color:var(--muted);min-width:2.5em;text-align:right">0.00</span>
   </div>
   <div class="row" style="gap:5px;margin-top:2px">
     <button class="tog" id="clearTraj" style="flex:1">Clear</button>
@@ -239,9 +285,31 @@ const setPathMode = (mode) => {
   document.getElementById('togCodeMode').classList.toggle('active', mode === 'code');
   document.getElementById('togSnapMode').classList.toggle('active', mode === 'snap');
   durRow.style.display = mode === 'code' ? 'none' : '';
+  document.getElementById('snapDurRow').style.display = mode === 'snap' ? '' : 'none';
+  document.getElementById('ctxSwapRow').style.display = mode === 'snap' ? '' : 'none';
   codePathFrames = null; snapFrames = null; snapPlayFrames = null;
   renderScatter(); autoRegenerate();
 };
+
+document.getElementById('togSnapAuto').addEventListener('click', () => {
+  snapDurMode = 'auto';
+  document.getElementById('togSnapAuto').classList.add('active');
+  document.getElementById('togSnapFixed').classList.remove('active');
+  autoRegenerate();
+});
+document.getElementById('togSnapFixed').addEventListener('click', () => {
+  snapDurMode = 'fixed';
+  document.getElementById('togSnapFixed').classList.add('active');
+  document.getElementById('togSnapAuto').classList.remove('active');
+  autoRegenerate();
+});
+
+const ctxSwapValEl = document.getElementById('ctxSwapVal');
+document.getElementById('ctxSwapSlider').addEventListener('input', e => {
+  ctxSwapRange = parseFloat(e.target.value);
+  ctxSwapValEl.textContent = ctxSwapRange.toFixed(2);
+  autoRegenerate();
+});
 document.getElementById('togCodeMode').addEventListener('click', () => setPathMode('code'));
 document.getElementById('togSnapMode').addEventListener('click', () => setPathMode('snap'));
 
@@ -270,6 +338,7 @@ let codebooksFor  = null;
 let umapMode      = 'combined';
 let umapLevel     = 0;
 let embSpace      = 'pre_vq'; // 'pre_vq' | 'post_vq'
+let embMode       = 'emb';    // 'emb' | 'emb+delta'
 let coordsA       = null;
 let coordsB       = null;
 let encodeTimer      = null;
@@ -292,6 +361,8 @@ let codePathFrames    = null;     // [{src,idx}] from graph search
 let snapFrames        = null;     // snap waypoints for viz
 let snapPlayFrames    = null;     // full snap sequence (with pre-roll) for playback
 let trajCurrentDuration = 0;     // actual playback duration (set at play time)
+let snapDurMode       = 'auto';  // 'auto' | 'fixed'
+let ctxSwapRange      = 0;       // UMAP-unit radius for context swap (0 = off)
 let isShiftDragging   = false;
 let shiftDragStart    = null;     // [umapX, umapY] at drag start
 let shiftDragBaseTraj = null;     // trajectory snapshot at drag start
@@ -525,6 +596,56 @@ async function ensureCodebooks() {
 
 // ── Frame extraction ──────────────────────────────────────────────────────────
 
+// Build the UMAP feature vector when History K > 1:
+//   [raw_emb[t]  ‖  feat[t-K+1]  ‖  …  ‖  feat[t-1]  ‖  feat[t]]
+//    ^ D_raw anchor                  K × D_feat history (oldest → newest)
+// rawFrames = original embeddings (the anchor, always present for K > 1)
+// featFrames = embMode-transformed frames (what goes in the history window)
+// K=1: no anchor needed — returns featFrames unchanged.
+function applyWindowWithAnchor(rawFrames, featFrames, K) {
+  if (K <= 1) return featFrames;
+  const D_raw  = rawFrames[0].length;
+  const D_feat = featFrames[0].length;
+  return rawFrames.map((raw, t) => {
+    const vec = new Float32Array(D_raw + K * D_feat);
+    vec.set(raw, 0);                                        // anchor: emb[t]
+    for (let k = 0; k < K; k++) {
+      const srcT = Math.max(0, t - (K - 1 - k));
+      vec.set(featFrames[srcT], D_raw + k * D_feat);        // history window
+    }
+    return vec;
+  });
+}
+
+// Return only the frame-to-frame delta vectors (same dimensionality as input).
+// First frame gets a zero delta.  Used for UMAP projection only — decoding always
+// uses the original emb_quant regardless of this choice.
+function computeDeltas(frames) {
+  const D = frames[0].length;
+  return frames.map((f, t) => {
+    if (t === 0) return new Float32Array(D);
+    const delta = new Float32Array(D);
+    const prev  = frames[t - 1];
+    for (let d = 0; d < D; d++) delta[d] = f[d] - prev[d];
+    return delta;
+  });
+}
+
+// Concatenate each frame with its delta: [emb ‖ emb−prev_emb] → Float32Array[2D].
+// First frame gets a zero delta.
+function appendDeltas(frames) {
+  const D   = frames[0].length;
+  const out = [];
+  for (let t = 0; t < frames.length; t++) {
+    const f   = frames[t];
+    const vec = new Float32Array(2 * D);
+    vec.set(f, 0);
+    if (t > 0) { const p = frames[t-1]; for (let d = 0; d < D; d++) vec[D+d] = f[d] - p[d]; }
+    out.push(vec);
+  }
+  return out;
+}
+
 // emb_quant layout: [1, D, T] flattened → index [d, t] = embQuant[d*T + t]
 function embQuantToFrames(embQuant, dims) {
   const [, D, T] = dims;
@@ -560,19 +681,32 @@ function triggerUMAP() {
 async function runUMAP() {
   if (!currentEmbeds) return;
 
-  let framesA, framesB;
+  let framesA, framesB, rawA, rawB;
   if (umapMode === 'combined') {
     if (embSpace === 'pre_vq') {
-      framesA = embQuantToFrames(currentEmbeds.embEncA, currentEmbeds.embEncDimsA);
-      framesB = embQuantToFrames(currentEmbeds.embEncB, currentEmbeds.embEncDimsB);
+      rawA = embQuantToFrames(currentEmbeds.embEncA, currentEmbeds.embEncDimsA);
+      rawB = embQuantToFrames(currentEmbeds.embEncB, currentEmbeds.embEncDimsB);
     } else {
-      framesA = embQuantToFrames(currentEmbeds.embQuantA, currentEmbeds.embQuantDimsA);
-      framesB = embQuantToFrames(currentEmbeds.embQuantB, currentEmbeds.embQuantDimsB);
+      rawA = embQuantToFrames(currentEmbeds.embQuantA, currentEmbeds.embQuantDimsA);
+      rawB = embQuantToFrames(currentEmbeds.embQuantB, currentEmbeds.embQuantDimsB);
     }
+    framesA = rawA; framesB = rawB;
+    if      (embMode === 'emb+delta') { framesA = appendDeltas(framesA);  framesB = appendDeltas(framesB); }
+    else if (embMode === 'delta')     { framesA = computeDeltas(framesA); framesB = computeDeltas(framesB); }
   } else {
     const cb = await ensureCodebooks();
-    framesA = codebookLookupFrames(cb, currentEmbeds.codesA, currentEmbeds.codesDimsA, umapLevel);
-    framesB = codebookLookupFrames(cb, currentEmbeds.codesB, currentEmbeds.codesDimsB, umapLevel);
+    rawA = codebookLookupFrames(cb, currentEmbeds.codesA, currentEmbeds.codesDimsA, umapLevel);
+    rawB = codebookLookupFrames(cb, currentEmbeds.codesB, currentEmbeds.codesDimsB, umapLevel);
+    framesA = rawA; framesB = rawB;
+    if      (embMode === 'emb+delta') { framesA = appendDeltas(framesA);  framesB = appendDeltas(framesB); }
+    else if (embMode === 'delta')     { framesA = computeDeltas(framesA); framesB = computeDeltas(framesB); }
+  }
+
+  // History window: anchor = emb[t], then K steps of embMode feature (oldest → newest)
+  const K = Math.max(1, parseInt(umapWindowEl.value) || 1);
+  if (K > 1) {
+    framesA = applyWindowWithAnchor(rawA, framesA, K);
+    framesB = applyWindowWithAnchor(rawB, framesB, K);
   }
 
   const T_A = framesA.length;
@@ -1057,6 +1191,44 @@ function findCodePath() {
   return nodePath.map(n => n < nA ? {src:'A', idx:n} : {src:'B', idx:n-nA});
 }
 
+// Walk backward K steps through the directed latent graph.
+// At each step: prefer the cross-source frame nearest to the current position if it
+// is within `range` UMAP units AND closer than the temporal predecessor; otherwise
+// step back one frame in the same source.  Multi-hop: each step re-evaluates the swap.
+// Returns [{src,idx}] in forward (oldest-first) order, length ≤ K.
+function walkBackward(src, idx, K, range) {
+  const frames = [];
+  let cSrc = src, cIdx = idx;
+
+  for (let step = 0; step < K; step++) {
+    const cCoords = cSrc === 'A' ? coordsA : coordsB;
+    const [cx, cy] = cCoords[cIdx];
+
+    // Temporal predecessor in same source
+    let bSrc = null, bIdx = -1, bDist = Infinity;
+    if (cIdx > 0) {
+      const [px, py] = cCoords[cIdx - 1];
+      bDist = Math.sqrt((cx - px) ** 2 + (cy - py) ** 2);
+      bSrc = cSrc; bIdx = cIdx - 1;
+    }
+
+    // Cross-source candidates within range (multi-hop: check the other source)
+    if (range > 0) {
+      const oSrc    = cSrc === 'A' ? 'B' : 'A';
+      const oCoords = oSrc  === 'A' ? coordsA : coordsB;
+      for (let j = 0; j < oCoords.length; j++) {
+        const d = Math.sqrt((oCoords[j][0] - cx) ** 2 + (oCoords[j][1] - cy) ** 2);
+        if (d < range && d < bDist) { bDist = d; bSrc = oSrc; bIdx = j; }
+      }
+    }
+
+    if (bIdx < 0) break; // reached start of all sources
+    cSrc = bSrc; cIdx = bIdx;
+    frames.unshift({src: cSrc, idx: cIdx}); // prepend → oldest first
+  }
+  return frames;
+}
+
 // Build a Float32Array(N) of per-frame scale values for 48k trajectory decoding.
 // seq is an array of {src, idx}; returns null for 24k (scales not needed).
 function makeFrameScales(seq) {
@@ -1109,48 +1281,87 @@ function computeSnapWaypoints() {
 //   • at every source transition or backward jump
 // Within-source forward runs fill naturally (A[i]→A[i+1]→…).
 // For 48k a post-roll is appended after the last waypoint.
-function buildSnapSequence(waypoints, K_pre, K_post) {
+// Auto-duration snap: fixed K_pre per context window, deduplicates, natural length.
+function buildSnapSequence(waypoints, K_pre, K_post, ctxSwap) {
   const T_A = currentEmbeds.embQuantDimsA[2];
   const T_B = currentEmbeds.embQuantDimsB[2];
   const getT = src => src === 'A' ? T_A : T_B;
+  const seq  = [];
 
-  const addPreroll = (src, idx) => {
-    for (let i = Math.max(0, idx - K_pre); i <= idx; i++) seq.push({src, idx: i});
+  const addPreroll = (src, idx, K) => {
+    const frames = walkBackward(src, idx, K, ctxSwap);
+    for (const f of frames) seq.push(f);
+    seq.push({src, idx});
   };
 
-  const seq = [];
-
-  // Pre-roll before first waypoint
-  addPreroll(waypoints[0].src, waypoints[0].idx);
+  addPreroll(waypoints[0].src, waypoints[0].idx, K_pre);
 
   for (let w = 1; w < waypoints.length; w++) {
     const {src, idx} = waypoints[w];
     const prev = waypoints[w - 1];
-
     if (prev.src === src && idx > prev.idx && (idx - prev.idx) <= K_pre) {
-      // Close forward run in same source — fill naturally, LSTM stays warm
+      // Close forward same-source run — LSTM stays warm, fill naturally
       for (let i = prev.idx + 1; i <= idx; i++) seq.push({src, idx: i});
     } else {
-      // Far jump (same or different source), or backward — fresh pre-roll
-      addPreroll(src, idx);
+      addPreroll(src, idx, K_pre);
     }
   }
 
-  // Post-roll after last waypoint (48k only)
   if (K_post > 0) {
     const {src: sL, idx: iL} = waypoints[waypoints.length - 1];
     const T = getT(sL);
     for (let i = iL + 1; i <= Math.min(T - 1, iL + K_post); i++) seq.push({src: sL, idx: i});
   }
 
-  // Deduplicate consecutive identical frames
   if (!seq.length) return [];
   const out = [seq[0]];
   for (let i = 1; i < seq.length; i++) {
-    const prev = out[out.length - 1];
-    if (seq[i].src !== prev.src || seq[i].idx !== prev.idx) out.push(seq[i]);
+    const p = out[out.length - 1];
+    if (seq[i].src !== p.src || seq[i].idx !== p.idx) out.push(seq[i]);
   }
   return out;
+}
+
+// Fixed-duration snap: distributes frame budget evenly across waypoints so that
+// total = exactly N_target frames (+ K_post for 48k post-roll).
+// All waypoints are always visited; context window size is adjusted to hit the target.
+function buildSnapSequenceFixed(waypoints, N_target, K_post, ctxSwap) {
+  const N_wp     = waypoints.length;
+  const N_budget = Math.max(0, N_target - N_wp);  // frames for context windows
+  const K_base   = Math.floor(N_budget / N_wp);
+  const N_extra  = N_budget % N_wp;               // first N_extra waypoints get +1
+
+  const seq = [];
+
+  for (let w = 0; w < N_wp; w++) {
+    const {src, idx} = waypoints[w];
+    const K_this = K_base + (w < N_extra ? 1 : 0);
+
+    if (K_this > 0) {
+      const frames = walkBackward(src, idx, K_this, ctxSwap);
+      // Pad to K_this if walkBackward ran out (near source start)
+      const fallback = frames[0] || {src, idx};
+      while (frames.length < K_this) frames.unshift({...fallback});
+      for (const f of frames) seq.push(f);
+    }
+    seq.push({src, idx});
+  }
+
+  // Hard trim/extend to exactly N_target before post-roll
+  if (seq.length > N_target) {
+    seq.length = N_target;
+  } else {
+    while (seq.length < N_target) seq.push({...seq[seq.length - 1]});
+  }
+
+  // Post-roll (48k)
+  if (K_post > 0) {
+    const {src: sL, idx: iL} = waypoints[N_wp - 1];
+    const T_L = sL === 'A' ? currentEmbeds.embQuantDimsA[2] : currentEmbeds.embQuantDimsB[2];
+    for (let i = iL + 1; i <= Math.min(T_L - 1, iL + K_post); i++) seq.push({src: sL, idx: i});
+  }
+
+  return seq;
 }
 
 function autoRegenerate() {
@@ -1213,10 +1424,18 @@ async function playTrajectory() {
 
     const is48k  = mp.getModelHz() === '48k';
     const fps    = coordsA.length / srcWidget.getDuration();
-    const K_pre  = Math.max(4, Math.round(fps * 0.05));  // ~0.05 s pre-roll per context window
     const K_post = is48k ? Math.max(2, Math.round(fps * 0.03)) : 0;
 
-    const seq = buildSnapSequence(waypoints, K_pre, K_post);
+    let seq;
+    if (snapDurMode === 'fixed') {
+      const N_target = Math.max(waypoints.length,
+                         Math.round((parseFloat(trajDurationEl.value) || 4) * fps));
+      seq = buildSnapSequenceFixed(waypoints, N_target, K_post, ctxSwapRange);
+    } else {
+      const K_pre = Math.max(4, Math.round(fps * 0.05));
+      seq = buildSnapSequence(waypoints, K_pre, K_post, ctxSwapRange);
+    }
+
     snapPlayFrames = seq;
     renderScatter();
 
@@ -1230,7 +1449,8 @@ async function playTrajectory() {
     }
     if (!audioCtx) audioCtx = new AudioContext();
     playJobId = ++jobSeq;
-    setStatus(`Decoding snap (${N} frames, ~${(N / fps).toFixed(1)} s)…`);
+    const snapLabel = snapDurMode === 'fixed' ? 'snap fixed' : 'snap auto';
+    setStatus(`Decoding ${snapLabel} (${N} frames, ${(N / fps).toFixed(1)} s)…`);
     const snapScales  = makeFrameScales(seq);
     const snapXfers   = [blended.buffer];
     if (snapScales) snapXfers.push(snapScales.buffer);
