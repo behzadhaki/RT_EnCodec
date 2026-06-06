@@ -104,6 +104,47 @@
   user-select: none;
   z-index: 1;
 }
+
+/* ── Waveform row ───────────────────────────────────────────────────────── */
+#waveRow {
+  display: flex;
+  height: 78px;
+  flex-shrink: 0;
+  border-top: 1px solid var(--border);
+}
+.wavePanel {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--border);
+  min-width: 0;
+  overflow: hidden;
+}
+.wavePanel:last-child { border-right: none; }
+.waveHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 2px 5px;
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--border);
+}
+.waveLbl { font-size: 10px; color: var(--muted); letter-spacing: 0.05em; text-transform: uppercase; }
+.waveCtrl { display: flex; gap: 2px; }
+.waveBtn {
+  background: none;
+  border: 1px solid var(--border2);
+  color: var(--muted);
+  border-radius: 2px;
+  font-size: 9px;
+  width: 18px; height: 15px;
+  cursor: pointer;
+  padding: 0;
+  line-height: 1;
+}
+.waveBtn:hover { color: var(--text); border-color: var(--accent); }
+.waveBtn.active { background: var(--accent-lo); border-color: var(--accent); color: var(--text); }
+.waveCanvas { flex: 1; width: 100%; display: block; cursor: crosshair; min-height: 0; }
 </style>
 </head>
 <body>
@@ -129,6 +170,42 @@
         <input type="checkbox" id="chkTrail" checked>
         Visualize pre-roll context
       </label>
+    </div>
+
+    <div id="waveRow">
+      <div class="wavePanel">
+        <div class="waveHeader">
+          <span class="waveLbl">Source A</span>
+          <div class="waveCtrl">
+            <button class="waveBtn" id="wbPlayA">▶</button>
+            <button class="waveBtn" id="wbStopA">■</button>
+            <button class="waveBtn" id="wbLoopA">⟳</button>
+          </div>
+        </div>
+        <canvas class="waveCanvas" id="waveCanvA"></canvas>
+      </div>
+      <div class="wavePanel">
+        <div class="waveHeader">
+          <span class="waveLbl">Source B</span>
+          <div class="waveCtrl">
+            <button class="waveBtn" id="wbPlayB">▶</button>
+            <button class="waveBtn" id="wbStopB">■</button>
+            <button class="waveBtn" id="wbLoopB">⟳</button>
+          </div>
+        </div>
+        <canvas class="waveCanvas" id="waveCanvB"></canvas>
+      </div>
+      <div class="wavePanel">
+        <div class="waveHeader">
+          <span class="waveLbl">Generated</span>
+          <div class="waveCtrl">
+            <button class="waveBtn" id="wbPlayG">▶</button>
+            <button class="waveBtn" id="wbStopG">■</button>
+            <button class="waveBtn" id="wbLoopG">⟳</button>
+          </div>
+        </div>
+        <canvas class="waveCanvas" id="waveCanvG"></canvas>
+      </div>
     </div>
 
     <div id="legendBar">
@@ -314,10 +391,8 @@ trajSection.innerHTML = `
     </div>
   </div>
 
-  <div class="row" style="gap:5px;margin-top:2px">
+  <div class="row" style="margin-top:2px">
     <button class="tog" id="clearTraj" style="flex:1">Clear</button>
-    <button class="tog" id="playTraj"  style="flex:1">Play</button>
-    <button class="tog" id="loopTraj"  style="flex:1">Loop</button>
   </div>
 `.trim();
 controls.appendChild(trajSection);
@@ -438,15 +513,12 @@ document.getElementById('togSnapMode').addEventListener('click', () => setPathMo
 
 document.getElementById('clearTraj').addEventListener('click', () => {
   stopTrajPlayback();
+  playerG.stop();
   userTrajectory = []; rawDrawPoints = [];
   trajAudioBuf = null; codePathFrames = null;
-  snapFrames = null; snapPlayFrames = null;
+  snapFrames = null; snapPlayFrames = null; genPlaySeq = null;
+  trajAnchorPos = -1;
   renderScatter(); setStatus('Trajectory cleared.');
-});
-document.getElementById('playTraj').addEventListener('click', playTrajectory);
-document.getElementById('loopTraj').addEventListener('click', () => {
-  trajLooping = !trajLooping;
-  document.getElementById('loopTraj').classList.toggle('active', trajLooping);
 });
 
 // ── State ─────────────────────────────────────────────────────────────────────
@@ -492,6 +564,10 @@ let snapMode          = 'k_frames'; // 'k_frames' | 'equal' | 'proportional'
 let codeRepeat        = 1;
 let ctxSwapRange      = 0;       // UMAP-unit radius for context swap (0 = off)
 let showTrail         = true;
+let rawAudioA         = null;   // Float32Array — source A PCM (kept after encode)
+let rawAudioB         = null;   // Float32Array — source B PCM
+let genPlaySeq        = null;   // [{src,idx}] — frame seq for last decoded trajectory
+let waveHighlight     = null;   // {src,idx} | null — UMAP point driven by waveform playback
 let isShiftDragging   = false;
 let shiftDragStart    = null;     // [umapX, umapY] at drag start
 let shiftDragBaseTraj = null;     // trajectory snapshot at drag start
@@ -571,12 +647,15 @@ function onWorkerMsg(e) {
   }
 
   if (msg.type === 'trajectory_audio_exp6') {
-    if (msg.jobId === playJobId && audioCtx) {
-      const sr  = mp.getSampleRate();
-      const buf = audioCtx.createBuffer(1, msg.decoded.length, sr);
-      buf.copyToChannel(msg.decoded, 0);
-      trajAudioBuf = buf;
-      startTrajPlayback(buf, sr);
+    if (msg.jobId === playJobId) {
+      const sr = mp.getSampleRate();
+      // Stop any legacy crossfade source
+      stopTrajPlayback();
+      const wasPlaying = playerG.isPlaying();
+      // Load new audio into the Generated player
+      playerG.setAudio(msg.decoded, sr);
+      // If it was already playing, restart with the fresh buffer
+      if (wasPlaying) playerG.play();
     }
     return;
   }
@@ -631,6 +710,12 @@ async function startEncode() {
 
   coordsA = coordsB = null;
   renderScatter();
+
+  // Keep raw PCM for waveform players (worker receives a copy via .slice())
+  rawAudioA = audioA;
+  rawAudioB = audioB;
+  playerA.setAudio(rawAudioA, sr);
+  playerB.setAudio(rawAudioB, sr);
 
   pendingAudioB = audioB;
   encodePhase   = 'A';
@@ -871,6 +956,169 @@ async function runUMAP() {
   );
 }
 
+// ── Waveform player factory ───────────────────────────────────────────────────
+// Creates a self-contained waveform player for one audio buffer.
+// onFrameCb(pos)  called each animation frame while playing (pos=0..1, pos=-1 when stopped).
+
+function makeWavePlayer(canvasId, waveColor, onFrameCb) {
+  const cvs  = document.getElementById(canvasId);
+  const c2   = cvs.getContext('2d');
+  const pdpr = devicePixelRatio || 1;
+
+  let audio   = null;   // Float32Array
+  let sr      = 44100;
+  let peaks   = null;   // Float32Array: [min,max] per pixel col
+  let looping = false;
+  let playing = false;
+  let srcNode = null, gainNode = null;
+  let playStart  = 0;   // audioCtx.currentTime when play began
+  let playOffset = 0;   // seconds into buffer when play began
+  let animId  = null;
+  let cursorPos = -1;   // 0..1 external cursor, -1 = hidden
+  let playBtnEl = null, loopBtnEl = null;
+
+  const dur = () => audio ? audio.length / sr : 0;
+  const elapsed = () => playing && audioCtx
+    ? playOffset + (audioCtx.currentTime - playStart)
+    : playOffset;
+  const position = () => dur() > 0 ? Math.min(1, elapsed() / dur()) : 0;
+
+  function buildPeaks() {
+    if (!audio || !cvs.width) { peaks = null; return; }
+    const W = cvs.width;
+    peaks = new Float32Array(W * 2);
+    for (let px = 0; px < W; px++) {
+      const s0 = Math.floor(px / W * audio.length);
+      const s1 = Math.max(s0 + 1, Math.floor((px + 1) / W * audio.length));
+      let mn = 0, mx = 0;
+      for (let s = s0; s < s1 && s < audio.length; s++) {
+        const v = audio[s]; if (v < mn) mn = v; if (v > mx) mx = v;
+      }
+      peaks[px * 2] = mn; peaks[px * 2 + 1] = mx;
+    }
+  }
+
+  function draw() {
+    const W = cvs.width, H = cvs.height;
+    c2.clearRect(0, 0, W, H);
+
+    if (!peaks) {
+      c2.fillStyle = '#444';
+      c2.font = `${9 * pdpr}px system-ui`;
+      c2.textAlign = 'center';
+      c2.fillText('no audio', W / 2, H / 2 + 3);
+      return;
+    }
+
+    // Waveform
+    const cy = H / 2;
+    c2.fillStyle = waveColor;
+    c2.globalAlpha = 0.5;
+    for (let px = 0; px < W; px++) {
+      const mn = peaks[px * 2], mx = peaks[px * 2 + 1];
+      c2.fillRect(px, cy - mx * cy, 1, Math.max(1, (mx - mn) * cy));
+    }
+    c2.globalAlpha = 1;
+
+    // External cursor (UMAP-selected frame)
+    if (cursorPos >= 0) {
+      const cx = cursorPos * W;
+      c2.strokeStyle = '#ffffff66';
+      c2.lineWidth = 1 * pdpr;
+      c2.beginPath(); c2.moveTo(cx, 0); c2.lineTo(cx, H); c2.stroke();
+    }
+
+    // Playhead
+    if (playing || playOffset > 0) {
+      const px = position() * W;
+      c2.strokeStyle = '#ffffff';
+      c2.lineWidth = 1.5 * pdpr;
+      c2.beginPath(); c2.moveTo(px, 0); c2.lineTo(px, H); c2.stroke();
+    }
+  }
+
+  function updatePlayBtn() {
+    if (!playBtnEl) return;
+    playBtnEl.textContent = playing ? '⏸' : '▶';
+    playBtnEl.classList.toggle('active', playing);
+  }
+
+  function doPlay(offset) {
+    if (!audio) return;
+    if (!audioCtx) audioCtx = new AudioContext();
+    try { srcNode?.stop(); } catch(_) {}
+    try { gainNode?.disconnect(); } catch(_) {}
+
+    playOffset = Math.max(0, Math.min(offset, dur() - 0.001));
+    playStart  = audioCtx.currentTime;
+
+    gainNode = audioCtx.createGain();
+    gainNode.gain.value = 1;
+    gainNode.connect(audioCtx.destination);
+
+    const buf = audioCtx.createBuffer(1, audio.length, sr);
+    buf.copyToChannel(audio, 0);
+    srcNode = audioCtx.createBufferSource();
+    srcNode.buffer = buf;
+    srcNode.connect(gainNode);
+    srcNode.start(0, playOffset);
+    srcNode.onended = () => {
+      playing = false; updatePlayBtn();
+      if (looping) { playOffset = 0; doPlay(0); }
+      else { playOffset = 0; cancelAnimationFrame(animId); draw(); onFrameCb?.(-1); }
+    };
+    playing = true; updatePlayBtn();
+    cancelAnimationFrame(animId);
+    (function animate() { draw(); onFrameCb?.(position()); if (playing) animId = requestAnimationFrame(animate); })();
+  }
+
+  // Click canvas to seek
+  cvs.addEventListener('click', e => {
+    const rect = cvs.getBoundingClientRect();
+    const pos  = (e.clientX - rect.left) / rect.width;
+    const t    = pos * dur();
+    if (playing) doPlay(t); else { playOffset = t; draw(); }
+  });
+
+  // Resize
+  const ro = new ResizeObserver(() => {
+    const r = cvs.getBoundingClientRect();
+    if (!r.width) return;
+    cvs.width = r.width * pdpr; cvs.height = r.height * pdpr;
+    buildPeaks(); draw();
+  });
+  ro.observe(cvs);
+
+  return {
+    setAudio(f32, sampleRate) {
+      audio = f32; sr = sampleRate;
+      playOffset = 0; playing = false;
+      updatePlayBtn(); buildPeaks(); draw();
+    },
+    play() {
+      if (playing) {                         // toggle → pause
+        playOffset = elapsed();
+        try { srcNode?.stop(); } catch(_) {}
+        playing = false; cancelAnimationFrame(animId);
+        updatePlayBtn(); draw();
+      } else { doPlay(playOffset); }         // start / resume
+    },
+    stop() {
+      try { srcNode?.stop(); } catch(_) {}
+      try { gainNode?.disconnect(); } catch(_) {}
+      srcNode = null; gainNode = null;
+      playing = false; playOffset = 0;
+      cancelAnimationFrame(animId); updatePlayBtn(); draw(); onFrameCb?.(-1);
+    },
+    setLoop(on) { looping = on; loopBtnEl?.classList.toggle('active', on); },
+    setCursor(pos) { cursorPos = pos; draw(); },
+    setPlayBtn(el) { playBtnEl = el; updatePlayBtn(); },
+    setLoopBtn(el) { loopBtnEl = el; },
+    isPlaying: () => playing,
+    getPosition: position,
+  };
+}
+
 // ── Scatter plot ──────────────────────────────────────────────────────────────
 
 function renderScatter() {
@@ -952,6 +1200,22 @@ function renderScatter() {
       ctx.lineWidth   = 1.5 * dpr;
       ctx.beginPath();
       ctx.arc(toX(pt[0]), toY(pt[1]), 6 * dpr, 0, 2 * Math.PI);
+      ctx.stroke();
+      ctx.restore();
+    }
+  }
+
+  // Waveform-driven highlight (active during waveform player playback)
+  if (waveHighlight) {
+    const coords = waveHighlight.src === 'A' ? coordsA : coordsB;
+    if (coords && waveHighlight.idx < coords.length) {
+      const [hx, hy] = coords[waveHighlight.idx];
+      ctx.save();
+      ctx.strokeStyle = waveHighlight.src === 'A' ? '#e89a20' : '#30aadc';
+      ctx.lineWidth   = 2 * dpr;
+      ctx.globalAlpha = 0.95;
+      ctx.beginPath();
+      ctx.arc(toX(hx), toY(hy), 7 * dpr, 0, 2 * Math.PI);
       ctx.stroke();
       ctx.restore();
     }
@@ -1260,6 +1524,11 @@ umapCanvas.addEventListener('click', async e => {
   if (bestIdx < 0) return;
 
   selectedPoint = { src: bestSrc, idx: bestIdx };
+  // Update the corresponding source waveform cursor
+  const srcLen = bestSrc === 'A' ? coordsA.length : coordsB.length;
+  const srcPos = bestIdx / srcLen;
+  if (bestSrc === 'A') { playerA.setCursor(srcPos); playerB.setCursor(-1); }
+  else                 { playerB.setCursor(srcPos); playerA.setCursor(-1); }
   renderScatter();
 
   const T = bestSrc === 'A' ? currentEmbeds.codesDimsA[2] : currentEmbeds.codesDimsB[2];
@@ -1703,6 +1972,7 @@ async function playTrajectory() {
       sampledWPs.push(waypoints[wi]);
     }
     codePathFrames = sampledWPs;
+    genPlaySeq = sampledWPs;
     renderScatter();
 
     const blended = new Float32Array(D * N);
@@ -1747,6 +2017,7 @@ async function playTrajectory() {
     }
 
     snapPlayFrames = seq;
+    genPlaySeq = seq;
     renderScatter();
 
     const N = seq.length;
@@ -1774,6 +2045,7 @@ async function playTrajectory() {
   }
 
   // ── Draw-path mode ────────────────────────────────────────────────────────
+  genPlaySeq = null; // draw mode = interpolated, no direct frame mapping
   const duration     = parseFloat(trajDurationEl.value) || 4;
   const framesPerSec = coordsA.length / srcWidget.getDuration();
   const N            = Math.max(2, Math.round(duration * framesPerSec));
@@ -1841,6 +2113,63 @@ async function playTrajectory() {
     modelHz: mp.getModelHz(), bwKbps: mp.getBwKbps(),
   }, drawXfers);
 }
+
+// ── Waveform player instances ─────────────────────────────────────────────────
+
+const playerA = makeWavePlayer('waveCanvA', '#c87800', pos => {
+  if (pos < 0 || !coordsA) { waveHighlight = null; renderScatter(); return; }
+  const i = Math.min(Math.floor(pos * coordsA.length), coordsA.length - 1);
+  waveHighlight = { src: 'A', idx: i };
+  playerB.setCursor(-1);
+  renderScatter();
+});
+
+const playerB = makeWavePlayer('waveCanvB', '#2090c0', pos => {
+  if (pos < 0 || !coordsB) { waveHighlight = null; renderScatter(); return; }
+  const i = Math.min(Math.floor(pos * coordsB.length), coordsB.length - 1);
+  waveHighlight = { src: 'B', idx: i };
+  playerA.setCursor(-1);
+  renderScatter();
+});
+
+const playerG = makeWavePlayer('waveCanvG', '#44bb88', pos => {
+  // Drive the UMAP playhead from the Generated player's position
+  trajAnchorPos = pos >= 0 ? pos : -1;
+
+  if (pos < 0 || !genPlaySeq) {
+    waveHighlight = null;
+    playerA.setCursor(-1); playerB.setCursor(-1);
+    renderScatter(); return;
+  }
+  const i = Math.min(Math.floor(pos * (genPlaySeq.length - 1)), genPlaySeq.length - 1);
+  const frame = genPlaySeq[i];
+  if (!frame) return;
+  waveHighlight = { src: frame.src, idx: frame.idx };
+  // Show cursor on the corresponding source player
+  const srcLen = frame.src === 'A' ? (coordsA?.length ?? 1) : (coordsB?.length ?? 1);
+  const srcPos = frame.idx / srcLen;
+  if (frame.src === 'A') { playerA.setCursor(srcPos); playerB.setCursor(-1); }
+  else                   { playerB.setCursor(srcPos); playerA.setCursor(-1); }
+  renderScatter();
+});
+
+// Wire play/stop/loop buttons
+playerA.setPlayBtn(document.getElementById('wbPlayA'));
+playerA.setLoopBtn(document.getElementById('wbLoopA'));
+playerB.setPlayBtn(document.getElementById('wbPlayB'));
+playerB.setLoopBtn(document.getElementById('wbLoopB'));
+playerG.setPlayBtn(document.getElementById('wbPlayG'));
+playerG.setLoopBtn(document.getElementById('wbLoopG'));
+
+['A','B','G'].forEach(id => {
+  const p = id === 'A' ? playerA : id === 'B' ? playerB : playerG;
+  document.getElementById(`wbPlay${id}`).addEventListener('click', () => p.play());
+  document.getElementById(`wbStop${id}`).addEventListener('click', () => p.stop());
+  document.getElementById(`wbLoop${id}`).addEventListener('click', () => {
+    const btn = document.getElementById(`wbLoop${id}`);
+    p.setLoop(!btn.classList.contains('active'));
+  });
+});
 </script>
 </body>
 </html>
