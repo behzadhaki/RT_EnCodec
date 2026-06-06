@@ -91,6 +91,43 @@
   transition: width 0.08s;
 }
 
+#pinSeqBar {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 3px;
+  padding: 5px 10px;
+  background: #00000099;
+  z-index: 2;
+  pointer-events: all;
+  border-bottom: 1px solid #333;
+}
+
+.pinChip {
+  cursor: grab;
+  background: #1e1e1e;
+  border: 1px solid #ffd70099;
+  border-radius: 3px;
+  padding: 1px 6px;
+  font-size: 11px;
+  color: #ffd700;
+  user-select: none;
+  transition: background 0.1s;
+}
+.pinChip:hover { background: #2e2e1e; }
+.pinChip.drag-over { border-color: #ffd700; background: #3a3a00; }
+
+.pinArrow {
+  color: #666;
+  font-size: 11px;
+  align-self: center;
+}
+
 #trailToggle {
   position: absolute;
   top: 8px;
@@ -166,6 +203,7 @@
     </div>
 
     <div id="umapWrap">
+      <div id="pinSeqBar"></div>
       <canvas id="umapCanvas"></canvas>
       <label id="trailToggle" style="display:none">
         <input type="checkbox" id="chkTrail" checked>
@@ -559,6 +597,7 @@ document.getElementById('clearTraj').addEventListener('click', () => {
   trajAudioBuf = null; codePathFrames = null;
   snapFrames = null; snapPlayFrames = null; genPlaySeq = null;
   trajAnchorPos = -1;
+  updatePinSeqBar();
   renderScatter(); setStatus('Trajectory cleared.');
 });
 
@@ -627,6 +666,9 @@ let waveHighlight     = null;   // {src,idx} | null — UMAP point driven by wav
 let isShiftDragging   = false;
 let shiftDragStart    = null;     // [umapX, umapY] at drag start
 let shiftDragBaseTraj = null;     // trajectory snapshot at drag start
+let isPinDragging     = false;
+let pinDragIdx        = -1;
+let pinSeqDragSrc     = -1;       // index of chip being dragged in seq bar
 const dpr = devicePixelRatio || 1;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -1353,6 +1395,38 @@ function renderScatter() {
 
   drawTrail(coordsA, '#c87800');
   drawTrail(coordsB, '#2090c0');
+
+  // ── Pins: drawn BEFORE data points so A/B markers remain visible on top ──
+  if (pinPoints.length > 0) {
+    const r = 8 * dpr;
+    if (pinPoints.length >= 2) {
+      ctx.save();
+      ctx.strokeStyle = '#ffd70055';
+      ctx.lineWidth   = 1 * dpr;
+      ctx.beginPath();
+      ctx.moveTo(toX(pinPoints[0][0]), toY(pinPoints[0][1]));
+      for (let i = 1; i < pinPoints.length; i++)
+        ctx.lineTo(toX(pinPoints[i][0]), toY(pinPoints[i][1]));
+      ctx.stroke();
+      ctx.restore();
+    }
+    ctx.save();
+    ctx.font = `bold ${10 * dpr}px system-ui`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    for (let i = 0; i < pinPoints.length; i++) {
+      const cx = toX(pinPoints[i][0]), cy = toY(pinPoints[i][1]);
+      ctx.fillStyle   = '#ffd700';
+      ctx.strokeStyle = '#000000';
+      ctx.lineWidth   = 1 * dpr;
+      ctx.beginPath(); ctx.arc(cx, cy, r, 0, 2 * Math.PI);
+      ctx.fill(); ctx.stroke();
+      ctx.fillStyle = '#000000';
+      ctx.fillText(String(i + 1), cx, cy);
+    }
+    ctx.restore();
+  }
+
   drawCirclesEmpty(coordsA,   '#c87800');
   drawTrianglesEmpty(coordsB, '#2090c0');
 
@@ -1384,40 +1458,6 @@ function renderScatter() {
       ctx.stroke();
       ctx.restore();
     }
-  }
-
-  // ── Pins overlay ─────────────────────────────────────────────────────────
-  if (pinPoints.length > 0) {
-    const r = 8 * dpr;
-    // Connecting lines
-    if (pinPoints.length >= 2) {
-      ctx.save();
-      ctx.strokeStyle = '#ffffff66';
-      ctx.lineWidth   = 1 * dpr;
-      ctx.setLineDash([4 * dpr, 3 * dpr]);
-      ctx.beginPath();
-      ctx.moveTo(toX(pinPoints[0][0]), toY(pinPoints[0][1]));
-      for (let i = 1; i < pinPoints.length; i++)
-        ctx.lineTo(toX(pinPoints[i][0]), toY(pinPoints[i][1]));
-      ctx.stroke();
-      ctx.restore();
-    }
-    // Numbered circles
-    ctx.save();
-    ctx.font = `bold ${10 * dpr}px system-ui`;
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    for (let i = 0; i < pinPoints.length; i++) {
-      const cx = toX(pinPoints[i][0]), cy = toY(pinPoints[i][1]);
-      ctx.fillStyle   = '#ffd700';
-      ctx.strokeStyle = '#000000';
-      ctx.lineWidth   = 1 * dpr;
-      ctx.beginPath(); ctx.arc(cx, cy, r, 0, 2 * Math.PI);
-      ctx.fill(); ctx.stroke();
-      ctx.fillStyle = '#000000';
-      ctx.fillText(String(i + 1), cx, cy);
-    }
-    ctx.restore();
   }
 
   // ── Trajectory overlay ────────────────────────────────────────────────────
@@ -1596,7 +1636,60 @@ function renderScatter() {
 
 // ── Mode toggles ──────────────────────────────────────────────────────────────
 
-const togPins = document.getElementById('togPins');
+const togPins    = document.getElementById('togPins');
+const pinSeqBar  = document.getElementById('pinSeqBar');
+
+function updatePinSeqBar() {
+  if (canvasMode !== 'pins' || pinPoints.length === 0) {
+    pinSeqBar.style.display = 'none';
+    return;
+  }
+  pinSeqBar.style.display = 'flex';
+  pinSeqBar.innerHTML = '';
+
+  pinPoints.forEach((_, i) => {
+    if (i > 0) {
+      const arrow = document.createElement('span');
+      arrow.className = 'pinArrow';
+      arrow.textContent = '→';
+      pinSeqBar.appendChild(arrow);
+    }
+
+    const chip = document.createElement('span');
+    chip.className = 'pinChip';
+    chip.textContent = `[${i + 1}]`;
+    chip.draggable = true;
+    chip.dataset.idx = i;
+
+    chip.addEventListener('dragstart', e => {
+      pinSeqDragSrc = parseInt(e.currentTarget.dataset.idx);
+      e.dataTransfer.effectAllowed = 'move';
+    });
+    chip.addEventListener('dragover', e => {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      e.currentTarget.classList.add('drag-over');
+    });
+    chip.addEventListener('dragleave', e => {
+      e.currentTarget.classList.remove('drag-over');
+    });
+    chip.addEventListener('drop', e => {
+      e.preventDefault();
+      e.currentTarget.classList.remove('drag-over');
+      const dstIdx = parseInt(e.currentTarget.dataset.idx);
+      if (pinSeqDragSrc < 0 || dstIdx === pinSeqDragSrc) return;
+      const [moved] = pinPoints.splice(pinSeqDragSrc, 1);
+      pinPoints.splice(dstIdx, 0, moved);
+      pinSeqDragSrc = -1;
+      userTrajectory = pinPoints.length >= 2 ? resamplePath(pinPoints, 300) : [];
+      updatePinSeqBar();
+      renderScatter();
+      if (userTrajectory.length >= 2) autoRegenerate();
+    });
+
+    pinSeqBar.appendChild(chip);
+  });
+}
 
 function setCanvasMode(mode) {
   canvasMode = mode;
@@ -1604,9 +1697,10 @@ function setCanvasMode(mode) {
   togDraw   .classList.toggle('active', mode === 'draw');
   togPins   .classList.toggle('active', mode === 'pins');
   umapCanvas.style.cursor = mode === 'draw' ? 'crosshair' : mode === 'pins' ? 'cell' : 'crosshair';
-  if (mode === 'draw')  setStatus('Click and drag on the UMAP to draw a trajectory.');
-  if (mode === 'pins')  setStatus('Double-click to add/remove pins. Pins define the playback sequence.');
+  if (mode === 'draw')    setStatus('Click and drag on the UMAP to draw a trajectory.');
+  if (mode === 'pins')    setStatus('Double-click near a UMAP point to add/remove pins.');
   if (mode === 'explore') setStatus('');
+  updatePinSeqBar();
 }
 
 togExplore.addEventListener('click', () => setCanvasMode('explore'));
@@ -1715,6 +1809,22 @@ umapCanvas.addEventListener('mousedown', e => {
     renderScatter();
     return;
   }
+  if (canvasMode === 'pins' && coordsA && coordsB) {
+    // Check if near an existing pin → start pin drag
+    const rect  = umapCanvas.getBoundingClientRect();
+    const physX = (e.clientX - rect.left) * dpr;
+    const physY = (e.clientY - rect.top)  * dpr;
+    const hitIdx = pinPoints.findIndex(([ux, uy]) => {
+      const [cx, cy] = umapToCanvas(ux, uy);
+      return (cx - physX) ** 2 + (cy - physY) ** 2 < (14 * dpr) ** 2;
+    });
+    if (hitIdx >= 0) {
+      isPinDragging = true;
+      pinDragIdx    = hitIdx;
+      umapCanvas.style.cursor = 'grabbing';
+      return;
+    }
+  }
   // Explore or Pins mode: start potential pan drag
   if (canvasMode === 'explore' || canvasMode === 'pins') {
     isPanDragging = true;
@@ -1724,6 +1834,26 @@ umapCanvas.addEventListener('mousedown', e => {
 });
 
 umapCanvas.addEventListener('mousemove', e => {
+  if (isPinDragging) {
+    if (!coordsA || !coordsB) return;
+    const [umapX, umapY] = canvasToUmap(e);
+    let bestDist2 = Infinity, bestPt = null;
+    for (const [x, y] of coordsA) {
+      const d2 = (x - umapX) ** 2 + (y - umapY) ** 2;
+      if (d2 < bestDist2) { bestDist2 = d2; bestPt = [x, y]; }
+    }
+    for (const [x, y] of coordsB) {
+      const d2 = (x - umapX) ** 2 + (y - umapY) ** 2;
+      if (d2 < bestDist2) { bestDist2 = d2; bestPt = [x, y]; }
+    }
+    if (bestPt) {
+      pinPoints[pinDragIdx] = bestPt;
+      userTrajectory = pinPoints.length >= 2 ? resamplePath(pinPoints, 300) : [];
+      updatePinSeqBar();
+      renderScatter();
+    }
+    return;
+  }
   if (isShiftDragging) {
     const [cx, cy] = canvasToUmap(e);
     const dx = cx - shiftDragStart[0], dy = cy - shiftDragStart[1];
@@ -1767,6 +1897,13 @@ const finishShiftDrag = () => {
   autoRegenerate();
 };
 
+const finishPinDrag = () => {
+  if (!isPinDragging) return;
+  isPinDragging = false; pinDragIdx = -1;
+  umapCanvas.style.cursor = 'cell';
+  if (userTrajectory.length >= 2) autoRegenerate();
+};
+
 const finishDraw = () => {
   if (!isDrawing) return;
   isDrawing = false;
@@ -1779,18 +1916,18 @@ const finishDraw = () => {
   if (userTrajectory.length >= 2) autoRegenerate();
 };
 
-umapCanvas.addEventListener('mouseup',    () => { finishPanDrag(); finishShiftDrag(); finishDraw(); });
-umapCanvas.addEventListener('mouseleave', () => { finishPanDrag(); finishShiftDrag(); finishDraw(); });
+umapCanvas.addEventListener('mouseup',    () => { finishPanDrag(); finishShiftDrag(); finishDraw(); finishPinDrag(); });
+umapCanvas.addEventListener('mouseleave', () => { finishPanDrag(); finishShiftDrag(); finishDraw(); finishPinDrag(); });
 
-// ── Double-click: add/remove pins ─────────────────────────────────────────────
+// ── Double-click: add/remove pins (only near existing UMAP points) ────────────
 umapCanvas.addEventListener('dblclick', e => {
-  if (canvasMode !== 'pins' || !lastTransform) return;
+  if (canvasMode !== 'pins' || !lastTransform || !coordsA || !coordsB) return;
   const rect   = umapCanvas.getBoundingClientRect();
   const physX  = (e.clientX - rect.left) * dpr;
   const physY  = (e.clientY - rect.top)  * dpr;
   const hitR2  = (14 * dpr) ** 2;
 
-  // Check if near an existing pin
+  // Check if near an existing pin → remove it
   const hitIdx = pinPoints.findIndex(([ux, uy]) => {
     const [cx, cy] = umapToCanvas(ux, uy);
     return (cx - physX) ** 2 + (cy - physY) ** 2 < hitR2;
@@ -1799,13 +1936,31 @@ umapCanvas.addEventListener('dblclick', e => {
   if (hitIdx >= 0) {
     pinPoints.splice(hitIdx, 1);
   } else {
-    pinPoints.push(canvasToUmap(e));
+    // Only add a pin if close enough to an actual UMAP point
+    const SNAP_R2 = (18 * dpr) ** 2;
+    let bestDist2 = Infinity, bestPt = null;
+    for (const [x, y] of coordsA) {
+      const [cx, cy] = umapToCanvas(x, y);
+      const d2 = (cx - physX) ** 2 + (cy - physY) ** 2;
+      if (d2 < bestDist2) { bestDist2 = d2; bestPt = [x, y]; }
+    }
+    for (const [x, y] of coordsB) {
+      const [cx, cy] = umapToCanvas(x, y);
+      const d2 = (cx - physX) ** 2 + (cy - physY) ** 2;
+      if (d2 < bestDist2) { bestDist2 = d2; bestPt = [x, y]; }
+    }
+    if (!bestPt || bestDist2 > SNAP_R2) {
+      setStatus('Double-click closer to a UMAP point to add a pin.');
+      return;
+    }
+    pinPoints.push(bestPt);
   }
 
   userTrajectory = pinPoints.length >= 2 ? resamplePath(pinPoints, 300) : [];
+  updatePinSeqBar();
   renderScatter();
   if (userTrajectory.length >= 2) autoRegenerate();
-  else setStatus(pinPoints.length === 1 ? 'Pin added. Double-click to add more.' : '');
+  else setStatus(pinPoints.length === 1 ? 'Pin added. Double-click near another point to add more.' : '');
 });
 
 // ── Click to play (explore mode) ──────────────────────────────────────────────
