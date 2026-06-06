@@ -90,6 +90,20 @@
   border-radius: 2px;
   transition: width 0.08s;
 }
+
+#trailToggle {
+  position: absolute;
+  top: 8px;
+  right: 10px;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  color: var(--muted);
+  cursor: pointer;
+  user-select: none;
+  z-index: 1;
+}
 </style>
 </head>
 <body>
@@ -111,11 +125,21 @@
 
     <div id="umapWrap">
       <canvas id="umapCanvas"></canvas>
+      <label id="trailToggle" style="display:none">
+        <input type="checkbox" id="chkTrail" checked>
+        Visualize pre-roll context
+      </label>
     </div>
 
     <div id="legendBar">
-      <span><span class="ldot" style="background:#c87800"></span>Source A</span>
-      <span><span class="ldot" style="background:#2090c0"></span>Source B</span>
+      <span>
+        <svg width="14" height="14" style="vertical-align:middle;margin-right:3px">
+          <circle cx="7" cy="7" r="4.5" fill="none" stroke="#c87800" stroke-width="1.5"/>
+        </svg>Source A</span>
+      <span>
+        <svg width="14" height="14" style="vertical-align:middle;margin-right:3px">
+          <polygon points="7,1.5 12.5,11.5 1.5,11.5" fill="none" stroke="#2090c0" stroke-width="1.5"/>
+        </svg>Source B</span>
     </div>
 
     <div id="statusWrap">
@@ -276,6 +300,7 @@ document.getElementById('togDrawMode').addEventListener('click', () => {
   pathMode = 'draw';
   document.getElementById('togDrawMode').classList.add('active');
   document.getElementById('togCodeMode').classList.remove('active');
+  document.getElementById('trailToggle').style.display = 'none';
   durRow.style.display = '';
   codePathFrames = null; renderScatter();
 });
@@ -287,6 +312,7 @@ const setPathMode = (mode) => {
   durRow.style.display = mode === 'code' ? 'none' : '';
   document.getElementById('snapDurRow').style.display = mode === 'snap' ? '' : 'none';
   document.getElementById('ctxSwapRow').style.display = mode === 'snap' ? '' : 'none';
+  document.getElementById('trailToggle').style.display = mode === 'snap' ? '' : 'none';
   codePathFrames = null; snapFrames = null; snapPlayFrames = null;
   renderScatter(); autoRegenerate();
 };
@@ -363,6 +389,7 @@ let snapPlayFrames    = null;     // full snap sequence (with pre-roll) for play
 let trajCurrentDuration = 0;     // actual playback duration (set at play time)
 let snapDurMode       = 'auto';  // 'auto' | 'fixed'
 let ctxSwapRange      = 0;       // UMAP-unit radius for context swap (0 = off)
+let showTrail         = true;
 let isShiftDragging   = false;
 let shiftDragStart    = null;     // [umapX, umapY] at drag start
 let shiftDragBaseTraj = null;     // trajectory snapshot at drag start
@@ -575,6 +602,11 @@ togPerLevel.addEventListener('click', () => {
 
 [nNeighborsEl, minDistEl].forEach(el => el.addEventListener('change', triggerUMAP));
 
+document.getElementById('chkTrail').addEventListener('change', e => {
+  showTrail = e.target.checked;
+  renderScatter();
+});
+
 // ── Codebook loading ──────────────────────────────────────────────────────────
 
 async function ensureCodebooks() {
@@ -778,20 +810,36 @@ function renderScatter() {
     ctx.restore();
   }
 
-  function drawDots(coords, color) {
+  function drawCirclesEmpty(coords, color) {
     const r = 2.5 * dpr;
-    ctx.fillStyle = color;
+    ctx.strokeStyle = color;
+    ctx.lineWidth   = 1 * dpr;
     for (const [x, y] of coords) {
       ctx.beginPath();
       ctx.arc(toX(x), toY(y), r, 0, 2 * Math.PI);
-      ctx.fill();
+      ctx.stroke();
+    }
+  }
+
+  function drawTrianglesEmpty(coords, color) {
+    const r = 3 * dpr;
+    ctx.strokeStyle = color;
+    ctx.lineWidth   = 1 * dpr;
+    for (const [x, y] of coords) {
+      const px = toX(x), py = toY(y);
+      ctx.beginPath();
+      ctx.moveTo(px,               py - r);
+      ctx.lineTo(px + r * 0.866,   py + r * 0.5);
+      ctx.lineTo(px - r * 0.866,   py + r * 0.5);
+      ctx.closePath();
+      ctx.stroke();
     }
   }
 
   drawTrail(coordsA, '#c87800');
   drawTrail(coordsB, '#2090c0');
-  drawDots(coordsA, '#c87800');
-  drawDots(coordsB, '#2090c0');
+  drawCirclesEmpty(coordsA,   '#c87800');
+  drawTrianglesEmpty(coordsB, '#2090c0');
 
   if (selectedPoint) {
     const coords = selectedPoint.src === 'A' ? coordsA : coordsB;
@@ -826,22 +874,84 @@ function renderScatter() {
   // ── Snap overlay ──────────────────────────────────────────────────────────
   if (pathMode === 'snap' && snapFrames && snapFrames.length >= 2) {
     const ptOf = ({src, idx}) => src === 'A' ? coordsA[idx] : coordsB[idx];
+
+    // ── Active context highlight (only during playback, only if enabled) ─
+    if (showTrail && trajAnchorPos >= 0 && snapPlayFrames && snapPlayFrames.length >= 2) {
+      const fi       = Math.min(Math.floor(trajAnchorPos * (snapPlayFrames.length - 1)), snapPlayFrames.length - 1);
+      const activeWi = snapPlayFrames[fi]?._wp;
+
+      if (activeWi !== undefined && activeWi < snapFrames.length) {
+        const wp        = snapFrames[activeWi];
+        const ctxKs    = getContextKs(snapFrames);
+        const ctxFrames = walkBackward(wp.src, wp.idx, ctxKs[activeWi], ctxSwapRange);
+
+        // Progressively highlight trail segments as the playhead moves through context.
+        // Find how far into this waypoint's region we are, then reveal segments up to that point.
+        if (ctxFrames.length > 0) {
+          const allCtx = [...ctxFrames, wp]; // oldest → newest, ending at anchor
+
+          // Scan backward to find where this waypoint's context region starts
+          let contextStart = fi;
+          while (contextStart > 0 && snapPlayFrames[contextStart - 1]?._wp === activeWi) contextStart--;
+
+          const elapsed  = fi - contextStart;
+          const segTotal = allCtx.length - 1;
+          const progress = Math.min(1, elapsed / Math.max(1, segTotal));
+          const segCount = Math.ceil(progress * segTotal);
+
+          ctx.save();
+          ctx.globalAlpha = 0.85;
+          for (let i = 1; i <= segCount && i < allCtx.length; i++) {
+            const prev = allCtx[i - 1], curr = allCtx[i];
+            const [px, py] = ptOf(prev), [cx, cy] = ptOf(curr);
+            ctx.beginPath();
+            ctx.moveTo(toX(px), toY(py));
+            ctx.lineTo(toX(cx), toY(cy));
+            if (prev.src === curr.src) {
+              ctx.strokeStyle = curr.src === 'A' ? '#c87800' : '#2090c0';
+              ctx.lineWidth   = 0.9 * dpr;
+            } else {
+              ctx.strokeStyle = '#bbbbbb';
+              ctx.lineWidth   = 1 * dpr;
+            }
+            ctx.stroke();
+          }
+          ctx.restore();
+        }
+
+        // Anchor ring on the active waypoint only
+        ctx.save();
+        const [wx, wy] = ptOf(wp);
+        ctx.strokeStyle = '#bbbbbb';
+        ctx.lineWidth   = 1.5 * dpr;
+        ctx.globalAlpha = 0.9;
+        ctx.beginPath();
+        ctx.arc(toX(wx), toY(wy), 5 * dpr, 0, 2 * Math.PI);
+        ctx.stroke();
+        ctx.restore();
+      }
+    }
+
+    // ── Snap path + waypoint dots (always visible, grey) ─────────────────
     ctx.save();
-    ctx.strokeStyle = '#ff9944';
+    ctx.strokeStyle = '#888888';
     ctx.lineWidth   = 1.5 * dpr;
-    ctx.globalAlpha = 0.85;
+    ctx.globalAlpha = 0.75;
     ctx.beginPath();
     for (let i = 0; i < snapFrames.length; i++) {
       const [x, y] = ptOf(snapFrames[i]);
       i === 0 ? ctx.moveTo(toX(x), toY(y)) : ctx.lineTo(toX(x), toY(y));
     }
     ctx.stroke();
-    ctx.fillStyle   = '#ff9944';
-    ctx.globalAlpha = 0.65;
+
+    ctx.fillStyle   = '#888888';
+    ctx.globalAlpha = 0.55;
     for (const f of snapFrames) {
       const [x, y] = ptOf(f);
       ctx.beginPath(); ctx.arc(toX(x), toY(y), 3 * dpr, 0, 2 * Math.PI); ctx.fill();
     }
+
+    // Start (green) / end (red) caps
     ctx.globalAlpha = 1;
     const [sx, sy] = ptOf(snapFrames[0]);
     const [ex, ey] = ptOf(snapFrames[snapFrames.length - 1]);
@@ -1283,29 +1393,30 @@ function buildSnapSequence(waypoints, K_pre, K_post, ctxSwap) {
   const getT = src => src === 'A' ? T_A : T_B;
   const seq  = [];
 
-  const addPreroll = (src, idx, K) => {
+  const addPreroll = (src, idx, K, wi) => {
     const frames = walkBackward(src, idx, K, ctxSwap);
-    for (const f of frames) seq.push(f);
-    seq.push({src, idx});
+    for (const f of frames) seq.push({...f, _wp: wi});
+    seq.push({src, idx, _wp: wi});
   };
 
-  addPreroll(waypoints[0].src, waypoints[0].idx, K_pre);
+  addPreroll(waypoints[0].src, waypoints[0].idx, K_pre, 0);
 
   for (let w = 1; w < waypoints.length; w++) {
     const {src, idx} = waypoints[w];
     const prev = waypoints[w - 1];
     if (prev.src === src && idx > prev.idx && (idx - prev.idx) <= K_pre) {
       // Close forward same-source run — LSTM stays warm, fill naturally
-      for (let i = prev.idx + 1; i <= idx; i++) seq.push({src, idx: i});
+      for (let i = prev.idx + 1; i <= idx; i++) seq.push({src, idx: i, _wp: w});
     } else {
-      addPreroll(src, idx, K_pre);
+      addPreroll(src, idx, K_pre, w);
     }
   }
 
+  const lastWi = waypoints.length - 1;
   if (K_post > 0) {
-    const {src: sL, idx: iL} = waypoints[waypoints.length - 1];
+    const {src: sL, idx: iL} = waypoints[lastWi];
     const T = getT(sL);
-    for (let i = iL + 1; i <= Math.min(T - 1, iL + K_post); i++) seq.push({src: sL, idx: i});
+    for (let i = iL + 1; i <= Math.min(T - 1, iL + K_post); i++) seq.push({src: sL, idx: i, _wp: lastWi});
   }
 
   if (!seq.length) return [];
@@ -1317,43 +1428,76 @@ function buildSnapSequence(waypoints, K_pre, K_post, ctxSwap) {
   return out;
 }
 
-// Fixed-duration snap: distributes frame budget evenly across waypoints so that
-// total = exactly N_target frames (+ K_post for 48k post-roll).
-// All waypoints are always visited; context window size is adjusted to hit the target.
-function buildSnapSequenceFixed(waypoints, N_target, K_post, ctxSwap) {
-  const N_wp     = waypoints.length;
-  const N_budget = Math.max(0, N_target - N_wp);  // frames for context windows
-  const K_base   = Math.floor(N_budget / N_wp);
-  const N_extra  = N_budget % N_wp;               // first N_extra waypoints get +1
+// Compute per-waypoint context (pre-roll) frame counts.
+//   Auto  → fixed K_pre for every waypoint.
+//   Fixed → proportional to UMAP distance of each segment so that longer
+//            jumps get more pre-roll and the total hits the Duration target.
+function getContextKs(waypoints) {
+  const fps   = coordsA.length / srcWidget.getDuration();
+  const N_wp  = waypoints.length;
+  const K_min = 4;
 
-  const seq = [];
-
-  for (let w = 0; w < N_wp; w++) {
-    const {src, idx} = waypoints[w];
-    const K_this = K_base + (w < N_extra ? 1 : 0);
-
-    if (K_this > 0) {
-      const frames = walkBackward(src, idx, K_this, ctxSwap);
-      // Pad to K_this if walkBackward ran out (near source start)
-      const fallback = frames[0] || {src, idx};
-      while (frames.length < K_this) frames.unshift({...fallback});
-      for (const f of frames) seq.push(f);
-    }
-    seq.push({src, idx});
+  if (snapDurMode === 'auto' || N_wp <= 1) {
+    const K_pre = Math.max(K_min, Math.round(fps * 0.05));
+    return waypoints.map(() => K_pre);
   }
 
-  // Hard trim/extend to exactly N_target before post-roll
+  // Segment distances in UMAP space
+  const segDists = [];
+  let totalDist  = 0;
+  for (let i = 1; i < N_wp; i++) {
+    const [x0, y0] = (waypoints[i-1].src === 'A' ? coordsA : coordsB)[waypoints[i-1].idx];
+    const [x1, y1] = (waypoints[i].src   === 'A' ? coordsA : coordsB)[waypoints[i].idx];
+    const d = Math.sqrt((x1 - x0) ** 2 + (y1 - y0) ** 2);
+    segDists.push(d);
+    totalDist += d;
+  }
+
+  const N_target = Math.max(N_wp, Math.round((parseFloat(trajDurationEl.value) || 4) * fps));
+  const budget   = Math.max(0, N_target - N_wp - K_min);
+
+  const K_each = new Array(N_wp).fill(0);
+  K_each[0] = K_min; // first waypoint gets baseline (no predecessor)
+  for (let i = 1; i < N_wp; i++) {
+    const frac = totalDist > 0 ? segDists[i - 1] / totalDist : 1 / (N_wp - 1);
+    K_each[i] = Math.max(1, Math.round(frac * budget));
+  }
+  return K_each;
+}
+
+// Fixed-duration snap: pre-roll per waypoint is proportional to the UMAP
+// distance of the preceding segment — longer jumps get more context.
+// Total = exactly N_target frames (+ K_post for 48k post-roll).
+function buildSnapSequenceFixed(waypoints, N_target, K_post, ctxSwap) {
+  const N_wp   = waypoints.length;
+  const K_each = getContextKs(waypoints);
+
+  const seq = [];
+  for (let w = 0; w < N_wp; w++) {
+    const { src, idx } = waypoints[w];
+    const K_this = K_each[w];
+    if (K_this > 0) {
+      const frames = walkBackward(src, idx, K_this, ctxSwap);
+      // Pad if walkBackward ran out near source start
+      const fallback = frames[0] || { src, idx };
+      while (frames.length < K_this) frames.unshift({ ...fallback });
+      for (const f of frames) seq.push({...f, _wp: w});
+    }
+    seq.push({ src, idx, _wp: w });
+  }
+
+  // Trim or pad to exactly N_target
   if (seq.length > N_target) {
     seq.length = N_target;
   } else {
-    while (seq.length < N_target) seq.push({...seq[seq.length - 1]});
+    while (seq.length < N_target) seq.push({ ...seq[seq.length - 1] });
   }
 
   // Post-roll (48k)
   if (K_post > 0) {
-    const {src: sL, idx: iL} = waypoints[N_wp - 1];
+    const { src: sL, idx: iL } = waypoints[N_wp - 1];
     const T_L = sL === 'A' ? currentEmbeds.embQuantDimsA[2] : currentEmbeds.embQuantDimsB[2];
-    for (let i = iL + 1; i <= Math.min(T_L - 1, iL + K_post); i++) seq.push({src: sL, idx: i});
+    for (let i = iL + 1; i <= Math.min(T_L - 1, iL + K_post); i++) seq.push({ src: sL, idx: i, _wp: N_wp - 1 });
   }
 
   return seq;
