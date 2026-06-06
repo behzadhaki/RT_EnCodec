@@ -2041,37 +2041,50 @@ async function runDecodeTrajectoryExp6(msg) {
       const fallbackScale     = refCap?.scale     ? refCap.scale.slice()            : new Float32Array([1.0]);
       const fallbackScaleDims = refCap?.scaleDims ? [...refCap.scaleDims].map(Number) : [1, 1, 1];
 
-      const CHUNK_T  = SEG_48 / HOP_48;  // 150
-      const outParts = [];
+      const CHUNK_F  = SEG_48 / HOP_48;    // 150 frames per chunk
+      const STRIDE_F = STRIDE_48 / HOP_48; // 135 frames per stride (10% overlap)
+
+      const totalSamples = N * HOP_48;
+      const outBuf = new Float32Array(totalSamples);
+      const wgtBuf = new Float32Array(totalSamples);
       let hDec = zeroState(1), cDec = zeroState(1);
 
-      for (let t = 0; t < N; t += CHUNK_T) {
-        const chunk_T  = Math.min(CHUNK_T, N - t);
+      const numChunks = Math.ceil(N / STRIDE_F);
+      for (let seg = 0; seg < numChunks; seg++) {
+        const tStart  = seg * STRIDE_F;
+        const tEnd    = Math.min(tStart + CHUNK_F, N);
+        const chunk_T = tEnd - tStart;
+
         const chunkEmb = new Float32Array(D * chunk_T);
         for (let d = 0; d < D; d++)
           for (let i = 0; i < chunk_T; i++)
-            chunkEmb[d * chunk_T + i] = embQuant[d * N + t + i];
+            chunkEmb[d * chunk_T + i] = embQuant[d * N + tStart + i];
 
-        // Per-chunk scale: mean of the per-frame values supplied by the main thread.
         // Always use fallbackScaleDims (real shape from the ONNX encoder output) —
         // never hardcode [1,1,1]; a shape mismatch silently hangs the 48k decoder.
         let scale = fallbackScale, scaleDims = fallbackScaleDims;
         if (frameScales) {
           let sum = 0;
-          for (let i = t; i < t + chunk_T; i++) sum += frameScales[i];
+          for (let i = tStart; i < tEnd; i++) sum += frameScales[i];
           scale     = new Float32Array(fallbackScale.length).fill(sum / chunk_T);
           scaleDims = fallbackScaleDims;
         }
 
         const res = await decodeFromLatents(chunkEmb, [1, D, chunk_T], scale, scaleDims, modelHz, hDec, cDec);
         hDec = res.hDecNew; cDec = res.cDecNew;
-        outParts.push(res.outAudio);
+
+        const sampleOffset = tStart * HOP_48;
+        const numSamples   = chunk_T * HOP_48;
+        for (let i = 0; i < numSamples; i++) {
+          outBuf[sampleOffset + i] += TRI_WIN_48[i] * res.outAudio[i];
+          wgtBuf[sampleOffset + i] += TRI_WIN_48[i];
+        }
       }
 
-      const totalSamples = outParts.reduce((s, p) => s + p.length, 0);
-      decoded = new Float32Array(totalSamples);
-      let off = 0;
-      for (const p of outParts) { decoded.set(p, off); off += p.length; }
+      for (let i = 0; i < totalSamples; i++) {
+        if (wgtBuf[i] > 0) outBuf[i] /= wgtBuf[i];
+      }
+      decoded = outBuf;
     } else {
       const res = await decodeFromLatents(embQuant, dims, null, null, modelHz, zeroState(1), zeroState(1));
       decoded = new Float32Array(res.outAudio);

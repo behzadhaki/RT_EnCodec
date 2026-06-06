@@ -724,7 +724,7 @@ async function runUMAP() {
   );
   const minDist = parseFloat(minDistEl.value) || 0.1;
 
-  if (!umapWorker) initUMAPWorker();
+  initUMAPWorker();
   activeUMAPJobId = ++jobSeq;
 
   progWrap.style.display = 'block';
@@ -818,19 +818,8 @@ function renderScatter() {
     ctx.moveTo(toX(userTrajectory[0][0]), toY(userTrajectory[0][1]));
     for (let i = 1; i < userTrajectory.length; i++)
       ctx.lineTo(toX(userTrajectory[i][0]), toY(userTrajectory[i][1]));
+    ctx.closePath();
     ctx.stroke();
-
-    // start/end markers
-    ctx.setLineDash([]);
-    ctx.globalAlpha = 1;
-    ctx.fillStyle   = '#44ff88';
-    ctx.beginPath();
-    ctx.arc(toX(userTrajectory[0][0]), toY(userTrajectory[0][1]), 4 * dpr, 0, 2 * Math.PI);
-    ctx.fill();
-    ctx.fillStyle = '#ff4466';
-    ctx.beginPath();
-    ctx.arc(toX(userTrajectory[userTrajectory.length-1][0]), toY(userTrajectory[userTrajectory.length-1][1]), 4 * dpr, 0, 2 * Math.PI);
-    ctx.fill();
     ctx.restore();
   }
 
@@ -1023,7 +1012,13 @@ const finishShiftDrag = () => {
 const finishDraw = () => {
   if (!isDrawing) return;
   isDrawing = false;
-  userTrajectory = rawDrawPoints.length >= 2 ? resamplePath(rawDrawPoints, 300) : [];
+  if (rawDrawPoints.length >= 2) {
+    const closed = [...rawDrawPoints, rawDrawPoints[0]];
+    userTrajectory = resamplePath(closed, 300);
+    userTrajectory[userTrajectory.length - 1] = userTrajectory[0].slice();
+  } else {
+    userTrajectory = [];
+  }
   renderScatter();
   if (userTrajectory.length >= 2) autoRegenerate();
 };
@@ -1365,9 +1360,11 @@ function buildSnapSequenceFixed(waypoints, N_target, K_post, ctxSwap) {
 }
 
 function autoRegenerate() {
-  // Always update snap waypoint viz when drawing in snap mode
-  if (pathMode === 'snap' && coordsA && coordsB) {
-    snapFrames = computeSnapWaypoints();
+  // Always update waypoint viz when drawing in snap or code mode
+  if ((pathMode === 'snap' || pathMode === 'code') && coordsA && coordsB) {
+    const wps = computeSnapWaypoints();
+    if (pathMode === 'snap') snapFrames = wps;
+    else codePathFrames = wps;
     renderScatter();
   }
   if (userTrajectory.length < 2 || !currentEmbeds || !coordsA || !coordsB) {
@@ -1388,23 +1385,24 @@ async function playTrajectory() {
 
   // ── Code-path mode ────────────────────────────────────────────────────────
   if (pathMode === 'code') {
-    const path = findCodePath();
-    if (!path || path.length === 0) { setStatus('No path found between endpoints.', true); return; }
-    codePathFrames = path;
+    const waypoints = computeSnapWaypoints();
+    if (!waypoints.length) { setStatus('Draw a path first.', true); return; }
+    codePathFrames = waypoints;
     renderScatter();
 
-    const N = path.length;
+    const N = waypoints.length;
     const blended = new Float32Array(D * N);
     for (let i = 0; i < N; i++) {
-      const {src, idx} = path[i];
+      const {src, idx} = waypoints[i];
       const emb = src === 'A' ? currentEmbeds.embQuantA : currentEmbeds.embQuantB;
       const T   = src === 'A' ? T_A : T_B;
       for (let d = 0; d < D; d++) blended[d * N + i] = emb[d * T + idx];
     }
     if (!audioCtx) audioCtx = new AudioContext();
     playJobId = ++jobSeq;
-    setStatus(`Decoding code path (${N} frames)…`);
-    const codeScales = makeFrameScales(path);
+    const fps = coordsA.length / srcWidget.getDuration();
+    setStatus(`Decoding code path (${N} frames, ${(N / fps).toFixed(1)} s)…`);
+    const codeScales = makeFrameScales(waypoints);
     const codeXfers  = [blended.buffer];
     if (codeScales) codeXfers.push(codeScales.buffer);
     worker.postMessage({

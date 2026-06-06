@@ -62,7 +62,7 @@ export function createSourcePanel({
     </div>
     <div class="row src-file-row" style="display:none">
       <button class="file-btn src-file-btn">choose file…</button>
-      <input type="file" class="src-file-input" accept="audio/*" style="display:none">
+      <input type="file" class="src-file-input" accept="audio/*,audio/mp4,audio/x-m4a,.m4a,.m4b,.caf,.aiff,.aif" style="display:none">
     </div>
     ${showVol ? `
     <div class="row">
