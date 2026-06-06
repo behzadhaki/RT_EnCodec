@@ -649,13 +649,10 @@ function onWorkerMsg(e) {
   if (msg.type === 'trajectory_audio_exp6') {
     if (msg.jobId === playJobId) {
       const sr = mp.getSampleRate();
-      // Stop any legacy crossfade source
-      stopTrajPlayback();
-      const wasPlaying = playerG.isPlaying();
-      // Load new audio into the Generated player
+      stopTrajPlayback(); // clean up any legacy crossfade nodes
+      // setAudio crossfades automatically if playerG is playing,
+      // or just loads the waveform if it is stopped
       playerG.setAudio(msg.decoded, sr);
-      // If it was already playing, restart with the fresh buffer
-      if (wasPlaying) playerG.play();
     }
     return;
   }
@@ -1043,33 +1040,73 @@ function makeWavePlayer(canvasId, waveColor, onFrameCb) {
     playBtnEl.classList.toggle('active', playing);
   }
 
-  function doPlay(offset) {
+  // Kill the current source safely — nulls onended first so the loop handler
+  // never fires as a side-effect of .stop().
+  function killSrc() {
+    if (srcNode)  { srcNode.onended = null; try { srcNode.stop(); } catch(_) {} srcNode = null; }
+    if (gainNode) { try { gainNode.disconnect(); } catch(_) {} gainNode = null; }
+  }
+
+  function doPlay(offset, xfade = false) {
     if (!audio) return;
     if (!audioCtx) audioCtx = new AudioContext();
-    try { srcNode?.stop(); } catch(_) {}
-    try { gainNode?.disconnect(); } catch(_) {}
+
+    const now = audioCtx.currentTime;
+    const XFADE_S = 0.04;
+
+    // Capture old nodes for crossfade before overwriting
+    const oldSrc  = srcNode;
+    const oldGain = gainNode;
+
+    // Prevent the old source's onended from re-triggering the loop
+    if (oldSrc) oldSrc.onended = null;
 
     playOffset = Math.max(0, Math.min(offset, dur() - 0.001));
-    playStart  = audioCtx.currentTime;
+    playStart  = now;
 
-    gainNode = audioCtx.createGain();
-    gainNode.gain.value = 1;
-    gainNode.connect(audioCtx.destination);
+    const newGain = audioCtx.createGain();
+    newGain.connect(audioCtx.destination);
 
     const buf = audioCtx.createBuffer(1, audio.length, sr);
     buf.copyToChannel(audio, 0);
-    srcNode = audioCtx.createBufferSource();
-    srcNode.buffer = buf;
-    srcNode.connect(gainNode);
-    srcNode.start(0, playOffset);
-    srcNode.onended = () => {
+    const newSrc = audioCtx.createBufferSource();
+    newSrc.buffer = buf;
+    newSrc.connect(newGain);
+
+    if (xfade && oldSrc && oldGain) {
+      // Crossfade: old → 0, new → 1 over XFADE_S
+      oldGain.gain.cancelScheduledValues(now);
+      oldGain.gain.setValueAtTime(oldGain.gain.value, now);
+      oldGain.gain.linearRampToValueAtTime(0, now + XFADE_S);
+      newGain.gain.setValueAtTime(0, now);
+      newGain.gain.linearRampToValueAtTime(1, now + XFADE_S);
+      oldSrc.stop(now + XFADE_S + 0.01);
+      oldSrc.onended = () => { try { oldGain.disconnect(); } catch(_) {} };
+    } else {
+      if (oldSrc)  { try { oldSrc.stop();       } catch(_) {} }
+      if (oldGain) { try { oldGain.disconnect(); } catch(_) {} }
+      newGain.gain.value = 1;
+    }
+
+    newSrc.start(now, playOffset);
+
+    // Guard: if this node was superseded before it ended, do nothing
+    newSrc.onended = () => {
+      if (srcNode !== newSrc) return;
       playing = false; updatePlayBtn();
-      if (looping) { playOffset = 0; doPlay(0); }
-      else { playOffset = 0; cancelAnimationFrame(animId); draw(); onFrameCb?.(-1); }
+      if (looping) {
+        playOffset = 0; doPlay(0);
+      } else {
+        srcNode = null; gainNode = null;
+        playOffset = 0; cancelAnimationFrame(animId); draw(); onFrameCb?.(-1);
+      }
     };
-    playing = true; updatePlayBtn();
+
+    srcNode  = newSrc;
+    gainNode = newGain;
+    playing  = true; updatePlayBtn();
     cancelAnimationFrame(animId);
-    (function animate() { draw(); onFrameCb?.(position()); if (playing) animId = requestAnimationFrame(animate); })();
+    (function anim() { draw(); onFrameCb?.(position()); if (playing) animId = requestAnimationFrame(anim); })();
   }
 
   // Click canvas to seek
@@ -1077,7 +1114,7 @@ function makeWavePlayer(canvasId, waveColor, onFrameCb) {
     const rect = cvs.getBoundingClientRect();
     const pos  = (e.clientX - rect.left) / rect.width;
     const t    = pos * dur();
-    if (playing) doPlay(t); else { playOffset = t; draw(); }
+    if (playing) doPlay(t, true); else { playOffset = t; draw(); }
   });
 
   // Resize
@@ -1090,23 +1127,33 @@ function makeWavePlayer(canvasId, waveColor, onFrameCb) {
   ro.observe(cvs);
 
   return {
+    // Load new audio. If currently playing, crossfade into the new buffer
+    // immediately. If stopped, just update the waveform display.
     setAudio(f32, sampleRate) {
+      const wasPlaying = playing;
+      const wasOffset  = playing ? elapsed() : 0;
       audio = f32; sr = sampleRate;
-      playOffset = 0; playing = false;
-      updatePlayBtn(); buildPeaks(); draw();
+      buildPeaks();
+      if (wasPlaying) {
+        doPlay(wasOffset, /*xfade=*/true);  // crossfade to new buffer at same position
+      } else {
+        playOffset = 0; draw();
+      }
+      updatePlayBtn();
     },
     play() {
-      if (playing) {                         // toggle → pause
+      if (playing) {
+        // Pause: capture position, kill source without triggering onended loop
         playOffset = elapsed();
-        try { srcNode?.stop(); } catch(_) {}
+        killSrc();
         playing = false; cancelAnimationFrame(animId);
         updatePlayBtn(); draw();
-      } else { doPlay(playOffset); }         // start / resume
+      } else {
+        doPlay(playOffset);
+      }
     },
     stop() {
-      try { srcNode?.stop(); } catch(_) {}
-      try { gainNode?.disconnect(); } catch(_) {}
-      srcNode = null; gainNode = null;
+      killSrc();
       playing = false; playOffset = 0;
       cancelAnimationFrame(animId); updatePlayBtn(); draw(); onFrameCb?.(-1);
     },
