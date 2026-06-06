@@ -282,7 +282,7 @@ trajSection.innerHTML = `
   <!-- Code-only block — fixed layout, never shifts internally -->
   <div id="codeBlock" style="display:none">
     <div class="row" style="gap:3px">
-      <button class="tog active" id="togCodeK"   style="flex:1">K repeats</button>
+      <button class="tog active" id="togCodeK"   style="flex:1">K frames</button>
       <button class="tog"        id="togCodeSec" style="flex:1">Seconds</button>
     </div>
     <div class="row">
@@ -356,15 +356,15 @@ snapParamInput.addEventListener('change', e => {
   autoRegenerate();
 });
 
-let codeDurMode = 'repeats'; // 'repeats' | 'seconds'
-let codeKVal    = 1;
-let codeSecVal  = 4;
+let codeDurMode = 'frames'; // 'frames' | 'seconds'
+let codeKVal    = 100;     // number of latent code frames
+let codeSecVal  = 4;       // duration in seconds
 
 function applyCodeParamUI() {
-  if (codeDurMode === 'repeats') {
+  if (codeDurMode === 'frames') {
     codeParamLbl.textContent  = 'K';
-    codeParamUnit.textContent = '×';
-    Object.assign(codeParamInput, {min: 1, max: 32, step: 1, value: codeKVal});
+    codeParamUnit.textContent = 'frames';
+    Object.assign(codeParamInput, {min: 2, max: 2000, step: 1, value: codeKVal});
   } else {
     codeParamLbl.textContent  = 'Duration';
     codeParamUnit.textContent = 's';
@@ -373,17 +373,17 @@ function applyCodeParamUI() {
 }
 
 codeParamInput.addEventListener('change', e => {
-  if (codeDurMode === 'repeats') codeKVal   = Math.max(1,   parseInt(e.target.value)   || 1);
-  else                            codeSecVal = Math.max(0.5, parseFloat(e.target.value) || 4);
+  if (codeDurMode === 'frames') codeKVal   = Math.max(2,   parseInt(e.target.value)   || 100);
+  else                           codeSecVal = Math.max(0.5, parseFloat(e.target.value) || 4);
 });
 
 const setCodeMode = (mode) => {
   codeDurMode = mode;
-  document.getElementById('togCodeK')  .classList.toggle('active', mode === 'repeats');
+  document.getElementById('togCodeK')  .classList.toggle('active', mode === 'frames');
   document.getElementById('togCodeSec').classList.toggle('active', mode === 'seconds');
   applyCodeParamUI();
 };
-document.getElementById('togCodeK')  .addEventListener('click', () => setCodeMode('repeats'));
+document.getElementById('togCodeK')  .addEventListener('click', () => setCodeMode('frames'));
 document.getElementById('togCodeSec').addEventListener('click', () => setCodeMode('seconds'));
 
 const setSnapMode = (mode) => {
@@ -977,51 +977,52 @@ function renderScatter() {
   if (pathMode === 'snap' && snapFrames && snapFrames.length >= 2) {
     const ptOf = ({src, idx}) => src === 'A' ? coordsA[idx] : coordsB[idx];
 
-    // ── Active context highlight (only during playback, only if enabled) ─
-    if (showTrail && trajAnchorPos >= 0 && snapPlayFrames && snapPlayFrames.length >= 2) {
+    // ── Active waypoint highlight (only during playback) ─────────────────
+    if (trajAnchorPos >= 0 && snapPlayFrames && snapPlayFrames.length >= 2) {
       const fi       = Math.min(Math.floor(trajAnchorPos * (snapPlayFrames.length - 1)), snapPlayFrames.length - 1);
       const activeWi = snapPlayFrames[fi]?._wp;
 
       if (activeWi !== undefined && activeWi < snapFrames.length) {
-        const wp        = snapFrames[activeWi];
-        const ctxKs    = getContextKs(snapFrames);
-        const ctxFrames = walkBackward(wp.src, wp.idx, ctxKs[activeWi], ctxSwapRange);
+        const wp = snapFrames[activeWi];
 
-        // Progressively highlight trail segments as the playhead moves through context.
-        // Find how far into this waypoint's region we are, then reveal segments up to that point.
-        if (ctxFrames.length > 0) {
-          const allCtx = [...ctxFrames, wp]; // oldest → newest, ending at anchor
+        // Context trail — only when checkbox is enabled
+        if (showTrail) {
+          const ctxKs    = getContextKs(snapFrames);
+          const ctxFrames = walkBackward(wp.src, wp.idx, ctxKs[activeWi], ctxSwapRange);
 
-          // Scan backward to find where this waypoint's context region starts
-          let contextStart = fi;
-          while (contextStart > 0 && snapPlayFrames[contextStart - 1]?._wp === activeWi) contextStart--;
+          if (ctxFrames.length > 0) {
+            const allCtx = [...ctxFrames, wp];
 
-          const elapsed  = fi - contextStart;
-          const segTotal = allCtx.length - 1;
-          const progress = Math.min(1, elapsed / Math.max(1, segTotal));
-          const segCount = Math.ceil(progress * segTotal);
+            let contextStart = fi;
+            while (contextStart > 0 && snapPlayFrames[contextStart - 1]?._wp === activeWi) contextStart--;
 
-          ctx.save();
-          ctx.globalAlpha = 0.85;
-          for (let i = 1; i <= segCount && i < allCtx.length; i++) {
-            const prev = allCtx[i - 1], curr = allCtx[i];
-            const [px, py] = ptOf(prev), [cx, cy] = ptOf(curr);
-            ctx.beginPath();
-            ctx.moveTo(toX(px), toY(py));
-            ctx.lineTo(toX(cx), toY(cy));
-            if (prev.src === curr.src) {
-              ctx.strokeStyle = curr.src === 'A' ? '#c87800' : '#2090c0';
-              ctx.lineWidth   = 0.9 * dpr;
-            } else {
-              ctx.strokeStyle = '#bbbbbb';
-              ctx.lineWidth   = 1 * dpr;
+            const elapsed  = fi - contextStart;
+            const segTotal = allCtx.length - 1;
+            const progress = Math.min(1, elapsed / Math.max(1, segTotal));
+            const segCount = Math.ceil(progress * segTotal);
+
+            ctx.save();
+            ctx.globalAlpha = 0.85;
+            for (let i = 1; i <= segCount && i < allCtx.length; i++) {
+              const prev = allCtx[i - 1], curr = allCtx[i];
+              const [px, py] = ptOf(prev), [cx, cy] = ptOf(curr);
+              ctx.beginPath();
+              ctx.moveTo(toX(px), toY(py));
+              ctx.lineTo(toX(cx), toY(cy));
+              if (prev.src === curr.src) {
+                ctx.strokeStyle = curr.src === 'A' ? '#c87800' : '#2090c0';
+                ctx.lineWidth   = 0.9 * dpr;
+              } else {
+                ctx.strokeStyle = '#bbbbbb';
+                ctx.lineWidth   = 1 * dpr;
+              }
+              ctx.stroke();
             }
-            ctx.stroke();
+            ctx.restore();
           }
-          ctx.restore();
         }
 
-        // Anchor ring on the active waypoint only
+        // Anchor ring — always visible regardless of checkbox
         ctx.save();
         const [wx, wy] = ptOf(wp);
         ctx.strokeStyle = '#bbbbbb';
@@ -1644,12 +1645,9 @@ function buildSnapSequenceFixed(waypoints, N_target, K_post, ctxSwap) {
     seq.push({ src, idx, _wp: w });
   }
 
-  // Trim or pad to exactly N_target
-  if (seq.length > N_target) {
-    seq.length = N_target;
-  } else {
-    while (seq.length < N_target) seq.push({ ...seq[seq.length - 1] });
-  }
+  // Trim to N_target if over — never pad (padding repeats the last frame,
+  // which causes a stuck-note glitch at the loop boundary)
+  if (seq.length > N_target) seq.length = N_target;
 
   // Post-roll (48k)
   if (K_post > 0) {
@@ -1689,41 +1687,36 @@ async function playTrajectory() {
   if (pathMode === 'code') {
     const fps = coordsA.length / srcWidget.getDuration();
 
-    // Determine repeat count and per-pass frame count
-    const K     = codeDurMode === 'repeats' ? codeKVal : 1;
-    const N_rep = codeDurMode === 'repeats'
-      ? Math.max(2, Math.round(codeSecVal * fps))   // each repeat = codeSecVal s
-      : Math.max(2, Math.round(codeSecVal * fps));   // single pass  = codeSecVal s
+    // N = exact number of latent code frames to decode (one pass through the path)
+    const N = codeDurMode === 'frames'
+      ? Math.max(2, codeKVal)
+      : Math.max(2, Math.round(codeSecVal * fps));
 
     const waypoints = computeSnapWaypoints();
     if (!waypoints.length) { setStatus('Draw a path first.', true); return; }
 
-    // Resample waypoints to N_rep frames
+    // Resample waypoints evenly to N frames
     const sampledWPs = [];
-    for (let i = 0; i < N_rep; i++) {
-      const frac = i / (N_rep - 1);
+    for (let i = 0; i < N; i++) {
+      const frac = i / (N - 1);
       const wi   = Math.min(Math.floor(frac * (waypoints.length - 1)), waypoints.length - 1);
       sampledWPs.push(waypoints[wi]);
     }
     codePathFrames = sampledWPs;
     renderScatter();
 
-    const N       = N_rep * K;
     const blended = new Float32Array(D * N);
-    for (let rep = 0; rep < K; rep++) {
-      for (let i = 0; i < N_rep; i++) {
-        const {src, idx} = sampledWPs[i];
-        const emb = src === 'A' ? currentEmbeds.embQuantA : currentEmbeds.embQuantB;
-        const T   = src === 'A' ? T_A : T_B;
-        const col = rep * N_rep + i;
-        for (let d = 0; d < D; d++) blended[d * N + col] = emb[d * T + idx];
-      }
+    for (let i = 0; i < N; i++) {
+      const {src, idx} = sampledWPs[i];
+      const emb = src === 'A' ? currentEmbeds.embQuantA : currentEmbeds.embQuantB;
+      const T   = src === 'A' ? T_A : T_B;
+      for (let d = 0; d < D; d++) blended[d * N + i] = emb[d * T + idx];
     }
 
     if (!audioCtx) audioCtx = new AudioContext();
     playJobId = ++jobSeq;
-    setStatus(`Decoding code path (${N_rep} frames × ${K}, ${(N / fps).toFixed(1)} s)…`);
-    const codeScales = makeFrameScales(Array.from({length: N}, (_, i) => sampledWPs[i % N_rep]));
+    setStatus(`Decoding code path (${N} frames, ${(N / fps).toFixed(1)} s)…`);
+    const codeScales = makeFrameScales(sampledWPs);
     const codeXfers  = [blended.buffer];
     if (codeScales) codeXfers.push(codeScales.buffer);
     worker.postMessage({
