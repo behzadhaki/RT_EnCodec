@@ -203,8 +203,12 @@ export function getContextKs(waypoints, { snapMode, snapKVal, snapDurVal, frames
     return waypoints.map(() => K_each);
   }
 
-  const K_min  = 4;
-  const budget = Math.max(0, N_target - N_wp - K_min);
+  // Proportional: context length proportional to UMAP segment distance.
+  // Waypoint 0 has no prior segment, so give it a virtual weight equal to
+  // the average of the real segments — ensuring fair allocation for wp0.
+  // (Old: K_each[0] = K_min=4 always → with 2 pins, one got 4 frames, the
+  //  other got nearly the entire budget, making wp0 almost inaudible.)
+  const total_context = Math.max(0, N_target - N_wp);
   const segDists = [];
   let totalDist  = 0;
   for (let i = 1; i < N_wp; i++) {
@@ -214,11 +218,20 @@ export function getContextKs(waypoints, { snapMode, snapKVal, snapDurVal, frames
     segDists.push(d);
     totalDist += d;
   }
+
+  // weights[0] = avgDist (virtual), weights[i] = segDists[i-1] for i >= 1
+  const avgDist     = totalDist / (N_wp - 1);
+  const weights     = [avgDist, ...segDists];
+  const totalWeight = weights.reduce((a, b) => a + b, 0);
+
   const K_each = new Array(N_wp).fill(0);
-  K_each[0] = K_min;
-  for (let i = 1; i < N_wp; i++) {
-    const frac = totalDist > 0 ? segDists[i - 1] / totalDist : 1 / (N_wp - 1);
-    K_each[i] = Math.max(1, Math.round(frac * budget));
+  if (totalWeight <= 0) {
+    // All waypoints at identical UMAP position — fall back to equal distribution.
+    const K_eq = Math.max(1, Math.floor(total_context / N_wp));
+    return waypoints.map(() => K_eq);
+  }
+  for (let i = 0; i < N_wp; i++) {
+    K_each[i] = Math.max(1, Math.floor(total_context * weights[i] / totalWeight));
   }
   return K_each;
 }

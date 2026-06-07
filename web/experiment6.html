@@ -466,7 +466,10 @@ function setSnapSeqInfo(snapFrames, snapPlayFrames) {
   let s = 0;
   for (let i = 1; i <= snapPlayFrames.length; i++) {
     if (i === snapPlayFrames.length || snapPlayFrames[i]._wp !== snapPlayFrames[i - 1]._wp) {
-      const end    = snapPlayFrames[i - 1];          // waypoint frame (last in segment)
+      // Use the actual snap waypoint (from snapFrames) as the segment endpoint,
+      // not the last frame in the group — which may be a K_post frame (idx > waypoint idx)
+      // for the last segment on 48k models.
+      const end    = snapFrames[segs.length] ?? snapPlayFrames[i - 1];
       let   minIdx = end.idx;
       for (let j = s; j < i; j++) {
         if (snapPlayFrames[j].src === end.src && snapPlayFrames[j].idx < minIdx)
