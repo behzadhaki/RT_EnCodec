@@ -394,8 +394,32 @@ function setSeqInfo(seq) {
   seqInfo.textContent = build([wps[0], null, wps[wps.length - 1]]);
 }
 
-// Code / snap mode: show at most 5 waypoints (6 for pingpong — 3 per half so turnaround always appears twice).
-// orderedWPs / snapFrames are already compact; pingpong turnaround duplicate is intentional — no dedup.
+// n evenly-spaced indices from lo..hi inclusive
+function spanIdx(lo, hi, n) {
+  if (n <= 1) return [lo];
+  return Array.from({ length: n }, (_, i) => lo + Math.round(i * (hi - lo) / (n - 1)));
+}
+
+// Detect pingpong turnaround index (first consecutive identical pair) in a waypoint array.
+// Returns -1 if not a pingpong sequence.
+function findTurnaround(wps) {
+  for (let i = 1; i < wps.length; i++) {
+    if (wps[i].src === wps[i-1].src && wps[i].idx === wps[i-1].idx) return i - 1;
+  }
+  return -1;
+}
+
+// Pick indices for display: 3-per-half mirrored for pingpong, or n evenly spaced for linear.
+function pickDisplayIndices(len, taIdx, n) {
+  if (taIdx >= 0) {
+    const L = spanIdx(0, taIdx, 3);
+    const R = [...L].reverse().map(i => taIdx + 1 + (taIdx - i));
+    return [...L, ...R];
+  }
+  return spanIdx(0, len - 1, n);
+}
+
+// Code mode: at most 5 waypoints (6 for pingpong), with xK multiplier suffix.
 function setCodeSeqInfo(seq, kRepeat) {
   const wps = seq || [];
   if (!wps.length) { seqInfo.textContent = ''; return; }
@@ -407,25 +431,8 @@ function setCodeSeqInfo(seq, kRepeat) {
     return;
   }
 
-  // n evenly-spaced indices from wps[lo..hi] inclusive
-  const span = (lo, hi, n) => n <= 1 ? [lo]
-    : Array.from({ length: n }, (_, i) => lo + Math.round(i * (hi - lo) / (n - 1)));
-
-  // Detect pingpong turnaround: first consecutive identical pair
-  let taIdx = -1;
-  for (let i = 1; i < wps.length; i++) {
-    if (wps[i].src === wps[i-1].src && wps[i].idx === wps[i-1].idx) { taIdx = i - 1; break; }
-  }
-
-  const picked = taIdx >= 0
-    // Pingpong: pick left half, then mirror to right so midpoints are guaranteed symmetric
-    ? (() => {
-        const L = span(0, taIdx, 3);
-        const R = [...L].reverse().map(i => taIdx + 1 + (taIdx - i));
-        return [...L, ...R];
-      })()
-    // Linear: 5 evenly spaced
-    : span(0, wps.length - 1, 5);
+  const taIdx  = findTurnaround(wps);
+  const picked = pickDisplayIndices(wps.length, taIdx, 5);
 
   let text = fmt(wps[picked[0]]);
   for (let i = 1; i < picked.length; i++) {
@@ -433,6 +440,53 @@ function setCodeSeqInfo(seq, kRepeat) {
     text += gap === 1 ? ' → ' + fmt(wps[picked[i]]) : ' → … → ' + fmt(wps[picked[i]]);
   }
   seqInfo.textContent = '[ ' + text + ' ]';
+}
+
+// Snap mode: show each waypoint as its actual frame range (preroll_start:waypoint_end).
+// Groups snapPlayFrames by _wp transitions to find the real context span per waypoint.
+function setSnapSeqInfo(snapFrames, snapPlayFrames) {
+  if (!snapFrames?.length || !snapPlayFrames?.length) { seqInfo.textContent = ''; return; }
+
+  // Group snapPlayFrames into per-waypoint segments by _wp change.
+  // Track the true min index within the waypoint's source (pingPongExtend bounces, so the
+  // first frame in the sequence is NOT necessarily the lowest index actually reached).
+  const segs = [];
+  let s = 0;
+  for (let i = 1; i <= snapPlayFrames.length; i++) {
+    if (i === snapPlayFrames.length || snapPlayFrames[i]._wp !== snapPlayFrames[i - 1]._wp) {
+      const end    = snapPlayFrames[i - 1];          // waypoint frame (last in segment)
+      let   minIdx = end.idx;
+      for (let j = s; j < i; j++) {
+        if (snapPlayFrames[j].src === end.src && snapPlayFrames[j].idx < minIdx)
+          minIdx = snapPlayFrames[j].idx;
+      }
+      segs.push({ minIdx, end });
+      s = i;
+    }
+  }
+
+  // Format one segment: "B0:B6" (true min → waypoint), or just "B6" if no pre-roll
+  const fmtSeg = ({ minIdx, end }) =>
+    minIdx === end.idx
+      ? `${end.src}${end.idx}`
+      : `${end.src}${minIdx}:${end.src}${end.idx}`;
+
+  const MAX = 7;
+
+  if (segs.length <= MAX) {
+    seqInfo.textContent = '[' + segs.map(fmtSeg).join(', ') + ']';
+    return;
+  }
+
+  const taIdx  = findTurnaround(snapFrames);
+  const picked = pickDisplayIndices(segs.length, taIdx, MAX);
+
+  const parts = [fmtSeg(segs[picked[0]])];
+  for (let i = 1; i < picked.length; i++) {
+    if (picked[i] !== picked[i - 1] + 1) parts.push('…');
+    parts.push(fmtSeg(segs[picked[i]]));
+  }
+  seqInfo.textContent = '[' + parts.join(', ') + ']';
 }
 
 function getAudioCtx() {
@@ -1568,23 +1622,32 @@ function computeWaypoints() {
     const K_post  = is48k ? Math.max(2, Math.round(fps * 0.03)) : 0;
     const N_total = Math.max(2, Math.round(snapDurVal * fps));
 
-    // kOverride lets pingpong halve the per-waypoint context to keep total duration constant
-    const buildSeq = (wps, N_target = N_total, kOverride = snapKVal) => snapMode === 'k_frames'
+    // Builds one direction's frame sequence.
+    // ctxArg defaults to snapCtxArg() — pingpong halves pass a half-duration arg so all waypoints fit.
+    const buildSeq = (wps, N_target = N_total, kOverride = snapKVal, ctxArg = null) => snapMode === 'k_frames'
       ? buildSnapSequence(wps, kOverride, K_post, ctxSwapRange, coordsA, coordsB, currentEmbeds)
-      : buildSnapSequenceFixed(wps, Math.max(wps.length, N_target), K_post, ctxSwapRange, coordsA, coordsB, currentEmbeds, snapCtxArg());
+      : buildSnapSequenceFixed(wps, Math.max(wps.length, N_target), K_post, ctxSwapRange, coordsA, coordsB, currentEmbeds, ctxArg ?? snapCtxArg());
 
     let seq;
     if (trajDir === 'forward')       seq = buildSeq(fwdWPs);
     else if (trajDir === 'backward') seq = buildSeq(bwdWPs);
     else {
-      // Pingpong: split total duration evenly across fwd and bwd halves
-      const half  = Math.floor(N_total / 2);
-      const kHalf = Math.max(1, Math.floor(snapKVal / 2));
-      seq = [...buildSeq(fwdWPs, half, kHalf), ...buildSeq(bwdWPs, half, kHalf)];
+      // Pingpong: split total duration evenly across fwd and bwd halves.
+      //
+      // k_frames: use ceil/floor so every K value maps to a unique (kFwd, kBwd) pair.
+      //   floor alone collapses K=8 and K=9 both to kHalf=4 → identical audio.
+      // equal/prop: pass half the snapDurVal so getContextKs budgets context correctly
+      //   for the half-length sequence; otherwise K_each is over-sized and the truncation
+      //   cuts the final waypoints entirely (they'd be past the N_target cutoff).
+      const half        = Math.floor(N_total / 2);
+      const kFwd        = Math.max(1, Math.ceil(snapKVal / 2));
+      const kBwd        = Math.max(1, Math.floor(snapKVal / 2));
+      const halfCtxArg  = { ...snapCtxArg(), snapDurVal: snapDurVal / 2 };
+      seq = [...buildSeq(fwdWPs, half, kFwd, halfCtxArg), ...buildSeq(bwdWPs, half, kBwd, halfCtxArg)];
     }
     snapPlayFrames = seq;
     genPlaySeq     = seq;
-    setCodeSeqInfo(snapFrames);
+    setSnapSeqInfo(snapFrames, seq);
   }
   // draw mode: no discrete waypoints — embeddings are interpolated at playback time
   if (pathMode === 'draw') seqInfo.textContent = 'interpolated points along path';
