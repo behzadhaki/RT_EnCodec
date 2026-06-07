@@ -396,10 +396,11 @@ function setSeqInfo(seq) {
 
 // Code / snap mode: show at most 5 waypoints (6 for pingpong — 3 per half so turnaround always appears twice).
 // orderedWPs / snapFrames are already compact; pingpong turnaround duplicate is intentional — no dedup.
-function setCodeSeqInfo(seq) {
+function setCodeSeqInfo(seq, kRepeat) {
   const wps = seq || [];
   if (!wps.length) { seqInfo.textContent = ''; return; }
-  const fmt = f => `${f.src}${f.idx}`;
+  const k   = kRepeat > 1 ? 'x' + kRepeat : '';
+  const fmt = f => `${f.src}${f.idx}${k}`;
 
   if (wps.length <= 6) {
     seqInfo.textContent = '[ ' + wps.map(fmt).join(' → ') + ' ]';
@@ -776,6 +777,7 @@ const setCodeMode = mode => {
   document.getElementById('togCodeK')  .classList.toggle('active', mode === 'frames');
   document.getElementById('togCodeSec').classList.toggle('active', mode === 'seconds');
   applyCodeParamUI();
+  autoRegenerate();
 };
 document.getElementById('togCodeK')  .addEventListener('click', () => setCodeMode('frames'));
 document.getElementById('togCodeSec').addEventListener('click', () => setCodeMode('seconds'));
@@ -1551,7 +1553,7 @@ function computeWaypoints() {
 
     codePathFrames = sampledWPs;
     genPlaySeq     = sampledWPs;
-    setCodeSeqInfo(orderedWPs);
+    setCodeSeqInfo(orderedWPs, K);
 
   } else if (pathMode === 'snap') {
     const fwdWPs = computeSnapWaypoints(snapWaypointArgs());
