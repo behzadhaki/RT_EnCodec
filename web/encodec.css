@@ -157,3 +157,156 @@ select:focus, input[type=number]:focus { outline: none; border-color: var(--acce
   font-size: 11px; line-height: 1.5; color: var(--muted);
 }
 #notePanel strong { color: var(--text); font-weight: 600; }
+
+/* ── Experiment 6 — UMAP explorer ───────────────────────────────────── */
+/* Note: #frame columns, :root --lbl-w, #statusBar, #progressWrap overrides
+   live in experiment6.html <style> to avoid polluting other experiments. */
+
+#vizArea {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--bg);
+}
+
+#modeBar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+#levelWrap {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-left: 6px;
+}
+
+#levelWrap label { font-size: 11px; color: var(--muted); }
+
+#levelSelect {
+  font-size: 11px;
+  background: #1c1c1c;
+  border: 1px solid var(--border2);
+  color: var(--text);
+  padding: 2px 4px;
+  border-radius: 3px;
+}
+
+#umapWrap {
+  flex: 1;
+  position: relative;
+  overflow: hidden;
+}
+
+#umapCanvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+
+#legendBar {
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  padding: 4px 10px;
+  border-top: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+#legendBar span { font-size: 11px; color: var(--muted); }
+
+#statusWrap {
+  padding: 4px 10px;
+  border-top: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+#pinSeqBar {
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 3px;
+  padding: 5px 10px;
+  background: #00000099;
+  z-index: 2;
+  pointer-events: all;
+  border-bottom: 1px solid #333;
+}
+
+.pinChip {
+  cursor: grab;
+  background: #1e1e1e;
+  border: 1px solid #ffd70099;
+  border-radius: 3px;
+  padding: 1px 6px;
+  font-size: 11px;
+  color: #ffd700;
+  user-select: none;
+  transition: background 0.1s;
+}
+.pinChip:hover { background: #2e2e1e; }
+.pinChip.drag-over { border-color: #ffd700; background: #3a3a00; }
+
+.pinArrow { color: #666; font-size: 11px; align-self: center; }
+
+#trailToggle {
+  position: absolute;
+  top: 8px; right: 10px;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  color: var(--muted);
+  cursor: pointer;
+  user-select: none;
+  z-index: 3;  /* above #pinSeqBar (z-index:2) */
+}
+
+/* ── Waveform row ── */
+#waveRow {
+  display: flex;
+  height: 78px;
+  flex-shrink: 0;
+  border-top: 1px solid var(--border);
+}
+.wavePanel {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--border);
+  min-width: 0;
+  overflow: hidden;
+}
+.wavePanel:last-child { border-right: none; }
+.waveHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 2px 5px;
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--border);
+}
+.waveLbl { font-size: 10px; color: var(--muted); letter-spacing: 0.05em; text-transform: uppercase; }
+.waveCtrl { display: flex; gap: 2px; }
+.waveBtn {
+  background: none;
+  border: 1px solid var(--border2);
+  color: var(--muted);
+  border-radius: 2px;
+  font-size: 9px;
+  width: 18px; height: 15px;
+  cursor: pointer;
+  padding: 0;
+  line-height: 1;
+}
+.waveBtn:hover { color: var(--text); border-color: var(--accent); }
+.waveBtn.active { background: var(--accent-lo); border-color: var(--accent); color: var(--text); }
+.waveCanvas { flex: 1; width: 100%; display: block; cursor: crosshair; min-height: 0; }

@@ -5,183 +5,12 @@
 <title>Exp 6 — Codebook UMAP</title>
 <link rel="stylesheet" href="encodec.css">
 <style>
-:root { --lbl-w: 5.5em; }
+/* Experiment-6-only overrides — kept here to avoid polluting shared encodec.css */
 #frame { grid-template-columns: 210px 1fr; }
-
-#vizArea {
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
-  background: var(--bg);
-}
-
-#modeBar {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 6px 10px;
-  border-bottom: 1px solid var(--border);
-  flex-shrink: 0;
-}
-
-#levelWrap {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  margin-left: 6px;
-}
-
-#levelWrap label { font-size: 11px; color: var(--muted); }
-
-#levelSelect {
-  font-size: 11px;
-  background: #1c1c1c;
-  border: 1px solid var(--border2);
-  color: var(--text);
-  padding: 2px 4px;
-  border-radius: 3px;
-}
-
-#umapWrap {
-  flex: 1;
-  position: relative;
-  overflow: hidden;
-}
-
-#umapCanvas {
-  position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
-}
-
-#legendBar {
-  display: flex;
-  gap: 14px;
-  align-items: center;
-  padding: 4px 10px;
-  border-top: 1px solid var(--border);
-  flex-shrink: 0;
-}
-
-#legendBar span { font-size: 11px; color: var(--muted); }
-.ldot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 3px; vertical-align: middle; }
-
-#statusWrap {
-  padding: 4px 10px;
-  border-top: 1px solid var(--border);
-  flex-shrink: 0;
-}
-
-#statusBar { font-size: 11px; color: var(--muted); }
-
-#progressWrap {
-  height: 3px;
-  background: var(--surface);
-  border-radius: 2px;
-  margin-top: 3px;
-  display: none;
-}
-
-#progressBar {
-  height: 100%;
-  width: 0%;
-  background: var(--accent);
-  border-radius: 2px;
-  transition: width 0.08s;
-}
-
-#pinSeqBar {
-  position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
-  display: none;
-  align-items: center;
-  justify-content: center;
-  flex-wrap: wrap;
-  gap: 3px;
-  padding: 5px 10px;
-  background: #00000099;
-  z-index: 2;
-  pointer-events: all;
-  border-bottom: 1px solid #333;
-}
-
-.pinChip {
-  cursor: grab;
-  background: #1e1e1e;
-  border: 1px solid #ffd70099;
-  border-radius: 3px;
-  padding: 1px 6px;
-  font-size: 11px;
-  color: #ffd700;
-  user-select: none;
-  transition: background 0.1s;
-}
-.pinChip:hover { background: #2e2e1e; }
-.pinChip.drag-over { border-color: #ffd700; background: #3a3a00; }
-
-.pinArrow {
-  color: #666;
-  font-size: 11px;
-  align-self: center;
-}
-
-#trailToggle {
-  position: absolute;
-  top: 8px;
-  right: 10px;
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  font-size: 11px;
-  color: var(--muted);
-  cursor: pointer;
-  user-select: none;
-  z-index: 1;
-}
-
-/* ── Waveform row ───────────────────────────────────────────────────────── */
-#waveRow {
-  display: flex;
-  height: 78px;
-  flex-shrink: 0;
-  border-top: 1px solid var(--border);
-}
-.wavePanel {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  border-right: 1px solid var(--border);
-  min-width: 0;
-  overflow: hidden;
-}
-.wavePanel:last-child { border-right: none; }
-.waveHeader {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 2px 5px;
-  flex-shrink: 0;
-  border-bottom: 1px solid var(--border);
-}
-.waveLbl { font-size: 10px; color: var(--muted); letter-spacing: 0.05em; text-transform: uppercase; }
-.waveCtrl { display: flex; gap: 2px; }
-.waveBtn {
-  background: none;
-  border: 1px solid var(--border2);
-  color: var(--muted);
-  border-radius: 2px;
-  font-size: 9px;
-  width: 18px; height: 15px;
-  cursor: pointer;
-  padding: 0;
-  line-height: 1;
-}
-.waveBtn:hover { color: var(--text); border-color: var(--accent); }
-.waveBtn.active { background: var(--accent-lo); border-color: var(--accent); color: var(--text); }
-.waveCanvas { flex: 1; width: 100%; display: block; cursor: crosshair; min-height: 0; }
+:root  { --lbl-w: 5.5em; }
+/* Reset shared rules that don't apply in this layout */
+#statusBar  { flex: none; white-space: normal; overflow: visible; text-overflow: clip; min-width: auto; }
+#progressWrap { width: auto; overflow: visible; }
 </style>
 </head>
 <body>
@@ -262,7 +91,6 @@
           <polygon points="7,1.5 12.5,11.5 1.5,11.5" fill="none" stroke="#2090c0" stroke-width="1.5"/>
         </svg>Source B</span>
     </div>
-
   </div>
 </div>
 
@@ -271,6 +99,17 @@
 
 import { createDoubleSourceWidget } from './lib/double-source-widget.js';
 import { createModelPanel }         from './lib/model-panel.js';
+import { makeWavePlayer }           from './lib/wave-player.js';
+import { renderScatter as _renderScatter } from './lib/scatter-renderer.js';
+import {
+  findNearestUmapPoint,
+  findCodePath,
+  computeSnapWaypoints,
+  getContextKs,
+  buildSnapSequence,
+  buildSnapSequenceFixed,
+  makeFrameScales,
+} from './lib/trajectory-utils.js';
 
 const MODELS_BASE = new URL('../serialization/encodec_onnx_exports', location.href).href;
 
@@ -327,58 +166,6 @@ umapSection.innerHTML = `
 `.trim();
 controls.appendChild(umapSection);
 
-// ── DOM refs ──────────────────────────────────────────────────────────────────
-
-const umapCanvas   = document.getElementById('umapCanvas');
-const statusBar    = document.getElementById('statusBar');
-const progWrap     = document.getElementById('progressWrap');
-const progBar      = document.getElementById('progressBar');
-const togCombined  = document.getElementById('togCombined');
-const togPerLevel  = document.getElementById('togPerLevel');
-const levelWrap    = document.getElementById('levelWrap');
-const levelSelect  = document.getElementById('levelSelect');
-const nNeighborsEl  = document.getElementById('nNeighbors');
-const minDistEl     = document.getElementById('minDist');
-const umapWindowEl  = document.getElementById('umapWindow');
-umapWindowEl.addEventListener('change', triggerUMAP);
-const togPreVQ     = document.getElementById('togPreVQ');
-const togPostVQ    = document.getElementById('togPostVQ');
-
-togPreVQ.addEventListener('click', () => {
-  embSpace = 'pre_vq';
-  togPreVQ.classList.add('active'); togPostVQ.classList.remove('active');
-  triggerUMAP();
-});
-togPostVQ.addEventListener('click', () => {
-  embSpace = 'post_vq';
-  togPostVQ.classList.add('active'); togPreVQ.classList.remove('active');
-  triggerUMAP();
-});
-
-const togEmbOnly  = document.getElementById('togEmbOnly');
-const togEmbDelta = document.getElementById('togEmbDelta');
-togEmbOnly.addEventListener('click', () => {
-  embMode = 'emb';
-  togEmbOnly.classList.add('active'); togEmbDelta.classList.remove('active');
-  triggerUMAP();
-});
-togEmbDelta.addEventListener('click', () => {
-  embMode = 'emb+delta';
-  togEmbDelta.classList.add('active');
-  togEmbOnly.classList.remove('active'); togDeltaOnly.classList.remove('active');
-  triggerUMAP();
-});
-
-const togDeltaOnly = document.getElementById('togDeltaOnly');
-togDeltaOnly.addEventListener('click', () => {
-  embMode = 'delta';
-  togDeltaOnly.classList.add('active');
-  togEmbOnly.classList.remove('active'); togEmbDelta.classList.remove('active');
-  triggerUMAP();
-});
-const togExplore   = document.getElementById('togExplore');
-const togDraw      = document.getElementById('togDraw');
-
 const trajSection = document.createElement('div');
 trajSection.className = 'section';
 trajSection.innerHTML = `
@@ -393,15 +180,11 @@ trajSection.innerHTML = `
     <button class="tog"        id="togDirBwd"  style="flex:1">← Bwd</button>
     <button class="tog"        id="togDirPing" style="flex:1">↔ Ping</button>
   </div>
-
-  <!-- Draw-only: duration -->
   <div class="row" id="durRow">
     <span class="lbl">Duration</span>
     <input type="number" id="trajDuration" value="4" min="0.5" max="30" step="0.5">
     <span style="font-size:11px;color:var(--muted);margin-left:2px">s</span>
   </div>
-
-  <!-- Code-only block — fixed layout, never shifts internally -->
   <div id="codeBlock" style="display:none">
     <div class="row" style="gap:3px">
       <button class="tog active" id="togCodeK"   style="flex:1">K frames</button>
@@ -413,8 +196,6 @@ trajSection.innerHTML = `
       <span id="codeParamUnit" style="font-size:11px;color:var(--muted)">×</span>
     </div>
   </div>
-
-  <!-- Snap-only block — fixed layout, never shifts internally -->
   <div id="snapBlock" style="display:none">
     <div class="row" style="margin-bottom:0.15em">
       <span style="font-size:10px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;color:var(--muted)">Duration</span>
@@ -435,7 +216,6 @@ trajSection.innerHTML = `
       <span id="ctxSwapVal" style="font-size:11px;color:var(--muted);min-width:2.5em;text-align:right">0.00</span>
     </div>
   </div>
-
   <div class="row" style="margin-top:2px">
     <button class="tog" id="clearTraj" style="flex:1">Clear</button>
   </div>
@@ -462,147 +242,39 @@ postProcSection.innerHTML = `
 `.trim();
 controls.appendChild(postProcSection);
 
-const trajDurationEl  = document.getElementById('trajDuration');
-const durRow          = document.getElementById('durRow');
-trajDurationEl.addEventListener('change', () => autoRegenerate());
-const codeBlock       = document.getElementById('codeBlock');
-const codeParamInput  = document.getElementById('codeParamInput');
-const codeParamLbl    = document.getElementById('codeParamLbl');
-const codeParamUnit   = document.getElementById('codeParamUnit');
-const snapBlock       = document.getElementById('snapBlock');
-const snapParamInput  = document.getElementById('snapParamInput');
-const snapParamLbl    = document.getElementById('snapParamLbl');
-const snapParamUnit   = document.getElementById('snapParamUnit');
+// ── DOM refs ──────────────────────────────────────────────────────────────────
 
-// Persisted snap parameter values so switching sub-modes doesn't lose them
-let snapKVal   = 8;   // for 'k_frames'
-let snapDurVal = 4;   // for 'equal' / 'proportional'
-
-// Update the single snap param row's label/attrs/value without changing layout
-function applySnapParamUI() {
-  if (snapMode === 'k_frames') {
-    snapParamLbl.textContent  = 'K';
-    snapParamUnit.textContent = 'frames';
-    Object.assign(snapParamInput, {min: 1, max: 128, step: 1, value: snapKVal});
-  } else {
-    snapParamLbl.textContent  = 'Duration';
-    snapParamUnit.textContent = 's';
-    Object.assign(snapParamInput, {min: 0.5, max: 30, step: 0.5, value: snapDurVal});
-  }
-}
-
-snapParamInput.addEventListener('change', e => {
-  if (snapMode === 'k_frames') snapKVal   = Math.max(1,   parseInt(e.target.value)   || 8);
-  else                          snapDurVal = Math.max(0.5, parseFloat(e.target.value) || 4);
-  autoRegenerate();
-});
-
-let codeDurMode = 'frames'; // 'frames' | 'seconds'
-let codeKVal    = 100;     // number of latent code frames
-let codeSecVal  = 4;       // duration in seconds
-
-function applyCodeParamUI() {
-  if (codeDurMode === 'frames') {
-    codeParamLbl.textContent  = 'K';
-    codeParamUnit.textContent = 'frames';
-    Object.assign(codeParamInput, {min: 2, max: 2000, step: 1, value: codeKVal});
-  } else {
-    codeParamLbl.textContent  = 'Duration';
-    codeParamUnit.textContent = 's';
-    Object.assign(codeParamInput, {min: 0.5, max: 30, step: 0.5, value: codeSecVal});
-  }
-}
-
-codeParamInput.addEventListener('change', e => {
-  if (codeDurMode === 'frames') codeKVal   = Math.max(2,   parseInt(e.target.value)   || 100);
-  else                           codeSecVal = Math.max(0.5, parseFloat(e.target.value) || 4);
-  autoRegenerate();
-});
-
-const setCodeMode = (mode) => {
-  codeDurMode = mode;
-  document.getElementById('togCodeK')  .classList.toggle('active', mode === 'frames');
-  document.getElementById('togCodeSec').classList.toggle('active', mode === 'seconds');
-  applyCodeParamUI();
-};
-document.getElementById('togCodeK')  .addEventListener('click', () => setCodeMode('frames'));
-document.getElementById('togCodeSec').addEventListener('click', () => setCodeMode('seconds'));
-
-const setSnapMode = (mode) => {
-  snapMode = mode;
-  document.getElementById('togSnapK')   .classList.toggle('active', mode === 'k_frames');
-  document.getElementById('togSnapEq')  .classList.toggle('active', mode === 'equal');
-  document.getElementById('togSnapProp').classList.toggle('active', mode === 'proportional');
-  applySnapParamUI(); // change label/unit/value — no rows added/removed
-  snapFrames = null; snapPlayFrames = null;
-  autoRegenerate();
-};
-
-document.getElementById('togSnapK')   .addEventListener('click', () => setSnapMode('k_frames'));
-document.getElementById('togSnapEq')  .addEventListener('click', () => setSnapMode('equal'));
-document.getElementById('togSnapProp').addEventListener('click', () => setSnapMode('proportional'));
-
-document.getElementById('togDrawMode').addEventListener('click', () => {
-  pathMode = 'draw';
-  document.getElementById('togDrawMode').classList.add('active');
-  document.getElementById('togCodeMode').classList.remove('active');
-  document.getElementById('togSnapMode').classList.remove('active');
-  durRow.style.display                                  = '';
-  codeBlock.style.display                               = 'none';
-  snapBlock.style.display                               = 'none';
-  document.getElementById('trailToggle').style.display  = 'none';
-  codePathFrames = null; snapFrames = null; snapPlayFrames = null;
-  renderScatter(); autoRegenerate();
-});
-
-const setPathMode = (mode) => {
-  pathMode = mode;
-  document.getElementById('togDrawMode').classList.toggle('active', mode === 'draw');
-  document.getElementById('togCodeMode').classList.toggle('active', mode === 'code');
-  document.getElementById('togSnapMode').classList.toggle('active', mode === 'snap');
-  durRow.style.display                                  = mode === 'draw' ? '' : 'none';
-  codeBlock.style.display                               = mode === 'code' ? '' : 'none';
-  snapBlock.style.display                               = mode === 'snap' ? '' : 'none';
-  document.getElementById('trailToggle').style.display  = mode === 'snap' ? '' : 'none';
-  if (mode === 'code') applyCodeParamUI();
-  if (mode === 'snap') applySnapParamUI();
-  codePathFrames = null; snapFrames = null; snapPlayFrames = null;
-  renderScatter(); autoRegenerate();
-};
-
-const ctxSwapValEl = document.getElementById('ctxSwapVal');
-document.getElementById('ctxSwapSlider').addEventListener('input', e => {
-  ctxSwapRange = parseFloat(e.target.value);
-  ctxSwapValEl.textContent = ctxSwapRange.toFixed(2);
-  autoRegenerate();
-});
-document.getElementById('togCodeMode').addEventListener('click', () => setPathMode('code'));
-document.getElementById('togSnapMode').addEventListener('click', () => setPathMode('snap'));
-
-const setTrajDir = dir => {
-  trajDir = dir;
-  document.getElementById('togDirFwd') .classList.toggle('active', dir === 'forward');
-  document.getElementById('togDirBwd') .classList.toggle('active', dir === 'backward');
-  document.getElementById('togDirPing').classList.toggle('active', dir === 'pingpong');
-  autoRegenerate();
-};
-document.getElementById('togDirFwd') .addEventListener('click', () => setTrajDir('forward'));
-document.getElementById('togDirBwd') .addEventListener('click', () => setTrajDir('backward'));
-document.getElementById('togDirPing').addEventListener('click', () => setTrajDir('pingpong'));
-
-document.getElementById('clearTraj').addEventListener('click', () => {
-  stopTrajPlayback();
-  playerG.stop();
-  userTrajectory = []; rawDrawPoints = []; pinPoints = [];
-  trajAudioBuf = null; codePathFrames = null;
-  snapFrames = null; snapPlayFrames = null; genPlaySeq = null;
-  trajAnchorPos = -1;
-  updatePinSeqBar();
-  renderScatter(); setStatus('Trajectory cleared.');
-});
+const umapCanvas    = document.getElementById('umapCanvas');
+const statusBar     = document.getElementById('statusBar');
+const progWrap      = document.getElementById('progressWrap');
+const progBar       = document.getElementById('progressBar');
+const togCombined   = document.getElementById('togCombined');
+const togPerLevel   = document.getElementById('togPerLevel');
+const levelWrap     = document.getElementById('levelWrap');
+const levelSelect   = document.getElementById('levelSelect');
+const nNeighborsEl  = document.getElementById('nNeighbors');
+const minDistEl     = document.getElementById('minDist');
+const umapWindowEl  = document.getElementById('umapWindow');
+const togExplore    = document.getElementById('togExplore');
+const togDraw       = document.getElementById('togDraw');
+const togPins       = document.getElementById('togPins');
+const pinSeqBar     = document.getElementById('pinSeqBar');
+const trajDurationEl = document.getElementById('trajDuration');
+const durRow         = document.getElementById('durRow');
+const codeBlock      = document.getElementById('codeBlock');
+const codeParamInput = document.getElementById('codeParamInput');
+const codeParamLbl   = document.getElementById('codeParamLbl');
+const codeParamUnit  = document.getElementById('codeParamUnit');
+const snapBlock      = document.getElementById('snapBlock');
+const snapParamInput = document.getElementById('snapParamInput');
+const snapParamLbl   = document.getElementById('snapParamLbl');
+const snapParamUnit  = document.getElementById('snapParamUnit');
+const ctxSwapValEl   = document.getElementById('ctxSwapVal');
+const dpr = devicePixelRatio || 1;
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
+// Worker / encode
 let worker        = null;
 let jobSeq        = 0;
 let activeJobId   = -1;
@@ -611,71 +283,114 @@ let pendingAudioB = null;
 let currentEmbeds = null;
 let codebooks     = null;
 let codebooksFor  = null;
-let umapMode      = 'combined';
-let umapLevel     = 0;
-let embSpace      = 'pre_vq'; // 'pre_vq' | 'post_vq'
-let embMode       = 'emb';    // 'emb' | 'emb+delta'
-let coordsA       = null;
-let coordsB       = null;
-let encodeTimer      = null;
-let umapWorker       = null;
-let activeUMAPJobId  = -1;
-let audioCtx         = null;
-let playJobId        = -1;
-let lastTransform    = null;
-let selectedPoint    = null; // { src, idx }
-let canvasMode       = 'explore'; // 'explore' | 'draw' | 'pins'
-let pinPoints        = [];        // [[umapX, umapY], …] ordered pin sequence
-// ── Viewport (zoom / pan) ──────────────────────────────────────────────────
-let viewZoom  = 1;
-let viewPanX  = 0;
-let viewPanY  = 0;
-// ── Pan-drag tracking ──────────────────────────────────────────────────────
-let isPanDragging  = false;
-let panDragLast    = null;
-let panDragMoved   = false;
-let userTrajectory   = [];        // [[umapX, umapY], …] resampled path
-let rawDrawPoints    = [];
-let isDrawing        = false;
-let trajAnchorPos    = -1;        // 0..1 during playback, -1 = off
-let trajPlayStartTime = null;
-let trajAudioBuf      = null;      // most-recent AudioBuffer (used for looping)
-let trajLooping       = false;
-let activeSrc         = null;      // currently playing BufferSourceNode
-let activeGain        = null;      // its GainNode (used for crossfade)
-const XFADE_S         = 0.04;     // crossfade duration in seconds
-let pathMode          = 'draw';   // 'draw' | 'code' | 'snap'
-let trajDir           = 'forward'; // 'forward' | 'backward' | 'pingpong'
-let codePathFrames    = null;     // [{src,idx}] from graph search
-let snapFrames        = null;     // snap waypoints for viz
-let snapPlayFrames    = null;     // full snap sequence (with pre-roll) for playback
-let trajCurrentDuration = 0;     // actual playback duration (set at play time)
-let snapMode          = 'k_frames'; // 'k_frames' | 'equal' | 'proportional'
-let codeRepeat        = 1;
-let ctxSwapRange      = 0;       // UMAP-unit radius for context swap (0 = off)
-let showTrail         = true;
-let postProcEnabled   = true;
-let notchFundamental  = 1200;  // Hz
-let notchQ            = 30;
-let masterDest        = null;  // AudioNode — chain input that all players connect to
-let notchFilters      = [];
-let rawAudioA         = null;   // Float32Array — source A PCM (kept after encode)
-let rawAudioB         = null;   // Float32Array — source B PCM
-let genPlaySeq        = null;   // [{src,idx}] — frame seq for last decoded trajectory
-let waveHighlight     = null;   // {src,idx} | null — UMAP point driven by waveform playback
-let isShiftDragging   = false;
-let shiftDragStart    = null;     // [umapX, umapY] at drag start
-let shiftDragBaseTraj = null;     // trajectory snapshot at drag start
-let isPinDragging     = false;
-let pinDragIdx        = -1;
-let pinSeqDragSrc     = -1;       // index of chip being dragged in seq bar
-const dpr = devicePixelRatio || 1;
+let encodeTimer   = null;
+
+// UMAP
+let umapWorker      = null;
+let activeUMAPJobId = -1;
+let umapMode        = 'combined';
+let umapLevel       = 0;
+let embSpace        = 'pre_vq'; // 'pre_vq' | 'post_vq'
+let embMode         = 'emb';    // 'emb' | 'emb+delta' | 'delta'
+let coordsA         = null;
+let coordsB         = null;
+
+// Viewport (zoom / pan)
+let viewZoom = 1;
+let viewPanX = 0;
+let viewPanY = 0;
+
+// Canvas interaction / drag
+let canvasMode      = 'explore';  // 'explore' | 'draw' | 'pins'
+let lastTransform   = null;
+let selectedPoint   = null;       // {src, idx}
+let isPanDragging   = false;
+let panDragLast     = null;
+let panDragMoved    = false;
+let isDrawing       = false;
+let isShiftDragging = false;
+let shiftDragStart  = null;
+let shiftDragBaseTraj = null;
+let isPinDragging   = false;
+let pinDragIdx      = -1;
+let pinSeqDragSrc   = -1;
+
+// Trajectory
+let userTrajectory  = [];
+let rawDrawPoints   = [];
+let pinPoints       = [];
+let pathMode        = 'draw';      // 'draw' | 'code' | 'snap'
+let trajDir         = 'forward';   // 'forward' | 'backward' | 'pingpong'
+let codePathFrames  = null;
+let snapFrames      = null;
+let snapPlayFrames  = null;
+let genPlaySeq      = null;
+let codeDurMode     = 'frames';    // 'frames' | 'seconds'
+let codeKVal        = 100;
+let codeSecVal      = 4;
+let snapMode        = 'k_frames';  // 'k_frames' | 'equal' | 'proportional'
+let snapKVal        = 8;
+let snapDurVal      = 4;
+let ctxSwapRange    = 0;
+
+// Playback
+let audioCtx            = null;
+let playJobId           = -1;
+let activeSrc           = null;
+let activeGain          = null;
+const XFADE_S           = 0.04;
+let trajPlayStartTime   = null;
+let trajAudioBuf        = null;
+let trajLooping         = false;
+let trajAnchorPos       = -1;
+let trajCurrentDuration = 0;
+
+// Post-processing
+let postProcEnabled  = true;
+let notchFundamental = 1200;
+let notchQ           = 30;
+let masterDest       = null;
+let notchFilters     = [];
+
+// Waveform display
+let rawAudioA    = null;
+let rawAudioB    = null;
+let waveHighlight = null;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function setStatus(msg, isError = false) {
   statusBar.textContent = msg;
   statusBar.style.color = isError ? '#f66' : '';
+}
+
+function getAudioCtx() {
+  if (!audioCtx) audioCtx = new AudioContext();
+  return audioCtx;
+}
+
+function renderScatter() {
+  const fps = coordsA ? coordsA.length / srcWidget.getDuration() : 1;
+  const result = _renderScatter(umapCanvas, dpr, {
+    coordsA, coordsB,
+    viewZoom, viewPanX, viewPanY,
+    pinPoints, selectedPoint, waveHighlight, userTrajectory,
+    pathMode, snapFrames, codePathFrames, trajAnchorPos,
+    snapPlayFrames, trajDir, showTrail: chkTrail.checked, canvasMode, ctxSwapRange,
+    snapMode, snapKVal, snapDurVal, framesPerSec: fps,
+  });
+  if (result !== null) lastTransform = result;
+}
+
+// ── Toggle group helper ───────────────────────────────────────────────────────
+
+function createToggleGroup(pairs, onChange) {
+  pairs.forEach(({ el, value }) => {
+    el.addEventListener('click', () => {
+      pairs.forEach(p => p.el.classList.toggle('active', p.value === value));
+      onChange(value);
+    });
+  });
 }
 
 // ── Canvas resize ─────────────────────────────────────────────────────────────
@@ -716,7 +431,7 @@ function onUMAPWorkerMsg({ data: msg }) {
     const { result, T_A, T_B } = msg;
     coordsA = [];
     coordsB = [];
-    viewZoom = 1; viewPanX = 0; viewPanY = 0; // reset viewport for new layout
+    viewZoom = 1; viewPanX = 0; viewPanY = 0;
     for (let i = 0; i < T_A; i++) coordsA.push([result[i * 2], result[i * 2 + 1]]);
     for (let i = 0; i < T_B; i++) coordsB.push([result[(T_A + i) * 2], result[(T_A + i) * 2 + 1]]);
     progWrap.style.display = 'none';
@@ -772,7 +487,7 @@ function onWorkerMsg(e) {
     }
 
   } else if (msg.type === 'embeddings_exp6') {
-    currentEmbeds = msg; // includes scalesA / scalesB (Float32Array or null)
+    currentEmbeds = msg;
     populateLevelSelect(msg.codesDimsA[1]);
     triggerUMAP();
 
@@ -806,7 +521,6 @@ async function startEncode() {
   coordsA = coordsB = null;
   renderScatter();
 
-  // Keep raw PCM for waveform players (worker receives a copy via .slice())
   rawAudioA = audioA;
   rawAudioB = audioB;
   playerA.setAudio(rawAudioA, sr);
@@ -821,7 +535,7 @@ async function startEncode() {
   setStatus('Encoding A…');
 
   worker.postMessage({
-    type:      'encode', source: 'A', jobId: activeJobId,
+    type: 'encode', source: 'A', jobId: activeJobId,
     audio:     audioA.slice(),
     modelHz:   mp.getModelHz(),
     bwKbps:    mp.getBwKbps(),
@@ -834,7 +548,7 @@ function startEncodeB() {
   encodePhase = 'B';
   setStatus('Encoding B…');
   worker.postMessage({
-    type:      'encode', source: 'B', jobId: activeJobId,
+    type: 'encode', source: 'B', jobId: activeJobId,
     audio:     pendingAudioB.slice(),
     modelHz:   mp.getModelHz(),
     bwKbps:    mp.getBwKbps(),
@@ -862,7 +576,7 @@ levelSelect.addEventListener('change', () => {
   triggerUMAP();
 });
 
-// ── Mode toggle ───────────────────────────────────────────────────────────────
+// ── UMAP mode toggles ─────────────────────────────────────────────────────────
 
 togCombined.addEventListener('click', () => {
   if (umapMode === 'combined') return;
@@ -882,12 +596,132 @@ togPerLevel.addEventListener('click', () => {
   triggerUMAP();
 });
 
-[nNeighborsEl, minDistEl].forEach(el => el.addEventListener('change', triggerUMAP));
+createToggleGroup([
+  { el: document.getElementById('togPreVQ'),  value: 'pre_vq' },
+  { el: document.getElementById('togPostVQ'), value: 'post_vq' },
+], v => { embSpace = v; triggerUMAP(); });
 
-document.getElementById('chkTrail').addEventListener('change', e => {
-  showTrail = e.target.checked;
-  renderScatter();
+createToggleGroup([
+  { el: document.getElementById('togEmbOnly'),  value: 'emb' },
+  { el: document.getElementById('togEmbDelta'), value: 'emb+delta' },
+  { el: document.getElementById('togDeltaOnly'), value: 'delta' },
+], v => { embMode = v; triggerUMAP(); });
+
+[nNeighborsEl, minDistEl, umapWindowEl].forEach(el => el.addEventListener('change', triggerUMAP));
+
+document.getElementById('chkTrail').addEventListener('change', renderScatter);
+
+// ── Trajectory mode toggles ───────────────────────────────────────────────────
+
+const chkTrail = document.getElementById('chkTrail');
+
+function applyCodeParamUI() {
+  if (codeDurMode === 'frames') {
+    codeParamLbl.textContent  = 'K';
+    codeParamUnit.textContent = 'frames';
+    Object.assign(codeParamInput, { min: 2, max: 2000, step: 1, value: codeKVal });
+  } else {
+    codeParamLbl.textContent  = 'Duration';
+    codeParamUnit.textContent = 's';
+    Object.assign(codeParamInput, { min: 0.5, max: 30, step: 0.5, value: codeSecVal });
+  }
+}
+
+function applySnapParamUI() {
+  if (snapMode === 'k_frames') {
+    snapParamLbl.textContent  = 'K';
+    snapParamUnit.textContent = 'frames';
+    Object.assign(snapParamInput, { min: 1, max: 128, step: 1, value: snapKVal });
+  } else {
+    snapParamLbl.textContent  = 'Duration';
+    snapParamUnit.textContent = 's';
+    Object.assign(snapParamInput, { min: 0.5, max: 30, step: 0.5, value: snapDurVal });
+  }
+}
+
+const setCodeMode = mode => {
+  codeDurMode = mode;
+  document.getElementById('togCodeK')  .classList.toggle('active', mode === 'frames');
+  document.getElementById('togCodeSec').classList.toggle('active', mode === 'seconds');
+  applyCodeParamUI();
+};
+document.getElementById('togCodeK')  .addEventListener('click', () => setCodeMode('frames'));
+document.getElementById('togCodeSec').addEventListener('click', () => setCodeMode('seconds'));
+
+const setSnapMode = mode => {
+  snapMode = mode;
+  document.getElementById('togSnapK')   .classList.toggle('active', mode === 'k_frames');
+  document.getElementById('togSnapEq')  .classList.toggle('active', mode === 'equal');
+  document.getElementById('togSnapProp').classList.toggle('active', mode === 'proportional');
+  applySnapParamUI();
+  snapFrames = null; snapPlayFrames = null;
+  autoRegenerate();
+};
+document.getElementById('togSnapK')   .addEventListener('click', () => setSnapMode('k_frames'));
+document.getElementById('togSnapEq')  .addEventListener('click', () => setSnapMode('equal'));
+document.getElementById('togSnapProp').addEventListener('click', () => setSnapMode('proportional'));
+
+const setPathMode = mode => {
+  pathMode = mode;
+  document.getElementById('togDrawMode').classList.toggle('active', mode === 'draw');
+  document.getElementById('togCodeMode').classList.toggle('active', mode === 'code');
+  document.getElementById('togSnapMode').classList.toggle('active', mode === 'snap');
+  durRow.style.display                                   = mode === 'draw' ? '' : 'none';
+  codeBlock.style.display                                = mode === 'code' ? '' : 'none';
+  snapBlock.style.display                                = mode === 'snap' ? '' : 'none';
+  document.getElementById('trailToggle').style.display   = mode === 'snap' ? '' : 'none';
+  if (mode === 'code') applyCodeParamUI();
+  if (mode === 'snap') applySnapParamUI();
+  codePathFrames = null; snapFrames = null; snapPlayFrames = null;
+  renderScatter(); autoRegenerate();
+};
+document.getElementById('togDrawMode').addEventListener('click', () => setPathMode('draw'));
+document.getElementById('togCodeMode').addEventListener('click', () => setPathMode('code'));
+document.getElementById('togSnapMode').addEventListener('click', () => setPathMode('snap'));
+
+const setTrajDir = dir => {
+  trajDir = dir;
+  document.getElementById('togDirFwd') .classList.toggle('active', dir === 'forward');
+  document.getElementById('togDirBwd') .classList.toggle('active', dir === 'backward');
+  document.getElementById('togDirPing').classList.toggle('active', dir === 'pingpong');
+  autoRegenerate();
+};
+document.getElementById('togDirFwd') .addEventListener('click', () => setTrajDir('forward'));
+document.getElementById('togDirBwd') .addEventListener('click', () => setTrajDir('backward'));
+document.getElementById('togDirPing').addEventListener('click', () => setTrajDir('pingpong'));
+
+codeParamInput.addEventListener('change', e => {
+  if (codeDurMode === 'frames') codeKVal   = Math.max(2,   parseInt(e.target.value)   || 100);
+  else                           codeSecVal = Math.max(0.5, parseFloat(e.target.value) || 4);
+  autoRegenerate();
 });
+
+snapParamInput.addEventListener('change', e => {
+  if (snapMode === 'k_frames') snapKVal   = Math.max(1,   parseInt(e.target.value)   || 8);
+  else                          snapDurVal = Math.max(0.5, parseFloat(e.target.value) || 4);
+  autoRegenerate();
+});
+
+trajDurationEl.addEventListener('change', () => autoRegenerate());
+
+document.getElementById('ctxSwapSlider').addEventListener('input', e => {
+  ctxSwapRange = parseFloat(e.target.value);
+  ctxSwapValEl.textContent = ctxSwapRange.toFixed(2);
+  autoRegenerate();
+});
+
+document.getElementById('clearTraj').addEventListener('click', () => {
+  stopTrajPlayback();
+  playerG.stop();
+  userTrajectory = []; rawDrawPoints = []; pinPoints = [];
+  trajAudioBuf = null; codePathFrames = null;
+  snapFrames = null; snapPlayFrames = null; genPlaySeq = null;
+  trajAnchorPos = -1;
+  updatePinSeqBar();
+  renderScatter(); setStatus('Trajectory cleared.');
+});
+
+// ── Post-process toggles ──────────────────────────────────────────────────────
 
 document.getElementById('togNotch').addEventListener('click', () => {
   postProcEnabled = !postProcEnabled;
@@ -926,30 +760,21 @@ async function ensureCodebooks() {
 
 // ── Frame extraction ──────────────────────────────────────────────────────────
 
-// Build the UMAP feature vector when History K > 1:
-//   [raw_emb[t]  ‖  feat[t-K+1]  ‖  …  ‖  feat[t-1]  ‖  feat[t]]
-//    ^ D_raw anchor                  K × D_feat history (oldest → newest)
-// rawFrames = original embeddings (the anchor, always present for K > 1)
-// featFrames = embMode-transformed frames (what goes in the history window)
-// K=1: no anchor needed — returns featFrames unchanged.
 function applyWindowWithAnchor(rawFrames, featFrames, K) {
   if (K <= 1) return featFrames;
   const D_raw  = rawFrames[0].length;
   const D_feat = featFrames[0].length;
   return rawFrames.map((raw, t) => {
     const vec = new Float32Array(D_raw + K * D_feat);
-    vec.set(raw, 0);                                        // anchor: emb[t]
+    vec.set(raw, 0);
     for (let k = 0; k < K; k++) {
       const srcT = Math.max(0, t - (K - 1 - k));
-      vec.set(featFrames[srcT], D_raw + k * D_feat);        // history window
+      vec.set(featFrames[srcT], D_raw + k * D_feat);
     }
     return vec;
   });
 }
 
-// Return only the frame-to-frame delta vectors (same dimensionality as input).
-// First frame gets a zero delta.  Used for UMAP projection only — decoding always
-// uses the original emb_quant regardless of this choice.
 function computeDeltas(frames) {
   const D = frames[0].length;
   return frames.map((f, t) => {
@@ -961,8 +786,6 @@ function computeDeltas(frames) {
   });
 }
 
-// Concatenate each frame with its delta: [emb ‖ emb−prev_emb] → Float32Array[2D].
-// First frame gets a zero delta.
 function appendDeltas(frames) {
   const D   = frames[0].length;
   const out = [];
@@ -970,13 +793,12 @@ function appendDeltas(frames) {
     const f   = frames[t];
     const vec = new Float32Array(2 * D);
     vec.set(f, 0);
-    if (t > 0) { const p = frames[t-1]; for (let d = 0; d < D; d++) vec[D+d] = f[d] - p[d]; }
+    if (t > 0) { const p = frames[t - 1]; for (let d = 0; d < D; d++) vec[D + d] = f[d] - p[d]; }
     out.push(vec);
   }
   return out;
 }
 
-// emb_quant layout: [1, D, T] flattened → index [d, t] = embQuant[d*T + t]
 function embQuantToFrames(embQuant, dims) {
   const [, D, T] = dims;
   const frames = [];
@@ -988,7 +810,6 @@ function embQuantToFrames(embQuant, dims) {
   return frames;
 }
 
-// codes layout: [1, K, T] flattened → index [k, t] = codes[k*T + t]
 function codebookLookupFrames(cb, codes, dims, level) {
   const [, , T] = dims;
   const { data, vocab_size, dim } = cb;
@@ -1032,7 +853,6 @@ async function runUMAP() {
     else if (embMode === 'delta')     { framesA = computeDeltas(framesA); framesB = computeDeltas(framesB); }
   }
 
-  // History window: anchor = emb[t], then K steps of embMode feature (oldest → newest)
   const K = Math.max(1, parseInt(umapWindowEl.value) || 1);
   if (K > 1) {
     framesA = applyWindowWithAnchor(rawA, framesA, K);
@@ -1043,7 +863,6 @@ async function runUMAP() {
   const T_B = framesB.length;
   const D   = framesA[0].length;
 
-  // Pack into a single transferable flat Float32Array
   const flat = new Float32Array((T_A + T_B) * D);
   framesA.forEach((f, i) => flat.set(f, i * D));
   framesB.forEach((f, i) => flat.set(f, (T_A + i) * D));
@@ -1068,21 +887,14 @@ async function runUMAP() {
 }
 
 // ── Post-processing chain ─────────────────────────────────────────────────────
-// Chains of notch (band-reject) filters at harmonics of notchFundamental.
-// All player gainNodes connect to masterDest (chain input) instead of
-// audioCtx.destination directly.
 
 function buildPostProc() {
   if (!audioCtx) return;
   const maxFreq = audioCtx.sampleRate / 2 - 1;
-
-  // Master input gain — everything connects here
   const mg = audioCtx.createGain();
   mg.gain.value = 1;
-
   notchFilters = [];
   let prev = mg;
-
   for (let h = 1; h * notchFundamental <= maxFreq; h++) {
     const f = audioCtx.createBiquadFilter();
     f.type = 'notch';
@@ -1112,532 +924,61 @@ function updateNotchFilters() {
   });
 }
 
-// ── Waveform player factory ───────────────────────────────────────────────────
-// Creates a self-contained waveform player for one audio buffer.
-// onFrameCb(pos)  called each animation frame while playing (pos=0..1, pos=-1 when stopped).
+// ── Waveform players ──────────────────────────────────────────────────────────
 
-function makeWavePlayer(canvasId, waveColor, onFrameCb) {
-  const cvs  = document.getElementById(canvasId);
-  const c2   = cvs.getContext('2d');
-  const pdpr = devicePixelRatio || 1;
+const playerA = makeWavePlayer('waveCanvA', '#c87800', { getAudioCtx, getMasterDest }, pos => {
+  if (pos < 0 || !coordsA) { waveHighlight = null; renderScatter(); return; }
+  const i = Math.min(Math.floor(pos * coordsA.length), coordsA.length - 1);
+  waveHighlight = { src: 'A', idx: i };
+  playerB.setCursor(-1);
+  renderScatter();
+});
 
-  let audio   = null;   // Float32Array
-  let sr      = 44100;
-  let peaks   = null;   // Float32Array: [min,max] per pixel col
-  let looping = false;
-  let playing = false;
-  let srcNode = null, gainNode = null;
-  let playStart  = 0;   // audioCtx.currentTime when play began
-  let playOffset = 0;   // seconds into buffer when play began
-  let animId  = null;
-  let cursorPos = -1;   // 0..1 external cursor, -1 = hidden
-  let playBtnEl = null, loopBtnEl = null;
+const playerB = makeWavePlayer('waveCanvB', '#2090c0', { getAudioCtx, getMasterDest }, pos => {
+  if (pos < 0 || !coordsB) { waveHighlight = null; renderScatter(); return; }
+  const i = Math.min(Math.floor(pos * coordsB.length), coordsB.length - 1);
+  waveHighlight = { src: 'B', idx: i };
+  playerA.setCursor(-1);
+  renderScatter();
+});
 
-  const dur = () => audio ? audio.length / sr : 0;
-  const elapsed = () => playing && audioCtx
-    ? playOffset + (audioCtx.currentTime - playStart)
-    : playOffset;
-  const position = () => dur() > 0 ? Math.min(1, elapsed() / dur()) : 0;
+const playerG = makeWavePlayer('waveCanvG', '#44bb88', { getAudioCtx, getMasterDest }, pos => {
+  trajAnchorPos = pos >= 0 ? pos : -1;
 
-  function buildPeaks() {
-    if (!audio || !cvs.width) { peaks = null; return; }
-    const W = cvs.width;
-    peaks = new Float32Array(W * 2);
-    for (let px = 0; px < W; px++) {
-      const s0 = Math.floor(px / W * audio.length);
-      const s1 = Math.max(s0 + 1, Math.floor((px + 1) / W * audio.length));
-      let mn = 0, mx = 0;
-      for (let s = s0; s < s1 && s < audio.length; s++) {
-        const v = audio[s]; if (v < mn) mn = v; if (v > mx) mx = v;
-      }
-      peaks[px * 2] = mn; peaks[px * 2 + 1] = mx;
-    }
+  if (pos < 0 || !genPlaySeq) {
+    waveHighlight = null;
+    playerA.setCursor(-1); playerB.setCursor(-1);
+    renderScatter(); return;
   }
+  const i = Math.min(Math.floor(pos * (genPlaySeq.length - 1)), genPlaySeq.length - 1);
+  const frame = genPlaySeq[i];
+  if (!frame) return;
+  waveHighlight = { src: frame.src, idx: frame.idx };
+  const srcLen = frame.src === 'A' ? (coordsA?.length ?? 1) : (coordsB?.length ?? 1);
+  const srcPos = frame.idx / srcLen;
+  if (frame.src === 'A') { playerA.setCursor(srcPos); playerB.setCursor(-1); }
+  else                   { playerB.setCursor(srcPos); playerA.setCursor(-1); }
+  renderScatter();
+});
 
-  function draw() {
-    const W = cvs.width, H = cvs.height;
-    c2.clearRect(0, 0, W, H);
+playerA.setPlayBtn(document.getElementById('wbPlayA'));
+playerA.setLoopBtn(document.getElementById('wbLoopA'));
+playerB.setPlayBtn(document.getElementById('wbPlayB'));
+playerB.setLoopBtn(document.getElementById('wbLoopB'));
+playerG.setPlayBtn(document.getElementById('wbPlayG'));
+playerG.setLoopBtn(document.getElementById('wbLoopG'));
 
-    if (!peaks) {
-      c2.fillStyle = '#444';
-      c2.font = `${9 * pdpr}px system-ui`;
-      c2.textAlign = 'center';
-      c2.fillText('no audio', W / 2, H / 2 + 3);
-      return;
-    }
-
-    // Waveform
-    const cy = H / 2;
-    c2.fillStyle = waveColor;
-    c2.globalAlpha = 0.5;
-    for (let px = 0; px < W; px++) {
-      const mn = peaks[px * 2], mx = peaks[px * 2 + 1];
-      c2.fillRect(px, cy - mx * cy, 1, Math.max(1, (mx - mn) * cy));
-    }
-    c2.globalAlpha = 1;
-
-    // External cursor (UMAP-selected frame)
-    if (cursorPos >= 0) {
-      const cx = cursorPos * W;
-      c2.strokeStyle = '#ffffff66';
-      c2.lineWidth = 1 * pdpr;
-      c2.beginPath(); c2.moveTo(cx, 0); c2.lineTo(cx, H); c2.stroke();
-    }
-
-    // Playhead
-    if (playing || playOffset > 0) {
-      const px = position() * W;
-      c2.strokeStyle = '#ffffff';
-      c2.lineWidth = 1.5 * pdpr;
-      c2.beginPath(); c2.moveTo(px, 0); c2.lineTo(px, H); c2.stroke();
-    }
-  }
-
-  function updatePlayBtn() {
-    if (!playBtnEl) return;
-    playBtnEl.textContent = playing ? '⏸' : '▶';
-    playBtnEl.classList.toggle('active', playing);
-  }
-
-  // Kill the current source safely — nulls onended first so the loop handler
-  // never fires as a side-effect of .stop().
-  function killSrc() {
-    if (srcNode)  { srcNode.onended = null; try { srcNode.stop(); } catch(_) {} srcNode = null; }
-    if (gainNode) { try { gainNode.disconnect(); } catch(_) {} gainNode = null; }
-  }
-
-  function doPlay(offset, xfade = false) {
-    if (!audio) return;
-    if (!audioCtx) audioCtx = new AudioContext();
-
-    const now = audioCtx.currentTime;
-    const XFADE_S = 0.04;
-
-    // Capture old nodes for crossfade before overwriting
-    const oldSrc  = srcNode;
-    const oldGain = gainNode;
-
-    // Prevent the old source's onended from re-triggering the loop
-    if (oldSrc) oldSrc.onended = null;
-
-    playOffset = Math.max(0, Math.min(offset, dur() - 0.001));
-    playStart  = now;
-
-    const newGain = audioCtx.createGain();
-    newGain.connect(getMasterDest());
-
-    const buf = audioCtx.createBuffer(1, audio.length, sr);
-    buf.copyToChannel(audio, 0);
-    const newSrc = audioCtx.createBufferSource();
-    newSrc.buffer = buf;
-    newSrc.connect(newGain);
-
-    if (xfade && oldSrc && oldGain) {
-      // Crossfade: old → 0, new → 1 over XFADE_S
-      oldGain.gain.cancelScheduledValues(now);
-      oldGain.gain.setValueAtTime(oldGain.gain.value, now);
-      oldGain.gain.linearRampToValueAtTime(0, now + XFADE_S);
-      newGain.gain.setValueAtTime(0, now);
-      newGain.gain.linearRampToValueAtTime(1, now + XFADE_S);
-      oldSrc.stop(now + XFADE_S + 0.01);
-      oldSrc.onended = () => { try { oldGain.disconnect(); } catch(_) {} };
-    } else {
-      if (oldSrc)  { try { oldSrc.stop();       } catch(_) {} }
-      if (oldGain) { try { oldGain.disconnect(); } catch(_) {} }
-      newGain.gain.value = 1;
-    }
-
-    newSrc.start(now, playOffset);
-
-    // Guard: if this node was superseded before it ended, do nothing
-    newSrc.onended = () => {
-      if (srcNode !== newSrc) return;
-      playing = false; updatePlayBtn();
-      if (looping) {
-        playOffset = 0; doPlay(0);
-      } else {
-        srcNode = null; gainNode = null;
-        playOffset = 0; cancelAnimationFrame(animId); draw(); onFrameCb?.(-1);
-      }
-    };
-
-    srcNode  = newSrc;
-    gainNode = newGain;
-    playing  = true; updatePlayBtn();
-    cancelAnimationFrame(animId);
-    (function anim() { draw(); onFrameCb?.(position()); if (playing) animId = requestAnimationFrame(anim); })();
-  }
-
-  // Click canvas to seek
-  cvs.addEventListener('click', e => {
-    const rect = cvs.getBoundingClientRect();
-    const pos  = (e.clientX - rect.left) / rect.width;
-    const t    = pos * dur();
-    if (playing) doPlay(t, true); else { playOffset = t; draw(); }
+['A', 'B', 'G'].forEach(id => {
+  const p = id === 'A' ? playerA : id === 'B' ? playerB : playerG;
+  document.getElementById(`wbPlay${id}`).addEventListener('click', () => p.play());
+  document.getElementById(`wbStop${id}`).addEventListener('click', () => p.stop());
+  document.getElementById(`wbLoop${id}`).addEventListener('click', () => {
+    const btn = document.getElementById(`wbLoop${id}`);
+    p.setLoop(!btn.classList.contains('active'));
   });
+});
 
-  // Resize
-  const ro = new ResizeObserver(() => {
-    const r = cvs.getBoundingClientRect();
-    if (!r.width) return;
-    cvs.width = r.width * pdpr; cvs.height = r.height * pdpr;
-    buildPeaks(); draw();
-  });
-  ro.observe(cvs);
-
-  return {
-    // Load new audio. If currently playing, crossfade into the new buffer
-    // immediately. If stopped, just update the waveform display.
-    setAudio(f32, sampleRate) {
-      const wasPlaying = playing;
-      const wasOffset  = playing ? elapsed() : 0;
-      audio = f32; sr = sampleRate;
-      buildPeaks();
-      if (wasPlaying) {
-        doPlay(wasOffset, /*xfade=*/true);  // crossfade to new buffer at same position
-      } else {
-        playOffset = 0; draw();
-      }
-      updatePlayBtn();
-    },
-    play() {
-      if (playing) {
-        // Pause: capture position, kill source without triggering onended loop
-        playOffset = elapsed();
-        killSrc();
-        playing = false; cancelAnimationFrame(animId);
-        updatePlayBtn(); draw();
-      } else {
-        doPlay(playOffset);
-      }
-    },
-    stop() {
-      killSrc();
-      playing = false; playOffset = 0;
-      cancelAnimationFrame(animId); updatePlayBtn(); draw(); onFrameCb?.(-1);
-    },
-    setLoop(on) { looping = on; loopBtnEl?.classList.toggle('active', on); },
-    setCursor(pos) { cursorPos = pos; draw(); },
-    setPlayBtn(el) { playBtnEl = el; updatePlayBtn(); },
-    setLoopBtn(el) { loopBtnEl = el; },
-    isPlaying: () => playing,
-    getPosition: position,
-  };
-}
-
-// ── Scatter plot ──────────────────────────────────────────────────────────────
-
-function renderScatter() {
-  const ctx = umapCanvas.getContext('2d');
-  const W = umapCanvas.width, H = umapCanvas.height;
-  ctx.clearRect(0, 0, W, H);
-  if (!coordsA || !coordsB || !W || !H) return;
-
-  // Compute bounds across all points
-  let xMin = Infinity, xMax = -Infinity, yMin = Infinity, yMax = -Infinity;
-  for (const [x, y] of [...coordsA, ...coordsB]) {
-    if (x < xMin) xMin = x; if (x > xMax) xMax = x;
-    if (y < yMin) yMin = y; if (y > yMax) yMax = y;
-  }
-
-  const pad   = 28 * dpr;
-  const rangeX = xMax - xMin || 1;
-  const rangeY = yMax - yMin || 1;
-  const scale  = Math.min((W - 2 * pad) / rangeX, (H - 2 * pad) / rangeY);
-  const offX   = (W - rangeX * scale) / 2;
-  const offY   = (H - rangeY * scale) / 2;
-  // Apply zoom/pan on top of the fit-to-canvas base transform
-  const toX    = x => viewPanX + (offX + (x - xMin) * scale) * viewZoom;
-  const toY    = y => viewPanY + (H - offY - (y - yMin) * scale) * viewZoom;
-
-  lastTransform = { xMin, yMin, scale, offX, offY, H };
-
-  function drawTrail(coords, color) {
-    if (coords.length < 2) return;
-    ctx.save();
-    ctx.strokeStyle = color;
-    ctx.lineWidth   = 0.8 * dpr;
-    ctx.globalAlpha = 0.18;
-    ctx.beginPath();
-    ctx.moveTo(toX(coords[0][0]), toY(coords[0][1]));
-    for (let i = 1; i < coords.length; i++) {
-      ctx.lineTo(toX(coords[i][0]), toY(coords[i][1]));
-    }
-    ctx.stroke();
-    ctx.restore();
-  }
-
-  function drawCirclesEmpty(coords, color) {
-    const r = 2.5 * dpr;
-    ctx.strokeStyle = color;
-    ctx.lineWidth   = 1 * dpr;
-    for (const [x, y] of coords) {
-      ctx.beginPath();
-      ctx.arc(toX(x), toY(y), r, 0, 2 * Math.PI);
-      ctx.stroke();
-    }
-  }
-
-  function drawTrianglesEmpty(coords, color) {
-    const r = 3 * dpr;
-    ctx.strokeStyle = color;
-    ctx.lineWidth   = 1 * dpr;
-    for (const [x, y] of coords) {
-      const px = toX(x), py = toY(y);
-      ctx.beginPath();
-      ctx.moveTo(px,               py - r);
-      ctx.lineTo(px + r * 0.866,   py + r * 0.5);
-      ctx.lineTo(px - r * 0.866,   py + r * 0.5);
-      ctx.closePath();
-      ctx.stroke();
-    }
-  }
-
-  drawTrail(coordsA, '#c87800');
-  drawTrail(coordsB, '#2090c0');
-
-  // ── Pins: drawn BEFORE data points so A/B markers remain visible on top ──
-  if (pinPoints.length > 0) {
-    const r = 8 * dpr;
-    if (pinPoints.length >= 2) {
-      ctx.save();
-      ctx.strokeStyle = '#ffd70055';
-      ctx.lineWidth   = 1 * dpr;
-      ctx.beginPath();
-      ctx.moveTo(toX(pinPoints[0][0]), toY(pinPoints[0][1]));
-      for (let i = 1; i < pinPoints.length; i++)
-        ctx.lineTo(toX(pinPoints[i][0]), toY(pinPoints[i][1]));
-      ctx.stroke();
-      ctx.restore();
-    }
-    ctx.save();
-    ctx.font = `bold ${10 * dpr}px system-ui`;
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    for (let i = 0; i < pinPoints.length; i++) {
-      const cx = toX(pinPoints[i][0]), cy = toY(pinPoints[i][1]);
-      ctx.fillStyle   = '#ffd700';
-      ctx.strokeStyle = '#000000';
-      ctx.lineWidth   = 1 * dpr;
-      ctx.beginPath(); ctx.arc(cx, cy, r, 0, 2 * Math.PI);
-      ctx.fill(); ctx.stroke();
-      ctx.fillStyle = '#000000';
-      ctx.fillText(String(i + 1), cx, cy);
-    }
-    ctx.restore();
-  }
-
-  drawCirclesEmpty(coordsA,   '#c87800');
-  drawTrianglesEmpty(coordsB, '#2090c0');
-
-  if (selectedPoint) {
-    const coords = selectedPoint.src === 'A' ? coordsA : coordsB;
-    const pt = coords[selectedPoint.idx];
-    if (pt) {
-      ctx.save();
-      ctx.strokeStyle = '#fff';
-      ctx.lineWidth   = 1.5 * dpr;
-      ctx.beginPath();
-      ctx.arc(toX(pt[0]), toY(pt[1]), 6 * dpr, 0, 2 * Math.PI);
-      ctx.stroke();
-      ctx.restore();
-    }
-  }
-
-  // Waveform-driven highlight (active during waveform player playback)
-  if (waveHighlight) {
-    const coords = waveHighlight.src === 'A' ? coordsA : coordsB;
-    if (coords && waveHighlight.idx < coords.length) {
-      const [hx, hy] = coords[waveHighlight.idx];
-      ctx.save();
-      ctx.strokeStyle = waveHighlight.src === 'A' ? '#e89a20' : '#30aadc';
-      ctx.lineWidth   = 2 * dpr;
-      ctx.globalAlpha = 0.95;
-      ctx.beginPath();
-      ctx.arc(toX(hx), toY(hy), 7 * dpr, 0, 2 * Math.PI);
-      ctx.stroke();
-      ctx.restore();
-    }
-  }
-
-  // ── Trajectory overlay ────────────────────────────────────────────────────
-  if (userTrajectory.length >= 2) {
-    ctx.save();
-    ctx.strokeStyle = '#ffffff';
-    ctx.lineWidth   = 2 * dpr;
-    ctx.globalAlpha = 0.75;
-    ctx.setLineDash([4 * dpr, 3 * dpr]);
-    ctx.beginPath();
-    ctx.moveTo(toX(userTrajectory[0][0]), toY(userTrajectory[0][1]));
-    for (let i = 1; i < userTrajectory.length; i++)
-      ctx.lineTo(toX(userTrajectory[i][0]), toY(userTrajectory[i][1]));
-    ctx.stroke();
-    ctx.restore();
-  }
-
-  // ── Snap overlay ──────────────────────────────────────────────────────────
-  if (pathMode === 'snap' && snapFrames && snapFrames.length >= 2) {
-    const ptOf = ({src, idx}) => src === 'A' ? coordsA[idx] : coordsB[idx];
-
-    // ── Active waypoint highlight (only during playback) ─────────────────
-    if (trajAnchorPos >= 0 && snapPlayFrames && snapPlayFrames.length >= 2) {
-      const fi       = Math.min(Math.floor(trajAnchorPos * (snapPlayFrames.length - 1)), snapPlayFrames.length - 1);
-      const activeWi = snapPlayFrames[fi]?._wp;
-
-      if (activeWi !== undefined && activeWi < snapFrames.length) {
-        const wp = snapFrames[activeWi];
-
-        // Context trail — only when checkbox is enabled
-        if (showTrail) {
-          const ctxKs    = getContextKs(snapFrames);
-          const ctxFrames = walkBackward(wp.src, wp.idx, ctxKs[activeWi], ctxSwapRange);
-
-          if (ctxFrames.length > 0) {
-            const allCtx = [...ctxFrames, wp];
-
-            let contextStart = fi;
-            while (contextStart > 0 && snapPlayFrames[contextStart - 1]?._wp === activeWi) contextStart--;
-
-            const elapsed  = fi - contextStart;
-            const segTotal = allCtx.length - 1;
-            const progress = Math.min(1, elapsed / Math.max(1, segTotal));
-            const segCount = Math.ceil(progress * segTotal);
-
-            ctx.save();
-            ctx.globalAlpha = 0.85;
-            for (let i = 1; i <= segCount && i < allCtx.length; i++) {
-              const prev = allCtx[i - 1], curr = allCtx[i];
-              const [px, py] = ptOf(prev), [cx, cy] = ptOf(curr);
-              ctx.beginPath();
-              ctx.moveTo(toX(px), toY(py));
-              ctx.lineTo(toX(cx), toY(cy));
-              if (prev.src === curr.src) {
-                ctx.strokeStyle = curr.src === 'A' ? '#c87800' : '#2090c0';
-                ctx.lineWidth   = 0.9 * dpr;
-              } else {
-                ctx.strokeStyle = '#bbbbbb';
-                ctx.lineWidth   = 1 * dpr;
-              }
-              ctx.stroke();
-            }
-            ctx.restore();
-          }
-        }
-
-        // Anchor ring — always visible regardless of checkbox
-        ctx.save();
-        const [wx, wy] = ptOf(wp);
-        ctx.strokeStyle = '#bbbbbb';
-        ctx.lineWidth   = 1.5 * dpr;
-        ctx.globalAlpha = 0.9;
-        ctx.beginPath();
-        ctx.arc(toX(wx), toY(wy), 5 * dpr, 0, 2 * Math.PI);
-        ctx.stroke();
-        ctx.restore();
-      }
-    }
-
-    // ── Snap path + waypoint dots (always visible, grey) ─────────────────
-    ctx.save();
-    ctx.strokeStyle = '#888888';
-    ctx.lineWidth   = 1.5 * dpr;
-    ctx.globalAlpha = 0.75;
-    ctx.beginPath();
-    for (let i = 0; i < snapFrames.length; i++) {
-      const [x, y] = ptOf(snapFrames[i]);
-      i === 0 ? ctx.moveTo(toX(x), toY(y)) : ctx.lineTo(toX(x), toY(y));
-    }
-    ctx.stroke();
-
-    ctx.fillStyle   = '#888888';
-    ctx.globalAlpha = 0.55;
-    for (const f of snapFrames) {
-      const [x, y] = ptOf(f);
-      ctx.beginPath(); ctx.arc(toX(x), toY(y), 3 * dpr, 0, 2 * Math.PI); ctx.fill();
-    }
-
-    // Start (green) / end (red) caps
-    ctx.globalAlpha = 1;
-    const [sx, sy] = ptOf(snapFrames[0]);
-    const [ex, ey] = ptOf(snapFrames[snapFrames.length - 1]);
-    ctx.fillStyle = '#44ff88';
-    ctx.beginPath(); ctx.arc(toX(sx), toY(sy), 4 * dpr, 0, 2 * Math.PI); ctx.fill();
-    ctx.fillStyle = '#ff4466';
-    ctx.beginPath(); ctx.arc(toX(ex), toY(ey), 4 * dpr, 0, 2 * Math.PI); ctx.fill();
-    ctx.restore();
-  }
-
-  // ── Code path overlay ─────────────────────────────────────────────────────
-  if (pathMode === 'code' && codePathFrames && codePathFrames.length >= 2) {
-    const ptOf = ({src, idx}) => src === 'A' ? coordsA[idx] : coordsB[idx];
-    ctx.save();
-    // Line through actual frame positions
-    ctx.strokeStyle = '#44ddaa';
-    ctx.lineWidth   = 1.5 * dpr;
-    ctx.globalAlpha = 0.85;
-    ctx.beginPath();
-    for (let i = 0; i < codePathFrames.length; i++) {
-      const [x, y] = ptOf(codePathFrames[i]);
-      i === 0 ? ctx.moveTo(toX(x), toY(y)) : ctx.lineTo(toX(x), toY(y));
-    }
-    ctx.stroke();
-    // Dots at each frame
-    ctx.fillStyle   = '#44ddaa';
-    ctx.globalAlpha = 0.55;
-    for (const f of codePathFrames) {
-      const [x, y] = ptOf(f);
-      ctx.beginPath(); ctx.arc(toX(x), toY(y), 2.5 * dpr, 0, 2 * Math.PI); ctx.fill();
-    }
-    // Start (green) / end (red) caps
-    ctx.globalAlpha = 1;
-    const [sx, sy] = ptOf(codePathFrames[0]);
-    const [ex, ey] = ptOf(codePathFrames[codePathFrames.length - 1]);
-    ctx.fillStyle = '#44ff88';
-    ctx.beginPath(); ctx.arc(toX(sx), toY(sy), 4 * dpr, 0, 2 * Math.PI); ctx.fill();
-    ctx.fillStyle = '#ff4466';
-    ctx.beginPath(); ctx.arc(toX(ex), toY(ey), 4 * dpr, 0, 2 * Math.PI); ctx.fill();
-    ctx.restore();
-  }
-
-  // ── Moving anchor ─────────────────────────────────────────────────────────
-  if (trajAnchorPos >= 0) {
-    let ax, ay;
-    if (pathMode === 'snap' && snapPlayFrames && snapPlayFrames.length >= 2) {
-      const fi = Math.min(Math.floor(trajAnchorPos * (snapPlayFrames.length - 1)), snapPlayFrames.length - 1);
-      const f  = snapPlayFrames[fi];
-      [ax, ay] = f.src === 'A' ? coordsA[f.idx] : coordsB[f.idx];
-    } else if (pathMode === 'code' && codePathFrames && codePathFrames.length >= 2) {
-      const fi = Math.min(Math.floor(trajAnchorPos * (codePathFrames.length - 1)), codePathFrames.length - 1);
-      const f  = codePathFrames[fi];
-      [ax, ay] = f.src === 'A' ? coordsA[f.idx] : coordsB[f.idx];
-    } else if (userTrajectory.length >= 2) {
-      // Map playback position (0→1) to trajectory position accounting for direction
-      const p = trajDir === 'backward'  ? 1 - trajAnchorPos
-              : trajDir === 'pingpong'  ? (trajAnchorPos <= 0.5 ? trajAnchorPos * 2 : 2 - trajAnchorPos * 2)
-              : trajAnchorPos;
-      const ti = p * (userTrajectory.length - 1);
-      const lo = Math.floor(ti), hi = Math.min(lo + 1, userTrajectory.length - 1);
-      const t  = ti - lo;
-      ax = userTrajectory[lo][0] + t * (userTrajectory[hi][0] - userTrajectory[lo][0]);
-      ay = userTrajectory[lo][1] + t * (userTrajectory[hi][1] - userTrajectory[lo][1]);
-    }
-    if (ax !== undefined) {
-      ctx.save();
-      ctx.fillStyle   = '#ffd700';
-      ctx.strokeStyle = '#fff';
-      ctx.lineWidth   = 1.5 * dpr;
-      ctx.beginPath();
-      ctx.arc(toX(ax), toY(ay), 6 * dpr, 0, 2 * Math.PI);
-      ctx.fill(); ctx.stroke();
-      ctx.restore();
-    }
-  }
-}
-
-// ── Mode toggles ──────────────────────────────────────────────────────────────
-
-const togPins    = document.getElementById('togPins');
-const pinSeqBar  = document.getElementById('pinSeqBar');
+// ── Mode toggles (canvas) ─────────────────────────────────────────────────────
 
 function updatePinSeqBar() {
   if (canvasMode !== 'pins' || pinPoints.length === 0) {
@@ -1654,7 +995,6 @@ function updatePinSeqBar() {
       arrow.textContent = '→';
       pinSeqBar.appendChild(arrow);
     }
-
     const chip = document.createElement('span');
     chip.className = 'pinChip';
     chip.textContent = `[${i + 1}]`;
@@ -1686,7 +1026,6 @@ function updatePinSeqBar() {
       renderScatter();
       if (userTrajectory.length >= 2) autoRegenerate();
     });
-
     pinSeqBar.appendChild(chip);
   });
 }
@@ -1696,7 +1035,7 @@ function setCanvasMode(mode) {
   togExplore.classList.toggle('active', mode === 'explore');
   togDraw   .classList.toggle('active', mode === 'draw');
   togPins   .classList.toggle('active', mode === 'pins');
-  umapCanvas.style.cursor = mode === 'draw' ? 'crosshair' : mode === 'pins' ? 'cell' : 'crosshair';
+  umapCanvas.style.cursor = mode === 'pins' ? 'cell' : 'crosshair';
   if (mode === 'draw')    setStatus('Click and drag on the UMAP to draw a trajectory.');
   if (mode === 'pins')    setStatus('Double-click near a UMAP point to add/remove pins.');
   if (mode === 'explore') setStatus('');
@@ -1715,7 +1054,6 @@ function applyZoom(cx, cy, dz) {
   viewPanY   = cy + (viewPanY - cy) * dz;
 }
 
-// UMAP coords → canvas pixel (accounts for zoom/pan)
 function umapToCanvas(ux, uy) {
   if (!lastTransform) return [0, 0];
   const { xMin, yMin, scale, offX, offY, H } = lastTransform;
@@ -1730,7 +1068,6 @@ function canvasToUmap(e) {
   const rect  = umapCanvas.getBoundingClientRect();
   const physX = (e.clientX - rect.left) * dpr;
   const physY = (e.clientY - rect.top)  * dpr;
-  // Invert: physX = viewPanX + (offX + (x - xMin)*scale) * viewZoom
   const umapX = ((physX - viewPanX) / viewZoom - offX) / scale + xMin;
   const umapY = (H - offY - (physY - viewPanY) / viewZoom) / scale + yMin;
   return [umapX, umapY];
@@ -1760,27 +1097,24 @@ function resamplePath(pts, maxN) {
 
 // ── Zoom / pan ────────────────────────────────────────────────────────────────
 
+umapCanvas.style.cursor = 'crosshair';
+
 umapCanvas.addEventListener('wheel', e => {
   e.preventDefault();
   if (!lastTransform) return;
   const rect = umapCanvas.getBoundingClientRect();
   const cx   = (e.clientX - rect.left) * dpr;
   const cy   = (e.clientY - rect.top)  * dpr;
-
   if (e.ctrlKey || e.metaKey) {
-    // Pinch-to-zoom on trackpad (ctrlKey) or Cmd+scroll
     applyZoom(cx, cy, Math.exp(-e.deltaY * 0.01));
   } else if (Math.abs(e.deltaX) > Math.abs(e.deltaY) * 0.5 && Math.abs(e.deltaX) > 2) {
-    // Two-finger horizontal pan (trackpad)
     viewPanX -= e.deltaX; viewPanY -= e.deltaY;
   } else {
-    // Scroll wheel or vertical trackpad → zoom at cursor
     applyZoom(cx, cy, Math.exp(-e.deltaY * 0.003));
   }
   renderScatter();
 }, { passive: false });
 
-// Keyboard zoom/reset
 window.addEventListener('keydown', e => {
   if (e.target !== document.body && e.target !== umapCanvas) return;
   if (e.key === '+' || e.key === '=') { applyZoom(umapCanvas.width/2, umapCanvas.height/2, 1.2); renderScatter(); }
@@ -1788,9 +1122,7 @@ window.addEventListener('keydown', e => {
   if (e.key === '0')                  { viewZoom = 1; viewPanX = 0; viewPanY = 0; renderScatter(); }
 });
 
-// ── Freehand drawing + pan drag ───────────────────────────────────────────────
-
-umapCanvas.style.cursor = 'crosshair';
+// ── Drag + draw event handlers ────────────────────────────────────────────────
 
 umapCanvas.addEventListener('mousedown', e => {
   if (!lastTransform) return;
@@ -1810,7 +1142,6 @@ umapCanvas.addEventListener('mousedown', e => {
     return;
   }
   if (canvasMode === 'pins' && coordsA && coordsB) {
-    // Check if near an existing pin → start pin drag
     const rect  = umapCanvas.getBoundingClientRect();
     const physX = (e.clientX - rect.left) * dpr;
     const physY = (e.clientY - rect.top)  * dpr;
@@ -1825,7 +1156,6 @@ umapCanvas.addEventListener('mousedown', e => {
       return;
     }
   }
-  // Explore or Pins mode: start potential pan drag
   if (canvasMode === 'explore' || canvasMode === 'pins') {
     isPanDragging = true;
     panDragLast   = { x: e.clientX, y: e.clientY };
@@ -1837,21 +1167,12 @@ umapCanvas.addEventListener('mousemove', e => {
   if (isPinDragging) {
     if (!coordsA || !coordsB) return;
     const [umapX, umapY] = canvasToUmap(e);
-    let bestDist2 = Infinity, bestPt = null;
-    for (const [x, y] of coordsA) {
-      const d2 = (x - umapX) ** 2 + (y - umapY) ** 2;
-      if (d2 < bestDist2) { bestDist2 = d2; bestPt = [x, y]; }
-    }
-    for (const [x, y] of coordsB) {
-      const d2 = (x - umapX) ** 2 + (y - umapY) ** 2;
-      if (d2 < bestDist2) { bestDist2 = d2; bestPt = [x, y]; }
-    }
-    if (bestPt) {
-      pinPoints[pinDragIdx] = bestPt;
-      userTrajectory = pinPoints.length >= 2 ? resamplePath(pinPoints, 300) : [];
-      updatePinSeqBar();
-      renderScatter();
-    }
+    const { src, idx } = findNearestUmapPoint(umapX, umapY, coordsA, coordsB);
+    const coords = src === 'A' ? coordsA : coordsB;
+    pinPoints[pinDragIdx] = coords[idx];
+    userTrajectory = pinPoints.length >= 2 ? resamplePath(pinPoints, 300) : [];
+    updatePinSeqBar();
+    renderScatter();
     return;
   }
   if (isShiftDragging) {
@@ -1907,11 +1228,7 @@ const finishPinDrag = () => {
 const finishDraw = () => {
   if (!isDrawing) return;
   isDrawing = false;
-  if (rawDrawPoints.length >= 2) {
-    userTrajectory = resamplePath(rawDrawPoints, 300);
-  } else {
-    userTrajectory = [];
-  }
+  userTrajectory = rawDrawPoints.length >= 2 ? resamplePath(rawDrawPoints, 300) : [];
   renderScatter();
   if (userTrajectory.length >= 2) autoRegenerate();
 };
@@ -1919,7 +1236,8 @@ const finishDraw = () => {
 umapCanvas.addEventListener('mouseup',    () => { finishPanDrag(); finishShiftDrag(); finishDraw(); finishPinDrag(); });
 umapCanvas.addEventListener('mouseleave', () => { finishPanDrag(); finishShiftDrag(); finishDraw(); finishPinDrag(); });
 
-// ── Double-click: add/remove pins (only near existing UMAP points) ────────────
+// ── Double-click: add/remove pins ────────────────────────────────────────────
+
 umapCanvas.addEventListener('dblclick', e => {
   if (canvasMode !== 'pins' || !lastTransform || !coordsA || !coordsB) return;
   const rect   = umapCanvas.getBoundingClientRect();
@@ -1927,7 +1245,6 @@ umapCanvas.addEventListener('dblclick', e => {
   const physY  = (e.clientY - rect.top)  * dpr;
   const hitR2  = (14 * dpr) ** 2;
 
-  // Check if near an existing pin → remove it
   const hitIdx = pinPoints.findIndex(([ux, uy]) => {
     const [cx, cy] = umapToCanvas(ux, uy);
     return (cx - physX) ** 2 + (cy - physY) ** 2 < hitR2;
@@ -1936,7 +1253,6 @@ umapCanvas.addEventListener('dblclick', e => {
   if (hitIdx >= 0) {
     pinPoints.splice(hitIdx, 1);
   } else {
-    // Only add a pin if close enough to an actual UMAP point
     const SNAP_R2 = (18 * dpr) ** 2;
     let bestDist2 = Infinity, bestPt = null;
     for (const [x, y] of coordsA) {
@@ -1967,25 +1283,15 @@ umapCanvas.addEventListener('dblclick', e => {
 
 umapCanvas.addEventListener('click', async e => {
   if (canvasMode !== 'explore') return;
-  if (panDragMoved) { panDragMoved = false; return; } // was a drag, not a click
+  if (panDragMoved) { panDragMoved = false; return; }
   if (!coordsA || !coordsB || !lastTransform || !currentEmbeds) return;
   if (encodePhase !== null) return;
 
   const [umapX, umapY] = canvasToUmap(e);
-
-  let bestDist = Infinity, bestSrc = null, bestIdx = -1;
-  for (let i = 0; i < coordsA.length; i++) {
-    const d = (coordsA[i][0] - umapX) ** 2 + (coordsA[i][1] - umapY) ** 2;
-    if (d < bestDist) { bestDist = d; bestSrc = 'A'; bestIdx = i; }
-  }
-  for (let i = 0; i < coordsB.length; i++) {
-    const d = (coordsB[i][0] - umapX) ** 2 + (coordsB[i][1] - umapY) ** 2;
-    if (d < bestDist) { bestDist = d; bestSrc = 'B'; bestIdx = i; }
-  }
+  const { src: bestSrc, idx: bestIdx } = findNearestUmapPoint(umapX, umapY, coordsA, coordsB);
   if (bestIdx < 0) return;
 
   selectedPoint = { src: bestSrc, idx: bestIdx };
-  // Update the corresponding source waveform cursor
   const srcLen = bestSrc === 'A' ? coordsA.length : coordsB.length;
   const srcPos = bestIdx / srcLen;
   if (bestSrc === 'A') { playerA.setCursor(srcPos); playerB.setCursor(-1); }
@@ -1998,8 +1304,7 @@ umapCanvas.addEventListener('click', async e => {
   const startFrame = Math.max(0, bestIdx - half);
   const endFrame   = Math.min(T, bestIdx + half);
 
-  if (!audioCtx) audioCtx = new AudioContext();
-
+  getAudioCtx();
   playJobId = ++jobSeq;
   setStatus(`Decoding frame ${bestIdx} (${bestSrc})…`);
   worker.postMessage({
@@ -2012,23 +1317,21 @@ umapCanvas.addEventListener('click', async e => {
 // ── Trajectory playback ───────────────────────────────────────────────────────
 
 function startTrajPlayback(buf, sr) {
-  const now = audioCtx.currentTime;
+  const ctx = getAudioCtx();
+  const now = ctx.currentTime;
 
-  // New source routed through a gain node so we can crossfade
-  const newGain = audioCtx.createGain();
-  const newSrc  = audioCtx.createBufferSource();
+  const newGain = ctx.createGain();
+  const newSrc  = ctx.createBufferSource();
   newSrc.buffer = buf;
   newSrc.connect(newGain);
   newGain.connect(getMasterDest());
 
   if (activeSrc) {
-    // Crossfade: old → 0, new → 1 over XFADE_S seconds
     activeGain.gain.cancelScheduledValues(now);
     activeGain.gain.setValueAtTime(activeGain.gain.value, now);
     activeGain.gain.linearRampToValueAtTime(0, now + XFADE_S);
     newGain.gain.setValueAtTime(0, now);
     newGain.gain.linearRampToValueAtTime(1, now + XFADE_S);
-    // Stop old source just after fade and disconnect its gain node
     const oldSrc = activeSrc, oldGain = activeGain;
     oldSrc.stop(now + XFADE_S + 0.01);
     oldSrc.onended = () => { try { oldGain.disconnect(); } catch (_) {} };
@@ -2047,14 +1350,8 @@ function startTrajPlayback(buf, sr) {
 }
 
 function stopTrajPlayback() {
-  if (activeSrc) {
-    try { activeSrc.stop(); } catch (_) {}
-    activeSrc = null;
-  }
-  if (activeGain) {
-    try { activeGain.disconnect(); } catch (_) {}
-    activeGain = null;
-  }
+  if (activeSrc) { try { activeSrc.stop(); } catch (_) {} activeSrc = null; }
+  if (activeGain) { try { activeGain.disconnect(); } catch (_) {} activeGain = null; }
   trajPlayStartTime = null;
   trajAnchorPos     = -1;
 }
@@ -2076,346 +1373,28 @@ function animateTrajAnchor() {
   }
 }
 
-// ── Code-path graph search ────────────────────────────────────────────────────
+// ── Trajectory generation ─────────────────────────────────────────────────────
 
-function buildCodePathGraph() {
-  const nA = coordsA.length, nB = coordsB.length;
-  const N  = nA + nB;
-  const K  = Math.min(Math.max(2, parseInt(nNeighborsEl.value) || 15), 20);
-  const adj = Array.from({length: N}, () => []);
-
-  const cx = i => (i < nA ? coordsA[i] : coordsB[i - nA])[0];
-  const cy = i => (i < nA ? coordsA[i] : coordsB[i - nA])[1];
-  const w  = (i, j) => Math.sqrt((cx(i)-cx(j))**2 + (cy(i)-cy(j))**2);
-
-  // kNN edges (covers temporal + cross-source neighbourhood)
-  for (let i = 0; i < N; i++) {
-    const dists = [];
-    for (let j = 0; j < N; j++) {
-      if (j === i) continue;
-      dists.push([j, (cx(i)-cx(j))**2 + (cy(i)-cy(j))**2]);
-    }
-    dists.sort((a, b) => a[1] - b[1]);
-    for (let k = 0; k < Math.min(K, dists.length); k++) {
-      const [j, d2] = dists[k];
-      adj[i].push({j, w: Math.sqrt(d2)});
-    }
-  }
-  // Guarantee temporal edges are always present
-  for (let i = 1; i < nA; i++) {
-    const d = w(i-1, i);
-    adj[i-1].push({j: i, w: d}); adj[i].push({j: i-1, w: d});
-  }
-  for (let i = 1; i < nB; i++) {
-    const ni = nA+i, np = nA+i-1;
-    const d = w(ni, np);
-    adj[np].push({j: ni, w: d}); adj[ni].push({j: np, w: d});
-  }
-  return adj;
-}
-
-function dijkstra(adj, start, end) {
-  const N    = adj.length;
-  const dist = new Float64Array(N).fill(Infinity);
-  const prev = new Int32Array(N).fill(-1);
-  const done = new Uint8Array(N);
-  dist[start] = 0;
-  for (let iter = 0; iter < N; iter++) {
-    let u = -1;
-    for (let i = 0; i < N; i++) if (!done[i] && (u < 0 || dist[i] < dist[u])) u = i;
-    if (u < 0 || dist[u] === Infinity || u === end) break;
-    done[u] = 1;
-    for (const {j, w} of adj[u]) {
-      const nd = dist[u] + w;
-      if (nd < dist[j]) { dist[j] = nd; prev[j] = u; }
-    }
-  }
-  if (dist[end] === Infinity) return null;
-  const path = [];
-  for (let cur = end; cur >= 0; cur = prev[cur]) path.unshift(cur);
-  return path;
-}
-
-function findCodePath() {
-  if (!userTrajectory || userTrajectory.length < 2 || !coordsA || !coordsB) return null;
-  const nA = coordsA.length;
-
-  const nearestNode = ([px, py]) => {
-    let best = 0, bestD = Infinity;
-    for (let i = 0; i < coordsA.length; i++) {
-      const d = (coordsA[i][0]-px)**2 + (coordsA[i][1]-py)**2;
-      if (d < bestD) { bestD = d; best = i; }
-    }
-    for (let i = 0; i < coordsB.length; i++) {
-      const d = (coordsB[i][0]-px)**2 + (coordsB[i][1]-py)**2;
-      if (d < bestD) { bestD = d; best = nA+i; }
-    }
-    return best;
+function snapCtxArg() {
+  return {
+    snapMode, snapKVal, snapDurVal,
+    framesPerSec: coordsA ? coordsA.length / srcWidget.getDuration() : 1,
+    coordsA, coordsB,
   };
-
-  const startNode = nearestNode(userTrajectory[0]);
-  const endNode   = nearestNode(userTrajectory[userTrajectory.length - 1]);
-  if (startNode === endNode) {
-    const s = startNode < nA ? {src:'A', idx:startNode} : {src:'B', idx:startNode-nA};
-    return [s];
-  }
-
-  const nodePath = dijkstra(buildCodePathGraph(), startNode, endNode);
-  if (!nodePath) return null;
-  return nodePath.map(n => n < nA ? {src:'A', idx:n} : {src:'B', idx:n-nA});
 }
 
-// Extend a context frame array to exactly K frames using ping-pong bouncing.
-// When walkBackward runs out of frames (near source start), instead of repeating
-// the first frame, the sequence bounces: f0,f1,f2 → f2,f1,f0,f1,f2 (ping-pong).
-function pingPongExtend(frames, K) {
-  if (!frames.length) return [];
-  if (frames.length >= K) return frames;
-  const n = frames.length;
-  if (n === 1) return Array.from({length: K}, () => ({...frames[0]}));
-  const period = 2 * (n - 1);
-  return Array.from({length: K}, (_, i) => {
-    const stepsBack = K - 1 - i;
-    const pos = stepsBack % period;
-    const idx = pos < n ? n - 1 - pos : pos - n + 1;
-    return {...frames[idx]};
-  });
-}
-
-// Walk backward K steps through the directed latent graph.
-// At each step: prefer the cross-source frame nearest to the current position if it
-// is within `range` UMAP units AND closer than the temporal predecessor; otherwise
-// step back one frame in the same source.  Multi-hop: each step re-evaluates the swap.
-// Returns [{src,idx}] in forward (oldest-first) order, length ≤ K.
-function walkBackward(src, idx, K, range) {
-  const frames = [];
-  let cSrc = src, cIdx = idx;
-
-  for (let step = 0; step < K; step++) {
-    const cCoords = cSrc === 'A' ? coordsA : coordsB;
-    const [cx, cy] = cCoords[cIdx];
-
-    // Temporal predecessor in same source
-    let bSrc = null, bIdx = -1, bDist = Infinity;
-    if (cIdx > 0) {
-      const [px, py] = cCoords[cIdx - 1];
-      bDist = Math.sqrt((cx - px) ** 2 + (cy - py) ** 2);
-      bSrc = cSrc; bIdx = cIdx - 1;
-    }
-
-    // Cross-source candidates within range (multi-hop: check the other source)
-    if (range > 0) {
-      const oSrc    = cSrc === 'A' ? 'B' : 'A';
-      const oCoords = oSrc  === 'A' ? coordsA : coordsB;
-      for (let j = 0; j < oCoords.length; j++) {
-        const d = Math.sqrt((oCoords[j][0] - cx) ** 2 + (oCoords[j][1] - cy) ** 2);
-        if (d < range && d < bDist) { bDist = d; bSrc = oSrc; bIdx = j; }
-      }
-    }
-
-    if (bIdx < 0) break; // reached start of all sources
-    cSrc = bSrc; cIdx = bIdx;
-    frames.unshift({src: cSrc, idx: cIdx}); // prepend → oldest first
-  }
-  return frames;
-}
-
-// Build a Float32Array(N) of per-frame scale values for 48k trajectory decoding.
-// seq is an array of {src, idx}; returns null for 24k (scales not needed).
-function makeFrameScales(seq) {
-  if (!currentEmbeds.scalesA && !currentEmbeds.scalesB) return null; // 24k
-  const out = new Float32Array(seq.length);
-  for (let i = 0; i < seq.length; i++) {
-    const {src, idx} = seq[i];
-    const arr = src === 'A' ? currentEmbeds.scalesA : currentEmbeds.scalesB;
-    out[i] = arr ? (arr[idx] || 1.0) : 1.0;
-  }
-  return out;
-}
-
-// ── Snap helpers ──────────────────────────────────────────────────────────────
-
-// Sample the drawn path and snap each sample to the nearest UMAP frame.
-// Returns deduplicated [{src,idx}] waypoints.
-function computeSnapWaypoints() {
-  if (!coordsA || !coordsB) return [];
-
-  // ── Pins mode: snap each explicit pin directly — no trajectory interpolation ──
-  if (canvasMode === 'pins' && pinPoints.length >= 1) {
-    const raw = [];
-    for (const [px, py] of pinPoints) {
-      let bestD = Infinity, bestSrc = 'A', bestIdx = 0;
-      for (let j = 0; j < coordsA.length; j++) {
-        const d = (coordsA[j][0]-px)**2 + (coordsA[j][1]-py)**2;
-        if (d < bestD) { bestD = d; bestSrc = 'A'; bestIdx = j; }
-      }
-      for (let j = 0; j < coordsB.length; j++) {
-        const d = (coordsB[j][0]-px)**2 + (coordsB[j][1]-py)**2;
-        if (d < bestD) { bestD = d; bestSrc = 'B'; bestIdx = j; }
-      }
-      const last = raw[raw.length - 1];
-      if (!last || last.src !== bestSrc || last.idx !== bestIdx) raw.push({src: bestSrc, idx: bestIdx});
-    }
-    return raw;
-  }
-
-  // ── Draw / other modes: sample N points along userTrajectory ─────────────────
-  if (!userTrajectory || userTrajectory.length < 2) return [];
-  const fps = coordsA.length / srcWidget.getDuration();
-  const dur = pathMode === 'snap' ? snapDurVal
-            : pathMode === 'code' ? codeSecVal
-            : (parseFloat(trajDurationEl.value) || 4);
-  const N   = Math.max(2, Math.round(dur * fps));
-
-  const raw = [];
-  for (let i = 0; i < N; i++) {
-    const frac = i / (N - 1);
-    const ti   = frac * (userTrajectory.length - 1);
-    const lo   = Math.floor(ti), hi = Math.min(lo + 1, userTrajectory.length - 1);
-    const tt   = ti - lo;
-    const px   = userTrajectory[lo][0] + tt * (userTrajectory[hi][0] - userTrajectory[lo][0]);
-    const py   = userTrajectory[lo][1] + tt * (userTrajectory[hi][1] - userTrajectory[lo][1]);
-
-    let bestD = Infinity, bestSrc = 'A', bestIdx = 0;
-    for (let j = 0; j < coordsA.length; j++) {
-      const d = (coordsA[j][0]-px)**2 + (coordsA[j][1]-py)**2;
-      if (d < bestD) { bestD = d; bestSrc = 'A'; bestIdx = j; }
-    }
-    for (let j = 0; j < coordsB.length; j++) {
-      const d = (coordsB[j][0]-px)**2 + (coordsB[j][1]-py)**2;
-      if (d < bestD) { bestD = d; bestSrc = 'B'; bestIdx = j; }
-    }
-    const last = raw[raw.length - 1];
-    if (!last || last.src !== bestSrc || last.idx !== bestIdx) raw.push({src: bestSrc, idx: bestIdx});
-  }
-  return raw;
-}
-
-// Build the full decode sequence from snap waypoints.
-// Pre-roll (K_pre frames from same source) is added:
-//   • before the very first waypoint
-//   • at every source transition or backward jump
-// Within-source forward runs fill naturally (A[i]→A[i+1]→…).
-// For 48k a post-roll is appended after the last waypoint.
-// Auto-duration snap: fixed K_pre per context window, deduplicates, natural length.
-function buildSnapSequence(waypoints, K_pre, K_post, ctxSwap) {
-  const T_A = currentEmbeds.embQuantDimsA[2];
-  const T_B = currentEmbeds.embQuantDimsB[2];
-  const getT = src => src === 'A' ? T_A : T_B;
-  const seq  = [];
-
-  const addPreroll = (src, idx, K, wi) => {
-    const frames = pingPongExtend(walkBackward(src, idx, K, ctxSwap), K);
-    for (const f of frames) seq.push({...f, _wp: wi});
-    seq.push({src, idx, _wp: wi});
+function snapWaypointArgs() {
+  return {
+    canvasMode, pinPoints, coordsA, coordsB,
+    userTrajectory, pathMode, snapMode, snapDurVal, codeSecVal,
+    trajDuration: parseFloat(trajDurationEl.value) || 4,
+    framesPerSec: coordsA ? coordsA.length / srcWidget.getDuration() : 1,
   };
-
-  addPreroll(waypoints[0].src, waypoints[0].idx, K_pre, 0);
-
-  for (let w = 1; w < waypoints.length; w++) {
-    const {src, idx} = waypoints[w];
-    const prev = waypoints[w - 1];
-    if (prev.src === src && idx > prev.idx && (idx - prev.idx) <= K_pre) {
-      // Close forward same-source run — LSTM stays warm, fill naturally
-      for (let i = prev.idx + 1; i <= idx; i++) seq.push({src, idx: i, _wp: w});
-    } else {
-      addPreroll(src, idx, K_pre, w);
-    }
-  }
-
-  const lastWi = waypoints.length - 1;
-  if (K_post > 0) {
-    const {src: sL, idx: iL} = waypoints[lastWi];
-    const T = getT(sL);
-    for (let i = iL + 1; i <= Math.min(T - 1, iL + K_post); i++) seq.push({src: sL, idx: i, _wp: lastWi});
-  }
-
-  if (!seq.length) return [];
-  const out = [seq[0]];
-  for (let i = 1; i < seq.length; i++) {
-    const p = out[out.length - 1];
-    if (seq[i].src !== p.src || seq[i].idx !== p.idx) out.push(seq[i]);
-  }
-  return out;
-}
-
-// Compute per-waypoint context (pre-roll) frame counts.
-//   Auto  → fixed K_pre for every waypoint.
-//   Fixed → proportional to UMAP distance of each segment so that longer
-//            jumps get more pre-roll and the total hits the Duration target.
-function getContextKs(waypoints) {
-  const fps  = coordsA.length / srcWidget.getDuration();
-  const N_wp = waypoints.length;
-
-  // ── K frames: explicit K for every waypoint ───────────────────────────
-  if (snapMode === 'k_frames') return waypoints.map(() => snapKVal);
-
-  const N_target = Math.max(N_wp, Math.round(snapDurVal * fps));
-
-  // ── Equal: same budget for every waypoint ─────────────────────────────
-  if (snapMode === 'equal' || N_wp <= 1) {
-    const K_each = Math.max(1, Math.floor(Math.max(0, N_target - N_wp) / N_wp));
-    return waypoints.map(() => K_each);
-  }
-
-  // ── Proportional: budget weighted by UMAP segment distances ───────────
-  const K_min  = 4;
-  const budget = Math.max(0, N_target - N_wp - K_min);
-  const segDists = [];
-  let totalDist  = 0;
-  for (let i = 1; i < N_wp; i++) {
-    const [x0, y0] = (waypoints[i-1].src === 'A' ? coordsA : coordsB)[waypoints[i-1].idx];
-    const [x1, y1] = (waypoints[i].src   === 'A' ? coordsA : coordsB)[waypoints[i].idx];
-    const d = Math.sqrt((x1 - x0) ** 2 + (y1 - y0) ** 2);
-    segDists.push(d);
-    totalDist += d;
-  }
-  const K_each = new Array(N_wp).fill(0);
-  K_each[0] = K_min;
-  for (let i = 1; i < N_wp; i++) {
-    const frac = totalDist > 0 ? segDists[i - 1] / totalDist : 1 / (N_wp - 1);
-    K_each[i] = Math.max(1, Math.round(frac * budget));
-  }
-  return K_each;
-}
-
-// Fixed-duration snap: pre-roll per waypoint is proportional to the UMAP
-// distance of the preceding segment — longer jumps get more context.
-// Total = exactly N_target frames (+ K_post for 48k post-roll).
-function buildSnapSequenceFixed(waypoints, N_target, K_post, ctxSwap) {
-  const N_wp   = waypoints.length;
-  const K_each = getContextKs(waypoints);
-
-  const seq = [];
-  for (let w = 0; w < N_wp; w++) {
-    const { src, idx } = waypoints[w];
-    const K_this = K_each[w];
-    if (K_this > 0) {
-      const frames = pingPongExtend(walkBackward(src, idx, K_this, ctxSwap), K_this);
-      for (const f of frames) seq.push({...f, _wp: w});
-    }
-    seq.push({ src, idx, _wp: w });
-  }
-
-  // Trim to N_target if over — never pad (padding repeats the last frame,
-  // which causes a stuck-note glitch at the loop boundary)
-  if (seq.length > N_target) seq.length = N_target;
-
-  // Post-roll (48k)
-  if (K_post > 0) {
-    const { src: sL, idx: iL } = waypoints[N_wp - 1];
-    const T_L = sL === 'A' ? currentEmbeds.embQuantDimsA[2] : currentEmbeds.embQuantDimsB[2];
-    for (let i = iL + 1; i <= Math.min(T_L - 1, iL + K_post); i++) seq.push({ src: sL, idx: i, _wp: N_wp - 1 });
-  }
-
-  return seq;
 }
 
 function autoRegenerate() {
-  // Always update waypoint viz when drawing in snap or code mode
   if ((pathMode === 'snap' || pathMode === 'code') && coordsA && coordsB) {
-    const wps = computeSnapWaypoints();
-    // Show the primary (forward) direction for viz; pingpong also shows forward
+    const wps    = computeSnapWaypoints(snapWaypointArgs());
     const vizWPs = trajDir === 'backward' ? [...wps].reverse() : wps;
     if (pathMode === 'snap') snapFrames = vizWPs;
     else codePathFrames = vizWPs;
@@ -2436,33 +1415,30 @@ async function playTrajectory() {
 
   const [, D, T_A] = currentEmbeds.embQuantDimsA;
   const [, , T_B]  = currentEmbeds.embQuantDimsB;
+  const fps = coordsA.length / srcWidget.getDuration();
 
   // ── Code-path mode ────────────────────────────────────────────────────────
   if (pathMode === 'code') {
-    const fps = coordsA.length / srcWidget.getDuration();
-
-    // N = frames per pass
     const N_pass = codeDurMode === 'frames'
       ? Math.max(2, codeKVal)
       : Math.max(2, Math.round(codeSecVal * fps));
 
-    const waypoints = computeSnapWaypoints();
+    const waypoints = computeSnapWaypoints(snapWaypointArgs());
     if (!waypoints.length) { setStatus('Draw a path first.', true); return; }
     const wLen = waypoints.length;
 
-    // Resample one pass worth of WPs for a given direction frac function
-    const resample = fracFn => Array.from({length: N_pass}, (_, i) => {
+    const resample = fracFn => Array.from({ length: N_pass }, (_, i) => {
       const wi = Math.min(Math.floor(fracFn(i, N_pass) * (wLen - 1)), wLen - 1);
       return waypoints[wi];
     });
 
     let sampledWPs;
-    if (trajDir === 'forward')  sampledWPs = resample((i, N) => i / (N - 1));
-    else if (trajDir === 'backward') sampledWPs = resample((i, N) => 1 - i / (N - 1));
+    if (trajDir === 'forward')        sampledWPs = resample((i, N) => i / (N - 1));
+    else if (trajDir === 'backward')  sampledWPs = resample((i, N) => 1 - i / (N - 1));
     else /* pingpong */ {
       const fwd = resample((i, N) => i / (N - 1));
       const bwd = resample((i, N) => 1 - i / (N - 1));
-      sampledWPs = [...fwd, ...bwd]; // 2N frames total
+      sampledWPs = [...fwd, ...bwd];
     }
 
     codePathFrames = sampledWPs;
@@ -2472,17 +1448,17 @@ async function playTrajectory() {
     const N       = sampledWPs.length;
     const blended = new Float32Array(D * N);
     for (let i = 0; i < N; i++) {
-      const {src, idx} = sampledWPs[i];
+      const { src, idx } = sampledWPs[i];
       const emb = src === 'A' ? currentEmbeds.embQuantA : currentEmbeds.embQuantB;
       const T   = src === 'A' ? T_A : T_B;
       for (let d = 0; d < D; d++) blended[d * N + i] = emb[d * T + idx];
     }
 
-    if (!audioCtx) audioCtx = new AudioContext();
+    getAudioCtx();
     playJobId = ++jobSeq;
-    const dirLabel = {forward:'fwd', backward:'bwd', pingpong:'ping'}[trajDir];
+    const dirLabel = { forward: 'fwd', backward: 'bwd', pingpong: 'ping' }[trajDir];
     setStatus(`Decoding code/${dirLabel} (${N} frames, ${(N / fps).toFixed(1)} s)…`);
-    const codeScales = makeFrameScales(sampledWPs);
+    const codeScales = makeFrameScales(sampledWPs, currentEmbeds);
     const codeXfers  = [blended.buffer];
     if (codeScales) codeXfers.push(codeScales.buffer);
     worker.postMessage({
@@ -2496,27 +1472,23 @@ async function playTrajectory() {
 
   // ── Snap mode ─────────────────────────────────────────────────────────────
   if (pathMode === 'snap') {
-    const fwdWPs = computeSnapWaypoints();
+    const fwdWPs = computeSnapWaypoints(snapWaypointArgs());
     if (!fwdWPs.length) { setStatus('Draw a path first.', true); return; }
     const bwdWPs = [...fwdWPs].reverse();
 
-    // Viz shows primary direction
     snapFrames = trajDir === 'backward' ? bwdWPs : fwdWPs;
 
     const is48k  = mp.getModelHz() === '48k';
-    const fps    = coordsA.length / srcWidget.getDuration();
     const K_post = is48k ? Math.max(2, Math.round(fps * 0.03)) : 0;
 
-    // Build sequence for each needed direction — pre-roll is always recomputed
-    // for the waypoints in the order they'll actually be decoded.
-    const buildSeq = (wps) => snapMode === 'k_frames'
-      ? buildSnapSequence(wps, snapKVal, K_post, ctxSwapRange)
-      : buildSnapSequenceFixed(wps, Math.max(wps.length, Math.round(snapDurVal * fps)), K_post, ctxSwapRange);
+    const buildSeq = wps => snapMode === 'k_frames'
+      ? buildSnapSequence(wps, snapKVal, K_post, ctxSwapRange, coordsA, coordsB, currentEmbeds)
+      : buildSnapSequenceFixed(wps, Math.max(wps.length, Math.round(snapDurVal * fps)), K_post, ctxSwapRange, coordsA, coordsB, currentEmbeds, snapCtxArg());
 
     let seq;
-    if (trajDir === 'forward')  seq = buildSeq(fwdWPs);
+    if (trajDir === 'forward')       seq = buildSeq(fwdWPs);
     else if (trajDir === 'backward') seq = buildSeq(bwdWPs);
-    else /* pingpong */ seq = [...buildSeq(fwdWPs), ...buildSeq(bwdWPs)];
+    else /* pingpong */              seq = [...buildSeq(fwdWPs), ...buildSeq(bwdWPs)];
 
     snapPlayFrames = seq;
     genPlaySeq = seq;
@@ -2525,17 +1497,17 @@ async function playTrajectory() {
     const N = seq.length;
     const blended = new Float32Array(D * N);
     for (let i = 0; i < N; i++) {
-      const {src, idx} = seq[i];
+      const { src, idx } = seq[i];
       const emb = src === 'A' ? currentEmbeds.embQuantA : currentEmbeds.embQuantB;
       const T   = src === 'A' ? T_A : T_B;
       for (let d = 0; d < D; d++) blended[d * N + i] = emb[d * T + idx];
     }
-    if (!audioCtx) audioCtx = new AudioContext();
+    getAudioCtx();
     playJobId = ++jobSeq;
     const snapLabel = { k_frames: 'K frames', equal: 'equal', proportional: 'proportional' }[snapMode];
     setStatus(`Decoding snap/${snapLabel} (${N} frames, ${(N / fps).toFixed(1)} s)…`);
-    const snapScales  = makeFrameScales(seq);
-    const snapXfers   = [blended.buffer];
+    const snapScales = makeFrameScales(seq, currentEmbeds);
+    const snapXfers  = [blended.buffer];
     if (snapScales) snapXfers.push(snapScales.buffer);
     worker.postMessage({
       type: 'decode_trajectory_exp6', jobId: playJobId,
@@ -2547,21 +1519,15 @@ async function playTrajectory() {
   }
 
   // ── Draw-path mode ────────────────────────────────────────────────────────
-  genPlaySeq = null; // draw mode = interpolated, no direct frame mapping
-  const duration     = parseFloat(trajDurationEl.value) || 4;
-  const framesPerSec = coordsA.length / srcWidget.getDuration();
-  // Pingpong doubles the frame count (forward + backward pass)
-  const N_pass = Math.max(2, Math.round(duration * framesPerSec));
-  const N      = trajDir === 'pingpong' ? N_pass * 2 : N_pass;
+  genPlaySeq = null;
+  const duration = parseFloat(trajDurationEl.value) || 4;
+  const N_pass   = Math.max(2, Math.round(duration * fps));
+  const N        = trajDir === 'pingpong' ? N_pass * 2 : N_pass;
 
-  // Map frame index to a 0..1 position along the trajectory
   const drawFrac = i => {
     if (trajDir === 'backward') return 1 - i / (N - 1);
-    if (trajDir === 'pingpong') {
-      const t = 2 * i / (N - 1); // 0..2
-      return t <= 1 ? t : 2 - t;
-    }
-    return i / (N - 1); // forward
+    if (trajDir === 'pingpong') { const t = 2 * i / (N - 1); return t <= 1 ? t : 2 - t; }
+    return i / (N - 1);
   };
 
   const getFrame = (src, idx) => {
@@ -2572,9 +1538,9 @@ async function playTrajectory() {
     return f;
   };
 
-  const blended     = new Float32Array(D * N);
-  const hasScales   = !!(currentEmbeds.scalesA || currentEmbeds.scalesB);
-  const drawScales  = hasScales ? new Float32Array(N) : null;
+  const blended    = new Float32Array(D * N);
+  const hasScales  = !!(currentEmbeds.scalesA || currentEmbeds.scalesB);
+  const drawScales = hasScales ? new Float32Array(N) : null;
 
   for (let i = 0; i < N; i++) {
     const frac = drawFrac(i);
@@ -2584,6 +1550,7 @@ async function playTrajectory() {
     const px   = userTrajectory[lo][0] + t * (userTrajectory[hi][0] - userTrajectory[lo][0]);
     const py   = userTrajectory[lo][1] + t * (userTrajectory[hi][1] - userTrajectory[lo][1]);
 
+    // Find two nearest points for interpolation
     let d1 = Infinity, d2 = Infinity;
     let src1 = null, idx1 = -1, src2 = null, idx2 = -1;
     for (let j = 0; j < coordsA.length; j++) {
@@ -2604,6 +1571,7 @@ async function playTrajectory() {
     const w1  = sum > 1e-12 ? sd2 / sum : 1;
     const w2  = 1 - w1;
     for (let d = 0; d < D; d++) blended[d * N + i] = w1 * f1[d] + w2 * f2[d];
+
     if (drawScales) {
       const getScale = (src, idx) => {
         const arr = src === 'A' ? currentEmbeds.scalesA : currentEmbeds.scalesB;
@@ -2614,7 +1582,7 @@ async function playTrajectory() {
     }
   }
 
-  if (!audioCtx) audioCtx = new AudioContext();
+  getAudioCtx();
   playJobId = ++jobSeq;
   setStatus(`Decoding ${N} frames (${duration} s)…`);
 
@@ -2627,63 +1595,6 @@ async function playTrajectory() {
     modelHz: mp.getModelHz(), bwKbps: mp.getBwKbps(),
   }, drawXfers);
 }
-
-// ── Waveform player instances ─────────────────────────────────────────────────
-
-const playerA = makeWavePlayer('waveCanvA', '#c87800', pos => {
-  if (pos < 0 || !coordsA) { waveHighlight = null; renderScatter(); return; }
-  const i = Math.min(Math.floor(pos * coordsA.length), coordsA.length - 1);
-  waveHighlight = { src: 'A', idx: i };
-  playerB.setCursor(-1);
-  renderScatter();
-});
-
-const playerB = makeWavePlayer('waveCanvB', '#2090c0', pos => {
-  if (pos < 0 || !coordsB) { waveHighlight = null; renderScatter(); return; }
-  const i = Math.min(Math.floor(pos * coordsB.length), coordsB.length - 1);
-  waveHighlight = { src: 'B', idx: i };
-  playerA.setCursor(-1);
-  renderScatter();
-});
-
-const playerG = makeWavePlayer('waveCanvG', '#44bb88', pos => {
-  // Drive the UMAP playhead from the Generated player's position
-  trajAnchorPos = pos >= 0 ? pos : -1;
-
-  if (pos < 0 || !genPlaySeq) {
-    waveHighlight = null;
-    playerA.setCursor(-1); playerB.setCursor(-1);
-    renderScatter(); return;
-  }
-  const i = Math.min(Math.floor(pos * (genPlaySeq.length - 1)), genPlaySeq.length - 1);
-  const frame = genPlaySeq[i];
-  if (!frame) return;
-  waveHighlight = { src: frame.src, idx: frame.idx };
-  // Show cursor on the corresponding source player
-  const srcLen = frame.src === 'A' ? (coordsA?.length ?? 1) : (coordsB?.length ?? 1);
-  const srcPos = frame.idx / srcLen;
-  if (frame.src === 'A') { playerA.setCursor(srcPos); playerB.setCursor(-1); }
-  else                   { playerB.setCursor(srcPos); playerA.setCursor(-1); }
-  renderScatter();
-});
-
-// Wire play/stop/loop buttons
-playerA.setPlayBtn(document.getElementById('wbPlayA'));
-playerA.setLoopBtn(document.getElementById('wbLoopA'));
-playerB.setPlayBtn(document.getElementById('wbPlayB'));
-playerB.setLoopBtn(document.getElementById('wbLoopB'));
-playerG.setPlayBtn(document.getElementById('wbPlayG'));
-playerG.setLoopBtn(document.getElementById('wbLoopG'));
-
-['A','B','G'].forEach(id => {
-  const p = id === 'A' ? playerA : id === 'B' ? playerB : playerG;
-  document.getElementById(`wbPlay${id}`).addEventListener('click', () => p.play());
-  document.getElementById(`wbStop${id}`).addEventListener('click', () => p.stop());
-  document.getElementById(`wbLoop${id}`).addEventListener('click', () => {
-    const btn = document.getElementById(`wbLoop${id}`);
-    p.setLoop(!btn.classList.contains('active'));
-  });
-});
 </script>
 </body>
 </html>
