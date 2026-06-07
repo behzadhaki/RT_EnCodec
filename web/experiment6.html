@@ -395,8 +395,9 @@ function setSeqInfo(seq) {
 }
 
 // Code mode: show at most 5 evenly-distributed waypoints; mark skipped spans with (→ … →).
+// orderedWPs is already compact (no K-repeat); pingpong turnaround duplicate is intentional — no dedup.
 function setCodeSeqInfo(seq) {
-  const wps = (seq || []).filter((f, i) => i === 0 || f.src !== seq[i-1].src || f.idx !== seq[i-1].idx);
+  const wps = seq || [];
   if (!wps.length) { seqInfo.textContent = ''; return; }
   const fmt = f => `${f.src}${f.idx}`;
   const MAX = 5;
