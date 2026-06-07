@@ -49,7 +49,7 @@ export function renderScatter(canvas, dpr, state) {
     pinPoints, selectedPoint, waveHighlight, userTrajectory,
     pathMode, snapFrames, codePathFrames, trajAnchorPos,
     snapPlayFrames, trajDir, showTrail, ctxSwapRange,
-    snapMode, snapKVal, snapDurVal, framesPerSec,
+    snapMode, snapKVal, snapDurVal, framesPerSec, canvasMode,
   } = state;
 
   function drawTrail(coords, color) {
@@ -157,7 +157,7 @@ export function renderScatter(canvas, dpr, state) {
     }
   }
 
-  if (userTrajectory.length >= 2) {
+  if (canvasMode === 'draw' && userTrajectory.length >= 2) {
     ctx.save();
     ctx.strokeStyle = '#ffffff';
     ctx.lineWidth   = 2 * dpr;

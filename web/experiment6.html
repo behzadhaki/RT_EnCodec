@@ -1040,6 +1040,12 @@ function setCanvasMode(mode) {
   if (mode === 'pins')    setStatus('Double-click near a UMAP point to add/remove pins.');
   if (mode === 'explore') setStatus('');
   updatePinSeqBar();
+  // Sync trajectory source to new mode and regenerate
+  if (mode === 'draw')      userTrajectory = rawDrawPoints.length >= 2 ? resamplePath(rawDrawPoints, 300) : [];
+  else if (mode === 'pins') userTrajectory = pinPoints.length    >= 2 ? resamplePath(pinPoints, 300)    : [];
+  if (userTrajectory.length < 2) { snapFrames = null; codePathFrames = null; snapPlayFrames = null; }
+  renderScatter();
+  if (userTrajectory.length >= 2) autoRegenerate();
 }
 
 togExplore.addEventListener('click', () => setCanvasMode('explore'));
@@ -1427,18 +1433,20 @@ async function playTrajectory() {
     if (!waypoints.length) { setStatus('Draw a path first.', true); return; }
     const wLen = waypoints.length;
 
-    const resample = fracFn => Array.from({ length: N_pass }, (_, i) => {
-      const wi = Math.min(Math.floor(fracFn(i, N_pass) * (wLen - 1)), wLen - 1);
+    const resample = (fracFn, len = N_pass) => Array.from({ length: len }, (_, i) => {
+      const wi = Math.min(Math.floor(fracFn(i, len) * (wLen - 1)), wLen - 1);
       return waypoints[wi];
     });
 
     let sampledWPs;
     if (trajDir === 'forward')        sampledWPs = resample((i, N) => i / (N - 1));
     else if (trajDir === 'backward')  sampledWPs = resample((i, N) => 1 - i / (N - 1));
-    else /* pingpong */ {
-      const fwd = resample((i, N) => i / (N - 1));
-      const bwd = resample((i, N) => 1 - i / (N - 1));
-      sampledWPs = [...fwd, ...bwd];
+    else /* pingpong — each half gets half the budget */ {
+      const half = Math.ceil(N_pass / 2);
+      sampledWPs = [
+        ...resample((i, N) => i / (N - 1), half),
+        ...resample((i, N) => 1 - i / (N - 1), half),
+      ];
     }
 
     codePathFrames = sampledWPs;
@@ -1481,14 +1489,18 @@ async function playTrajectory() {
     const is48k  = mp.getModelHz() === '48k';
     const K_post = is48k ? Math.max(2, Math.round(fps * 0.03)) : 0;
 
-    const buildSeq = wps => snapMode === 'k_frames'
+    const N_total  = Math.max(2, Math.round(snapDurVal * fps));
+    const buildSeq = (wps, N_target = N_total) => snapMode === 'k_frames'
       ? buildSnapSequence(wps, snapKVal, K_post, ctxSwapRange, coordsA, coordsB, currentEmbeds)
-      : buildSnapSequenceFixed(wps, Math.max(wps.length, Math.round(snapDurVal * fps)), K_post, ctxSwapRange, coordsA, coordsB, currentEmbeds, snapCtxArg());
+      : buildSnapSequenceFixed(wps, Math.max(wps.length, N_target), K_post, ctxSwapRange, coordsA, coordsB, currentEmbeds, snapCtxArg());
 
     let seq;
     if (trajDir === 'forward')       seq = buildSeq(fwdWPs);
     else if (trajDir === 'backward') seq = buildSeq(bwdWPs);
-    else /* pingpong */              seq = [...buildSeq(fwdWPs), ...buildSeq(bwdWPs)];
+    else /* pingpong — each half gets half the budget */ {
+      const half = Math.ceil(N_total / 2);
+      seq = [...buildSeq(fwdWPs, half), ...buildSeq(bwdWPs, half)];
+    }
 
     snapPlayFrames = seq;
     genPlaySeq = seq;
@@ -1522,7 +1534,7 @@ async function playTrajectory() {
   genPlaySeq = null;
   const duration = parseFloat(trajDurationEl.value) || 4;
   const N_pass   = Math.max(2, Math.round(duration * fps));
-  const N        = trajDir === 'pingpong' ? N_pass * 2 : N_pass;
+  const N        = N_pass;
 
   const drawFrac = i => {
     if (trajDir === 'backward') return 1 - i / (N - 1);
