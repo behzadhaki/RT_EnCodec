@@ -6,6 +6,19 @@
 <link rel="stylesheet" href="encodec.css">
 <style>
 /* Experiment-6-only overrides — kept here to avoid polluting shared encodec.css */
+#levelDropdown { position: relative; }
+#levelMenu {
+  display: none; position: absolute; top: calc(100% + 4px); left: 0;
+  background: #1c1c1c; border: 1px solid var(--border2); border-radius: 4px;
+  padding: 4px 0; z-index: 200; min-width: 90px;
+}
+#levelMenu.open { display: block; }
+#levelMenu label {
+  display: flex; align-items: center; gap: 7px;
+  padding: 3px 10px; font-size: 11px; cursor: pointer; white-space: nowrap; color: var(--text);
+}
+#levelMenu label:hover { background: #2a2a2a; }
+#levelMenu input[type=checkbox] { accent-color: var(--accent); cursor: pointer; margin: 0; }
 #frame { grid-template-columns: 210px 1fr; }
 :root  { --lbl-w: 5.5em; }
 /* Reset shared rules that don't apply in this layout */
@@ -21,11 +34,15 @@
 
   <div id="vizArea">
     <div id="modeBar">
-      <button class="tog active" id="togCombined">Combined</button>
-      <button class="tog"        id="togPerLevel">Per level</button>
+      <button class="tog active" id="togPreVQMode">Pre-VQ</button>
+      <button class="tog"        id="togVQMode">VQ</button>
+      <button class="tog"        id="togPostVQMode">Post-VQ</button>
       <div id="levelWrap" style="display:none">
-        <label>Level</label>
-        <select id="levelSelect"></select>
+        <label>Levels</label>
+        <div id="levelDropdown">
+          <button id="levelMenuBtn" class="tog">All</button>
+          <div id="levelMenu"></div>
+        </div>
       </div>
       <span style="flex:1"></span>
       <button class="tog active" id="togExplore">Explore</button>
@@ -139,13 +156,6 @@ umapSection.className = 'section';
 umapSection.innerHTML = `
   <div class="section-title">UMAP</div>
   <div class="row">
-    <span class="lbl">Space</span>
-    <div style="display:flex;gap:3px">
-      <button class="tog active" id="togPreVQ">Pre-VQ</button>
-      <button class="tog"        id="togPostVQ">Post-VQ</button>
-    </div>
-  </div>
-  <div class="row">
     <span class="lbl">Features</span>
     <div style="display:flex;gap:3px">
       <button class="tog active" id="togEmbOnly">Emb</button>
@@ -251,10 +261,12 @@ const umapCanvas    = document.getElementById('umapCanvas');
 const statusBar     = document.getElementById('statusBar');
 const progWrap      = document.getElementById('progressWrap');
 const progBar       = document.getElementById('progressBar');
-const togCombined   = document.getElementById('togCombined');
-const togPerLevel   = document.getElementById('togPerLevel');
+const togPreVQMode  = document.getElementById('togPreVQMode');
+const togVQMode     = document.getElementById('togVQMode');
+const togPostVQMode = document.getElementById('togPostVQMode');
 const levelWrap     = document.getElementById('levelWrap');
-const levelSelect   = document.getElementById('levelSelect');
+const levelMenuBtn  = document.getElementById('levelMenuBtn');
+const levelMenu     = document.getElementById('levelMenu');
 const nNeighborsEl  = document.getElementById('nNeighbors');
 const minDistEl     = document.getElementById('minDist');
 const umapWindowEl  = document.getElementById('umapWindow');
@@ -292,7 +304,7 @@ let encodeTimer   = null;
 let umapWorker      = null;
 let activeUMAPJobId = -1;
 let umapMode        = 'combined';
-let umapLevel       = 0;
+let umapLevels      = [];   // selected codebook levels (all by default)
 let embSpace        = 'pre_vq'; // 'pre_vq' | 'post_vq'
 let embMode         = 'emb';    // 'emb' | 'emb+delta' | 'delta'
 let coordsA         = null;
@@ -745,46 +757,73 @@ function startEncodeB() {
 
 // ── Level selector ────────────────────────────────────────────────────────────
 
-function populateLevelSelect(K) {
-  levelSelect.innerHTML = '';
-  for (let k = 0; k < K; k++) {
-    const opt = document.createElement('option');
-    opt.value = k;
-    opt.textContent = `Level ${k + 1}`;
-    levelSelect.appendChild(opt);
-  }
-  umapLevel = 0;
+function updateLevelMenuBtn() {
+  const total = levelMenu.querySelectorAll('input[type=checkbox]').length;
+  levelMenuBtn.textContent = umapLevels.length === total
+    ? 'All ▾'
+    : umapLevels.length === 0
+      ? 'None ▾'
+      : umapLevels.map(l => l + 1).join(', ') + ' ▾';
 }
 
-levelSelect.addEventListener('change', () => {
-  umapLevel = parseInt(levelSelect.value);
-  markDirty('COORDS', 'WAYPOINTS', 'AUDIO', 'RENDER');
+function populateLevelSelect(K) {
+  levelMenu.innerHTML = '';
+  umapLevels = Array.from({ length: K }, (_, k) => k);  // all selected
+  for (let k = 0; k < K; k++) {
+    const lbl = document.createElement('label');
+    const cb  = document.createElement('input');
+    cb.type    = 'checkbox';
+    cb.checked = true;
+    cb.dataset.level = k;
+    cb.addEventListener('change', () => {
+      umapLevels = [...levelMenu.querySelectorAll('input[type=checkbox]')]
+        .filter(c => c.checked)
+        .map(c => parseInt(c.dataset.level));
+      if (umapLevels.length === 0) {
+        // re-check this box — don't allow empty selection
+        cb.checked = true;
+        umapLevels = [k];
+      }
+      updateLevelMenuBtn();
+      markDirty('COORDS', 'WAYPOINTS', 'AUDIO', 'RENDER');
+    });
+    lbl.appendChild(cb);
+    lbl.appendChild(document.createTextNode(`Level ${k + 1}`));
+    levelMenu.appendChild(lbl);
+  }
+  updateLevelMenuBtn();
+}
+
+levelMenuBtn.addEventListener('click', e => {
+  e.stopPropagation();
+  levelMenu.classList.toggle('open');
 });
 
-// ── UMAP mode toggles ─────────────────────────────────────────────────────────
-
-togCombined.addEventListener('click', () => {
-  if (umapMode === 'combined') return;
-  umapMode = 'combined';
-  togCombined.classList.add('active');
-  togPerLevel.classList.remove('active');
-  levelWrap.style.display = 'none';
-  markDirty('COORDS', 'WAYPOINTS', 'AUDIO', 'RENDER');
+document.addEventListener('click', e => {
+  if (!levelMenu.contains(e.target) && e.target !== levelMenuBtn)
+    levelMenu.classList.remove('open');
 });
 
-togPerLevel.addEventListener('click', () => {
-  if (umapMode === 'per_level') return;
-  umapMode = 'per_level';
-  togPerLevel.classList.add('active');
-  togCombined.classList.remove('active');
-  levelWrap.style.display = '';
-  markDirty('COORDS', 'WAYPOINTS', 'AUDIO', 'RENDER');
-});
+// ── UMAP space toggles (Pre-VQ | VQ | Post-VQ) ───────────────────────────────
 
-createToggleGroup([
-  { el: document.getElementById('togPreVQ'),  value: 'pre_vq' },
-  { el: document.getElementById('togPostVQ'), value: 'post_vq' },
-], v => { embSpace = v; markDirty('COORDS', 'WAYPOINTS', 'AUDIO', 'RENDER'); });
+function setUmapSpace(space) {
+  // space: 'pre_vq' | 'vq' | 'post_vq'
+  togPreVQMode .classList.toggle('active', space === 'pre_vq');
+  togVQMode    .classList.toggle('active', space === 'vq');
+  togPostVQMode.classList.toggle('active', space === 'post_vq');
+  levelWrap.style.display = space === 'vq' ? '' : 'none';
+  if (space === 'vq') {
+    umapMode = 'per_level';
+  } else {
+    umapMode  = 'combined';
+    embSpace  = space;   // 'pre_vq' | 'post_vq'
+  }
+  markDirty('COORDS', 'WAYPOINTS', 'AUDIO', 'RENDER');
+}
+
+togPreVQMode .addEventListener('click', () => setUmapSpace('pre_vq'));
+togVQMode    .addEventListener('click', () => setUmapSpace('vq'));
+togPostVQMode.addEventListener('click', () => setUmapSpace('post_vq'));
 
 createToggleGroup([
   { el: document.getElementById('togEmbOnly'),  value: 'emb' },
@@ -998,14 +1037,21 @@ function embQuantToFrames(embQuant, dims) {
   return frames;
 }
 
-function codebookLookupFrames(cb, codes, dims, level) {
+// Concatenates codebook vectors for all selected levels per frame.
+// With a single level selected this is identical to the old single-level lookup.
+function codebookLookupFrames(cb, codes, dims, levels) {
   const [, , T] = dims;
   const { data, vocab_size, dim } = cb;
   const frames = [];
   for (let t = 0; t < T; t++) {
-    const idx = codes[level * T + t];
-    const off = level * vocab_size * dim + idx * dim;
-    frames.push(data.slice(off, off + dim));
+    const vec = new Float32Array(dim * levels.length);
+    for (let li = 0; li < levels.length; li++) {
+      const level = levels[li];
+      const idx   = codes[level * T + t];
+      const off   = level * vocab_size * dim + idx * dim;
+      vec.set(data.subarray(off, off + dim), li * dim);
+    }
+    frames.push(vec);
   }
   return frames;
 }
@@ -1034,8 +1080,9 @@ async function runUMAP() {
     else if (embMode === 'delta')     { framesA = computeDeltas(framesA); framesB = computeDeltas(framesB); }
   } else {
     const cb = await ensureCodebooks();
-    rawA = codebookLookupFrames(cb, currentEmbeds.codesA, currentEmbeds.codesDimsA, umapLevel);
-    rawB = codebookLookupFrames(cb, currentEmbeds.codesB, currentEmbeds.codesDimsB, umapLevel);
+    const levels = umapLevels.length ? umapLevels : [0];
+    rawA = codebookLookupFrames(cb, currentEmbeds.codesA, currentEmbeds.codesDimsA, levels);
+    rawB = codebookLookupFrames(cb, currentEmbeds.codesB, currentEmbeds.codesDimsB, levels);
     framesA = rawA; framesB = rawB;
     if      (embMode === 'emb+delta') { framesA = appendDeltas(framesA);  framesB = appendDeltas(framesB); }
     else if (embMode === 'delta')     { framesA = computeDeltas(framesA); framesB = computeDeltas(framesB); }
