@@ -1299,6 +1299,9 @@ umapCanvas.addEventListener('wheel', e => {
   const cy   = (e.clientY - rect.top)  * dpr;
   if (e.ctrlKey || e.metaKey) {
     applyZoom(cx, cy, Math.exp(-e.deltaY * 0.01));
+  } else if (e.shiftKey) {
+    // Shift + two-finger scroll → pan
+    viewPanX -= e.deltaX; viewPanY -= e.deltaY;
   } else if (Math.abs(e.deltaX) > Math.abs(e.deltaY) * 0.5 && Math.abs(e.deltaX) > 2) {
     viewPanX -= e.deltaX; viewPanY -= e.deltaY;
   } else {
@@ -1312,6 +1315,15 @@ window.addEventListener('keydown', e => {
   if (e.key === '+' || e.key === '=') { applyZoom(umapCanvas.width/2, umapCanvas.height/2, 1.2); scheduleRender(); }
   if (e.key === '-')                  { applyZoom(umapCanvas.width/2, umapCanvas.height/2, 1/1.2); scheduleRender(); }
   if (e.key === '0')                  { viewZoom = 1; viewPanX = 0; viewPanY = 0; scheduleRender(); }
+  if (e.shiftKey && (e.key === 'ArrowLeft' || e.key === 'ArrowRight' || e.key === 'ArrowUp' || e.key === 'ArrowDown')) {
+    e.preventDefault();
+    const step = 40;
+    if (e.key === 'ArrowLeft')  viewPanX += step;
+    if (e.key === 'ArrowRight') viewPanX -= step;
+    if (e.key === 'ArrowUp')    viewPanY += step;
+    if (e.key === 'ArrowDown')  viewPanY -= step;
+    scheduleRender();
+  }
 });
 
 // ── Drag + draw event handlers ────────────────────────────────────────────────
