@@ -394,28 +394,44 @@ function setSeqInfo(seq) {
   seqInfo.textContent = build([wps[0], null, wps[wps.length - 1]]);
 }
 
-// Code mode: show at most 5 evenly-distributed waypoints; mark skipped spans with (→ … →).
-// orderedWPs is already compact (no K-repeat); pingpong turnaround duplicate is intentional — no dedup.
+// Code / snap mode: show at most 5 waypoints (6 for pingpong — 3 per half so turnaround always appears twice).
+// orderedWPs / snapFrames are already compact; pingpong turnaround duplicate is intentional — no dedup.
 function setCodeSeqInfo(seq) {
   const wps = seq || [];
   if (!wps.length) { seqInfo.textContent = ''; return; }
   const fmt = f => `${f.src}${f.idx}`;
-  const MAX = 5;
-  if (wps.length <= MAX) {
+
+  if (wps.length <= 6) {
     seqInfo.textContent = '[ ' + wps.map(fmt).join(' → ') + ' ]';
     return;
   }
-  // Pick MAX evenly-spaced indices (always includes 0 and last)
-  const picked = Array.from({ length: MAX }, (_, i) => Math.round(i * (wps.length - 1) / (MAX - 1)));
-  const parts = [];
-  for (let i = 0; i < picked.length; i++) {
-    if (i > 0) {
-      const gap = picked[i] - picked[i - 1];
-      parts.push(gap === 1 ? '→' : '(→ … →)');
-    }
-    parts.push(fmt(wps[picked[i]]));
+
+  // n evenly-spaced indices from wps[lo..hi] inclusive
+  const span = (lo, hi, n) => n <= 1 ? [lo]
+    : Array.from({ length: n }, (_, i) => lo + Math.round(i * (hi - lo) / (n - 1)));
+
+  // Detect pingpong turnaround: first consecutive identical pair
+  let taIdx = -1;
+  for (let i = 1; i < wps.length; i++) {
+    if (wps[i].src === wps[i-1].src && wps[i].idx === wps[i-1].idx) { taIdx = i - 1; break; }
   }
-  seqInfo.textContent = '[ ' + parts.join(' ') + ' ]';
+
+  const picked = taIdx >= 0
+    // Pingpong: pick left half, then mirror to right so midpoints are guaranteed symmetric
+    ? (() => {
+        const L = span(0, taIdx, 3);
+        const R = [...L].reverse().map(i => taIdx + 1 + (taIdx - i));
+        return [...L, ...R];
+      })()
+    // Linear: 5 evenly spaced
+    : span(0, wps.length - 1, 5);
+
+  let text = fmt(wps[picked[0]]);
+  for (let i = 1; i < picked.length; i++) {
+    const gap = picked[i] - picked[i - 1];
+    text += gap === 1 ? ' → ' + fmt(wps[picked[i]]) : ' → … → ' + fmt(wps[picked[i]]);
+  }
+  seqInfo.textContent = '[ ' + text + ' ]';
 }
 
 function getAudioCtx() {
@@ -1566,7 +1582,7 @@ function computeWaypoints() {
     }
     snapPlayFrames = seq;
     genPlaySeq     = seq;
-    setSeqInfo(snapFrames);
+    setCodeSeqInfo(snapFrames);
   }
   // draw mode: no discrete waypoints — embeddings are interpolated at playback time
   if (pathMode === 'draw') seqInfo.textContent = 'interpolated points along path';
