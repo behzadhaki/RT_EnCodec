@@ -11,6 +11,8 @@
 /* Reset shared rules that don't apply in this layout */
 #statusBar  { flex: none; white-space: normal; overflow: visible; text-overflow: clip; min-width: auto; }
 #progressWrap { width: auto; overflow: visible; }
+#seqInfo    { font-family: monospace; font-size: 0.78em; color: #aaa; margin-left: 0.6em;
+              flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; }
 </style>
 </head>
 <body>
@@ -42,6 +44,7 @@
 
     <div id="statusWrap">
       <span id="statusBar">Encode both sources to compute UMAP.</span>
+      <span id="seqInfo"></span>
       <div id="progressWrap"><div id="progressBar"></div></div>
     </div>
 
@@ -359,9 +362,59 @@ let waveHighlight = null;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+function pinCoords() {
+  if (!coordsA || !coordsB) return [];
+  return pinPoints.map(p => (p.src === 'A' ? coordsA : coordsB)[p.idx]);
+}
+
 function setStatus(msg, isError = false) {
   statusBar.textContent = msg;
   statusBar.style.color = isError ? '#f66' : '';
+}
+
+// Snap mode: fit as many waypoints as possible into the available width,
+// shrinking toward start → … → end as needed.
+function setSeqInfo(seq) {
+  const wps = (seq || []).filter((f, i) => i === 0 || f.src !== seq[i-1].src || f.idx !== seq[i-1].idx);
+  if (!wps.length) { seqInfo.textContent = ''; return; }
+  const fmt  = f  => `${f.src}${f.idx}`;
+  const build = arr => '[ ' + arr.map(f => f === null ? '…' : fmt(f)).join(' → ') + ' ]';
+  if (wps.length === 1) { seqInfo.textContent = build(wps); return; }
+
+  for (let vis = wps.length; vis >= 2; vis--) {
+    if (vis === wps.length) {
+      seqInfo.textContent = build(wps);
+    } else {
+      const front = Math.ceil(vis / 2);
+      const back  = vis - front;
+      seqInfo.textContent = build([...wps.slice(0, front), null, ...wps.slice(wps.length - back)]);
+    }
+    if (seqInfo.scrollWidth <= seqInfo.clientWidth + 1) return;
+  }
+  seqInfo.textContent = build([wps[0], null, wps[wps.length - 1]]);
+}
+
+// Code mode: show at most 5 evenly-distributed waypoints; mark skipped spans with (→ … →).
+function setCodeSeqInfo(seq) {
+  const wps = (seq || []).filter((f, i) => i === 0 || f.src !== seq[i-1].src || f.idx !== seq[i-1].idx);
+  if (!wps.length) { seqInfo.textContent = ''; return; }
+  const fmt = f => `${f.src}${f.idx}`;
+  const MAX = 5;
+  if (wps.length <= MAX) {
+    seqInfo.textContent = '[ ' + wps.map(fmt).join(' → ') + ' ]';
+    return;
+  }
+  // Pick MAX evenly-spaced indices (always includes 0 and last)
+  const picked = Array.from({ length: MAX }, (_, i) => Math.round(i * (wps.length - 1) / (MAX - 1)));
+  const parts = [];
+  for (let i = 0; i < picked.length; i++) {
+    if (i > 0) {
+      const gap = picked[i] - picked[i - 1];
+      parts.push(gap === 1 ? '→' : '(→ … →)');
+    }
+    parts.push(fmt(wps[picked[i]]));
+  }
+  seqInfo.textContent = '[ ' + parts.join(' ') + ' ]';
 }
 
 function getAudioCtx() {
@@ -374,12 +427,62 @@ function renderScatter() {
   const result = _renderScatter(umapCanvas, dpr, {
     coordsA, coordsB,
     viewZoom, viewPanX, viewPanY,
-    pinPoints, selectedPoint, waveHighlight, userTrajectory,
+    pinPoints: pinCoords(),
+    highlightedPinIdx: waveHighlight
+      ? pinPoints.findIndex(p => p.src === waveHighlight.src && p.idx === waveHighlight.idx)
+      : -1,
+    selectedPoint, waveHighlight, userTrajectory,
     pathMode, snapFrames, codePathFrames, trajAnchorPos,
     snapPlayFrames, trajDir, showTrail: chkTrail.checked, canvasMode, ctxSwapRange,
     snapMode, snapKVal, snapDurVal, framesPerSec: fps,
   });
   if (result !== null) lastTransform = result;
+}
+
+// ── Dirty flags & effect scheduler ───────────────────────────────────────────
+
+const dirty = { COORDS: false, WAYPOINTS: false, AUDIO: false, RENDER: false };
+let renderPending = false;
+
+function scheduleRender() {
+  if (renderPending) return;
+  renderPending = true;
+  requestAnimationFrame(() => { renderPending = false; renderScatter(); });
+}
+
+function markDirty(...flags) {
+  for (const f of flags) dirty[f] = true;
+  runEffects();
+}
+
+// True when there is enough source material to compute waypoints for the current mode.
+// Draw mode needs a drawn path; snap/code mode can use pins (≥1) or a drawn path (≥2 pts).
+function hasWaypointSource() {
+  if (pathMode === 'draw') return userTrajectory.length >= 2;
+  return (canvasMode === 'pins' && pinPoints.length >= 1) || userTrajectory.length >= 2;
+}
+
+function runEffects() {
+  if (dirty.COORDS && currentEmbeds) {
+    dirty.COORDS = false;
+    triggerUMAP();
+  }
+  if (dirty.WAYPOINTS && coordsA && coordsB && hasWaypointSource()) {
+    dirty.WAYPOINTS = false;
+    computeWaypoints();
+    dirty.AUDIO  = true;
+    dirty.RENDER = true;
+  }
+  if (dirty.AUDIO && currentEmbeds && coordsA && coordsB
+      && hasWaypointSource()
+      && (genPlaySeq !== null || pathMode === 'draw')) {
+    dirty.AUDIO = false;
+    playTrajectory();
+  }
+  if (dirty.RENDER) {
+    dirty.RENDER = false;
+    scheduleRender();
+  }
 }
 
 // ── Toggle group helper ───────────────────────────────────────────────────────
@@ -400,7 +503,7 @@ function resizeCanvas() {
   const W = wrap.clientWidth, H = wrap.clientHeight;
   umapCanvas.width  = W * dpr;
   umapCanvas.height = H * dpr;
-  renderScatter();
+  scheduleRender();
 }
 new ResizeObserver(resizeCanvas).observe(umapCanvas.parentElement);
 
@@ -435,8 +538,18 @@ function onUMAPWorkerMsg({ data: msg }) {
     for (let i = 0; i < T_A; i++) coordsA.push([result[i * 2], result[i * 2 + 1]]);
     for (let i = 0; i < T_B; i++) coordsB.push([result[(T_A + i) * 2], result[(T_A + i) * 2 + 1]]);
     progWrap.style.display = 'none';
-    setStatus(`Done — ${T_A} frames (A) · ${T_B} frames (B)`);
-    renderScatter();
+
+    // Draw trajectories are defined in UMAP space and are now invalid.
+    // Pin trajectories store {src,idx} and auto-remap since coordsA/B just updated.
+    const hadDrawTraj = rawDrawPoints.length >= 2;
+    rawDrawPoints = [];
+    userTrajectory = pinPoints.length >= 2 ? resamplePath(pinCoords(), 300) : [];
+    if (hadDrawTraj && pinPoints.length < 2) {
+      setStatus(`UMAP updated — draw trajectory cleared. Redraw to regenerate.`);
+    } else {
+      setStatus(`Done — ${T_A} frames (A) · ${T_B} frames (B)`);
+    }
+    markDirty('WAYPOINTS', 'AUDIO', 'RENDER');
 
   } else if (msg.type === 'umap_error') {
     progWrap.style.display = 'none';
@@ -489,7 +602,7 @@ function onWorkerMsg(e) {
   } else if (msg.type === 'embeddings_exp6') {
     currentEmbeds = msg;
     populateLevelSelect(msg.codesDimsA[1]);
-    triggerUMAP();
+    markDirty('COORDS', 'WAYPOINTS', 'AUDIO', 'RENDER');
 
   } else if (msg.type === 'error') {
     progWrap.style.display = 'none';
@@ -519,7 +632,7 @@ async function startEncode() {
   } catch (err) { setStatus(err.message, true); return; }
 
   coordsA = coordsB = null;
-  renderScatter();
+  scheduleRender();
 
   rawAudioA = audioA;
   rawAudioB = audioB;
@@ -573,7 +686,7 @@ function populateLevelSelect(K) {
 
 levelSelect.addEventListener('change', () => {
   umapLevel = parseInt(levelSelect.value);
-  triggerUMAP();
+  markDirty('COORDS', 'WAYPOINTS', 'AUDIO', 'RENDER');
 });
 
 // ── UMAP mode toggles ─────────────────────────────────────────────────────────
@@ -584,7 +697,7 @@ togCombined.addEventListener('click', () => {
   togCombined.classList.add('active');
   togPerLevel.classList.remove('active');
   levelWrap.style.display = 'none';
-  triggerUMAP();
+  markDirty('COORDS', 'WAYPOINTS', 'AUDIO', 'RENDER');
 });
 
 togPerLevel.addEventListener('click', () => {
@@ -593,23 +706,25 @@ togPerLevel.addEventListener('click', () => {
   togPerLevel.classList.add('active');
   togCombined.classList.remove('active');
   levelWrap.style.display = '';
-  triggerUMAP();
+  markDirty('COORDS', 'WAYPOINTS', 'AUDIO', 'RENDER');
 });
 
 createToggleGroup([
   { el: document.getElementById('togPreVQ'),  value: 'pre_vq' },
   { el: document.getElementById('togPostVQ'), value: 'post_vq' },
-], v => { embSpace = v; triggerUMAP(); });
+], v => { embSpace = v; markDirty('COORDS', 'WAYPOINTS', 'AUDIO', 'RENDER'); });
 
 createToggleGroup([
   { el: document.getElementById('togEmbOnly'),  value: 'emb' },
   { el: document.getElementById('togEmbDelta'), value: 'emb+delta' },
   { el: document.getElementById('togDeltaOnly'), value: 'delta' },
-], v => { embMode = v; triggerUMAP(); });
+], v => { embMode = v; markDirty('COORDS', 'WAYPOINTS', 'AUDIO', 'RENDER'); });
 
-[nNeighborsEl, minDistEl, umapWindowEl].forEach(el => el.addEventListener('change', triggerUMAP));
+[nNeighborsEl, minDistEl, umapWindowEl].forEach(el =>
+  el.addEventListener('change', () => markDirty('COORDS', 'WAYPOINTS', 'AUDIO', 'RENDER'))
+);
 
-document.getElementById('chkTrail').addEventListener('change', renderScatter);
+document.getElementById('chkTrail').addEventListener('change', scheduleRender);
 
 // ── Trajectory mode toggles ───────────────────────────────────────────────────
 
@@ -673,7 +788,7 @@ const setPathMode = mode => {
   if (mode === 'code') applyCodeParamUI();
   if (mode === 'snap') applySnapParamUI();
   codePathFrames = null; snapFrames = null; snapPlayFrames = null;
-  renderScatter(); autoRegenerate();
+  autoRegenerate();
 };
 document.getElementById('togDrawMode').addEventListener('click', () => setPathMode('draw'));
 document.getElementById('togCodeMode').addEventListener('click', () => setPathMode('code'));
@@ -718,7 +833,7 @@ document.getElementById('clearTraj').addEventListener('click', () => {
   snapFrames = null; snapPlayFrames = null; genPlaySeq = null;
   trajAnchorPos = -1;
   updatePinSeqBar();
-  renderScatter(); setStatus('Trajectory cleared.');
+  scheduleRender(); setStatus('Trajectory cleared.');
 });
 
 // ── Post-process toggles ──────────────────────────────────────────────────────
@@ -927,19 +1042,19 @@ function updateNotchFilters() {
 // ── Waveform players ──────────────────────────────────────────────────────────
 
 const playerA = makeWavePlayer('waveCanvA', '#c87800', { getAudioCtx, getMasterDest }, pos => {
-  if (pos < 0 || !coordsA) { waveHighlight = null; renderScatter(); return; }
+  if (pos < 0 || !coordsA) { waveHighlight = null; scheduleRender(); return; }
   const i = Math.min(Math.floor(pos * coordsA.length), coordsA.length - 1);
   waveHighlight = { src: 'A', idx: i };
   playerB.setCursor(-1);
-  renderScatter();
+  scheduleRender();
 });
 
 const playerB = makeWavePlayer('waveCanvB', '#2090c0', { getAudioCtx, getMasterDest }, pos => {
-  if (pos < 0 || !coordsB) { waveHighlight = null; renderScatter(); return; }
+  if (pos < 0 || !coordsB) { waveHighlight = null; scheduleRender(); return; }
   const i = Math.min(Math.floor(pos * coordsB.length), coordsB.length - 1);
   waveHighlight = { src: 'B', idx: i };
   playerA.setCursor(-1);
-  renderScatter();
+  scheduleRender();
 });
 
 const playerG = makeWavePlayer('waveCanvG', '#44bb88', { getAudioCtx, getMasterDest }, pos => {
@@ -948,7 +1063,7 @@ const playerG = makeWavePlayer('waveCanvG', '#44bb88', { getAudioCtx, getMasterD
   if (pos < 0 || !genPlaySeq) {
     waveHighlight = null;
     playerA.setCursor(-1); playerB.setCursor(-1);
-    renderScatter(); return;
+    scheduleRender(); return;
   }
   const i = Math.min(Math.floor(pos * (genPlaySeq.length - 1)), genPlaySeq.length - 1);
   const frame = genPlaySeq[i];
@@ -958,7 +1073,7 @@ const playerG = makeWavePlayer('waveCanvG', '#44bb88', { getAudioCtx, getMasterD
   const srcPos = frame.idx / srcLen;
   if (frame.src === 'A') { playerA.setCursor(srcPos); playerB.setCursor(-1); }
   else                   { playerB.setCursor(srcPos); playerA.setCursor(-1); }
-  renderScatter();
+  scheduleRender();
 });
 
 playerA.setPlayBtn(document.getElementById('wbPlayA'));
@@ -1021,10 +1136,9 @@ function updatePinSeqBar() {
       const [moved] = pinPoints.splice(pinSeqDragSrc, 1);
       pinPoints.splice(dstIdx, 0, moved);
       pinSeqDragSrc = -1;
-      userTrajectory = pinPoints.length >= 2 ? resamplePath(pinPoints, 300) : [];
+      userTrajectory = pinPoints.length >= 2 ? resamplePath(pinCoords(), 300) : [];
       updatePinSeqBar();
-      renderScatter();
-      if (userTrajectory.length >= 2) autoRegenerate();
+      autoRegenerate();
     });
     pinSeqBar.appendChild(chip);
   });
@@ -1042,10 +1156,9 @@ function setCanvasMode(mode) {
   updatePinSeqBar();
   // Sync trajectory source to new mode and regenerate
   if (mode === 'draw')      userTrajectory = rawDrawPoints.length >= 2 ? resamplePath(rawDrawPoints, 300) : [];
-  else if (mode === 'pins') userTrajectory = pinPoints.length    >= 2 ? resamplePath(pinPoints, 300)    : [];
+  else if (mode === 'pins') userTrajectory = pinPoints.length    >= 2 ? resamplePath(pinCoords(), 300)    : [];
   if (userTrajectory.length < 2) { snapFrames = null; codePathFrames = null; snapPlayFrames = null; }
-  renderScatter();
-  if (userTrajectory.length >= 2) autoRegenerate();
+  autoRegenerate();
 }
 
 togExplore.addEventListener('click', () => setCanvasMode('explore'));
@@ -1118,14 +1231,14 @@ umapCanvas.addEventListener('wheel', e => {
   } else {
     applyZoom(cx, cy, Math.exp(-e.deltaY * 0.003));
   }
-  renderScatter();
+  scheduleRender();
 }, { passive: false });
 
 window.addEventListener('keydown', e => {
   if (e.target !== document.body && e.target !== umapCanvas) return;
-  if (e.key === '+' || e.key === '=') { applyZoom(umapCanvas.width/2, umapCanvas.height/2, 1.2); renderScatter(); }
-  if (e.key === '-')                  { applyZoom(umapCanvas.width/2, umapCanvas.height/2, 1/1.2); renderScatter(); }
-  if (e.key === '0')                  { viewZoom = 1; viewPanX = 0; viewPanY = 0; renderScatter(); }
+  if (e.key === '+' || e.key === '=') { applyZoom(umapCanvas.width/2, umapCanvas.height/2, 1.2); scheduleRender(); }
+  if (e.key === '-')                  { applyZoom(umapCanvas.width/2, umapCanvas.height/2, 1/1.2); scheduleRender(); }
+  if (e.key === '0')                  { viewZoom = 1; viewPanX = 0; viewPanY = 0; scheduleRender(); }
 });
 
 // ── Drag + draw event handlers ────────────────────────────────────────────────
@@ -1144,14 +1257,15 @@ umapCanvas.addEventListener('mousedown', e => {
     rawDrawPoints = [canvasToUmap(e)];
     userTrajectory = rawDrawPoints.slice();
     trajAnchorPos = -1;
-    renderScatter();
+    scheduleRender();
     return;
   }
   if (canvasMode === 'pins' && coordsA && coordsB) {
     const rect  = umapCanvas.getBoundingClientRect();
     const physX = (e.clientX - rect.left) * dpr;
     const physY = (e.clientY - rect.top)  * dpr;
-    const hitIdx = pinPoints.findIndex(([ux, uy]) => {
+    const hitIdx = pinPoints.findIndex(p => {
+      const [ux, uy] = (p.src === 'A' ? coordsA : coordsB)[p.idx];
       const [cx, cy] = umapToCanvas(ux, uy);
       return (cx - physX) ** 2 + (cy - physY) ** 2 < (14 * dpr) ** 2;
     });
@@ -1174,18 +1288,17 @@ umapCanvas.addEventListener('mousemove', e => {
     if (!coordsA || !coordsB) return;
     const [umapX, umapY] = canvasToUmap(e);
     const { src, idx } = findNearestUmapPoint(umapX, umapY, coordsA, coordsB);
-    const coords = src === 'A' ? coordsA : coordsB;
-    pinPoints[pinDragIdx] = coords[idx];
-    userTrajectory = pinPoints.length >= 2 ? resamplePath(pinPoints, 300) : [];
+    pinPoints[pinDragIdx] = { src, idx };
+    userTrajectory = pinPoints.length >= 2 ? resamplePath(pinCoords(), 300) : [];
     updatePinSeqBar();
-    renderScatter();
+    scheduleRender();
     return;
   }
   if (isShiftDragging) {
     const [cx, cy] = canvasToUmap(e);
     const dx = cx - shiftDragStart[0], dy = cy - shiftDragStart[1];
     userTrajectory = shiftDragBaseTraj.map(([x, y]) => [x + dx, y + dy]);
-    renderScatter();
+    scheduleRender();
     return;
   }
   if (isDrawing) {
@@ -1196,7 +1309,7 @@ umapCanvas.addEventListener('mousemove', e => {
     if (dx*dx + dy*dy < (2 * dpr) ** 2) return;
     rawDrawPoints.push(pt);
     userTrajectory = rawDrawPoints;
-    renderScatter();
+    scheduleRender();
     return;
   }
   if (isPanDragging && panDragLast) {
@@ -1206,7 +1319,7 @@ umapCanvas.addEventListener('mousemove', e => {
       panDragMoved = true;
       umapCanvas.style.cursor = 'grab';
     }
-    if (panDragMoved) { viewPanX += dx; viewPanY += dy; renderScatter(); }
+    if (panDragMoved) { viewPanX += dx; viewPanY += dy; scheduleRender(); }
     panDragLast = { x: e.clientX, y: e.clientY };
   }
 });
@@ -1228,15 +1341,14 @@ const finishPinDrag = () => {
   if (!isPinDragging) return;
   isPinDragging = false; pinDragIdx = -1;
   umapCanvas.style.cursor = 'cell';
-  if (userTrajectory.length >= 2) autoRegenerate();
+  autoRegenerate();
 };
 
 const finishDraw = () => {
   if (!isDrawing) return;
   isDrawing = false;
   userTrajectory = rawDrawPoints.length >= 2 ? resamplePath(rawDrawPoints, 300) : [];
-  renderScatter();
-  if (userTrajectory.length >= 2) autoRegenerate();
+  autoRegenerate();
 };
 
 umapCanvas.addEventListener('mouseup',    () => { finishPanDrag(); finishShiftDrag(); finishDraw(); finishPinDrag(); });
@@ -1251,7 +1363,8 @@ umapCanvas.addEventListener('dblclick', e => {
   const physY  = (e.clientY - rect.top)  * dpr;
   const hitR2  = (14 * dpr) ** 2;
 
-  const hitIdx = pinPoints.findIndex(([ux, uy]) => {
+  const hitIdx = pinPoints.findIndex(p => {
+    const [ux, uy] = (p.src === 'A' ? coordsA : coordsB)[p.idx];
     const [cx, cy] = umapToCanvas(ux, uy);
     return (cx - physX) ** 2 + (cy - physY) ** 2 < hitR2;
   });
@@ -1260,29 +1373,28 @@ umapCanvas.addEventListener('dblclick', e => {
     pinPoints.splice(hitIdx, 1);
   } else {
     const SNAP_R2 = (18 * dpr) ** 2;
-    let bestDist2 = Infinity, bestPt = null;
-    for (const [x, y] of coordsA) {
-      const [cx, cy] = umapToCanvas(x, y);
+    let bestDist2 = Infinity, bestSrc = null, bestIdx = -1;
+    for (let i = 0; i < coordsA.length; i++) {
+      const [cx, cy] = umapToCanvas(coordsA[i][0], coordsA[i][1]);
       const d2 = (cx - physX) ** 2 + (cy - physY) ** 2;
-      if (d2 < bestDist2) { bestDist2 = d2; bestPt = [x, y]; }
+      if (d2 < bestDist2) { bestDist2 = d2; bestSrc = 'A'; bestIdx = i; }
     }
-    for (const [x, y] of coordsB) {
-      const [cx, cy] = umapToCanvas(x, y);
+    for (let i = 0; i < coordsB.length; i++) {
+      const [cx, cy] = umapToCanvas(coordsB[i][0], coordsB[i][1]);
       const d2 = (cx - physX) ** 2 + (cy - physY) ** 2;
-      if (d2 < bestDist2) { bestDist2 = d2; bestPt = [x, y]; }
+      if (d2 < bestDist2) { bestDist2 = d2; bestSrc = 'B'; bestIdx = i; }
     }
-    if (!bestPt || bestDist2 > SNAP_R2) {
+    if (bestIdx < 0 || bestDist2 > SNAP_R2) {
       setStatus('Double-click closer to a UMAP point to add a pin.');
       return;
     }
-    pinPoints.push(bestPt);
+    pinPoints.push({ src: bestSrc, idx: bestIdx });
   }
 
-  userTrajectory = pinPoints.length >= 2 ? resamplePath(pinPoints, 300) : [];
+  userTrajectory = pinPoints.length >= 2 ? resamplePath(pinCoords(), 300) : [];
   updatePinSeqBar();
-  renderScatter();
-  if (userTrajectory.length >= 2) autoRegenerate();
-  else setStatus(pinPoints.length === 1 ? 'Pin added. Double-click near another point to add more.' : '');
+  autoRegenerate();
+  if (userTrajectory.length < 2) setStatus(pinPoints.length === 1 ? 'Pin added. Double-click near another point to add more.' : '');
 });
 
 // ── Click to play (explore mode) ──────────────────────────────────────────────
@@ -1302,7 +1414,7 @@ umapCanvas.addEventListener('click', async e => {
   const srcPos = bestIdx / srcLen;
   if (bestSrc === 'A') { playerA.setCursor(srcPos); playerB.setCursor(-1); }
   else                 { playerB.setCursor(srcPos); playerA.setCursor(-1); }
-  renderScatter();
+  scheduleRender();
 
   const T = bestSrc === 'A' ? currentEmbeds.codesDimsA[2] : currentEmbeds.codesDimsB[2];
   const framesPerSec = (bestSrc === 'A' ? coordsA.length : coordsB.length) / srcWidget.getDuration();
@@ -1367,14 +1479,14 @@ function animateTrajAnchor() {
   const elapsed  = audioCtx.currentTime - trajPlayStartTime;
   const duration = trajCurrentDuration || parseFloat(trajDurationEl.value) || 4;
   trajAnchorPos  = Math.min(elapsed / duration, 1);
-  renderScatter();
+  scheduleRender();
   if (trajAnchorPos < 1) {
     requestAnimationFrame(animateTrajAnchor);
   } else if (trajLooping && trajAudioBuf) {
     startTrajPlayback(trajAudioBuf, mp.getSampleRate());
   } else {
     stopTrajPlayback();
-    renderScatter();
+    scheduleRender();
     setStatus('Trajectory playback done.');
   }
 }
@@ -1391,31 +1503,83 @@ function snapCtxArg() {
 
 function snapWaypointArgs() {
   return {
-    canvasMode, pinPoints, coordsA, coordsB,
+    canvasMode, pinPoints: pinCoords(), coordsA, coordsB,
     userTrajectory, pathMode, snapMode, snapDurVal, codeSecVal,
     trajDuration: parseFloat(trajDurationEl.value) || 4,
     framesPerSec: coordsA ? coordsA.length / srcWidget.getDuration() : 1,
   };
 }
 
+function computeWaypoints() {
+  if (!coordsA || !coordsB) return;
+  const fps = coordsA.length / srcWidget.getDuration();
+
+  if (pathMode === 'code') {
+    const N_total = codeDurMode === 'frames'
+      ? Math.max(2, codeKVal)
+      : Math.max(2, Math.round(codeSecVal * fps));
+
+    const fwdWPs = computeSnapWaypoints(snapWaypointArgs());
+    if (!fwdWPs.length) return;
+    const bwdWPs = [...fwdWPs].reverse();
+
+    // Build ordered waypoint list; pingpong = fwd + bwd (turnaround repeated at junction)
+    const orderedWPs = trajDir === 'forward'  ? fwdWPs
+                     : trajDir === 'backward' ? bwdWPs
+                     : [...fwdWPs, ...bwdWPs];   // pingpong: 2× length → K halves automatically
+
+    // K frames per waypoint; dividing N_total by list length keeps total duration constant
+    const K = Math.max(1, Math.round(N_total / orderedWPs.length));
+    const sampledWPs = orderedWPs.flatMap(wp => Array.from({ length: K }, () => wp));
+
+    codePathFrames = sampledWPs;
+    genPlaySeq     = sampledWPs;
+    setCodeSeqInfo(orderedWPs);
+
+  } else if (pathMode === 'snap') {
+    const fwdWPs = computeSnapWaypoints(snapWaypointArgs());
+    if (!fwdWPs.length) return;
+    const bwdWPs = [...fwdWPs].reverse();
+
+    snapFrames = trajDir === 'backward' ? bwdWPs
+               : trajDir === 'pingpong' ? [...fwdWPs, ...bwdWPs]
+               : fwdWPs;
+
+    const is48k   = mp.getModelHz() === '48k';
+    const K_post  = is48k ? Math.max(2, Math.round(fps * 0.03)) : 0;
+    const N_total = Math.max(2, Math.round(snapDurVal * fps));
+
+    // kOverride lets pingpong halve the per-waypoint context to keep total duration constant
+    const buildSeq = (wps, N_target = N_total, kOverride = snapKVal) => snapMode === 'k_frames'
+      ? buildSnapSequence(wps, kOverride, K_post, ctxSwapRange, coordsA, coordsB, currentEmbeds)
+      : buildSnapSequenceFixed(wps, Math.max(wps.length, N_target), K_post, ctxSwapRange, coordsA, coordsB, currentEmbeds, snapCtxArg());
+
+    let seq;
+    if (trajDir === 'forward')       seq = buildSeq(fwdWPs);
+    else if (trajDir === 'backward') seq = buildSeq(bwdWPs);
+    else {
+      // Pingpong: split total duration evenly across fwd and bwd halves
+      const half  = Math.floor(N_total / 2);
+      const kHalf = Math.max(1, Math.floor(snapKVal / 2));
+      seq = [...buildSeq(fwdWPs, half, kHalf), ...buildSeq(bwdWPs, half, kHalf)];
+    }
+    snapPlayFrames = seq;
+    genPlaySeq     = seq;
+    setSeqInfo(snapFrames);
+  }
+  // draw mode: no discrete waypoints — embeddings are interpolated at playback time
+  if (pathMode === 'draw') seqInfo.textContent = 'interpolated points along path';
+}
+
 function autoRegenerate() {
-  if ((pathMode === 'snap' || pathMode === 'code') && coordsA && coordsB) {
-    const wps    = computeSnapWaypoints(snapWaypointArgs());
-    const vizWPs = trajDir === 'backward' ? [...wps].reverse() : wps;
-    if (pathMode === 'snap') snapFrames = vizWPs;
-    else codePathFrames = vizWPs;
-    renderScatter();
+  if (userTrajectory.length >= 2 && (!currentEmbeds || !coordsA || !coordsB)) {
+    setStatus('Path drawn. Encode sources and run UMAP to play.');
   }
-  if (userTrajectory.length < 2 || !currentEmbeds || !coordsA || !coordsB) {
-    if (userTrajectory.length >= 2) setStatus('Path drawn. Encode sources and run UMAP to play.');
-    return;
-  }
-  trajPlayStartTime = null;
-  playTrajectory();
+  markDirty('WAYPOINTS', 'AUDIO', 'RENDER');
 }
 
 async function playTrajectory() {
-  if (!userTrajectory || userTrajectory.length < 2) { setStatus('Draw a trajectory first.', true); return; }
+  if (!hasWaypointSource()) { setStatus('Add pins or draw a path first.', true); return; }
   if (!currentEmbeds)                                { setStatus('Encode both sources first.', true); return; }
   if (!coordsA || !coordsB)                          { setStatus('Run UMAP first.', true); return; }
 
@@ -1425,48 +1589,20 @@ async function playTrajectory() {
 
   // ── Code-path mode ────────────────────────────────────────────────────────
   if (pathMode === 'code') {
-    const N_pass = codeDurMode === 'frames'
-      ? Math.max(2, codeKVal)
-      : Math.max(2, Math.round(codeSecVal * fps));
-
-    const waypoints = computeSnapWaypoints(snapWaypointArgs());
-    if (!waypoints.length) { setStatus('Draw a path first.', true); return; }
-    const wLen = waypoints.length;
-
-    const resample = (fracFn, len = N_pass) => Array.from({ length: len }, (_, i) => {
-      const wi = Math.min(Math.floor(fracFn(i, len) * (wLen - 1)), wLen - 1);
-      return waypoints[wi];
-    });
-
-    let sampledWPs;
-    if (trajDir === 'forward')        sampledWPs = resample((i, N) => i / (N - 1));
-    else if (trajDir === 'backward')  sampledWPs = resample((i, N) => 1 - i / (N - 1));
-    else /* pingpong — each half gets half the budget */ {
-      const half = Math.ceil(N_pass / 2);
-      sampledWPs = [
-        ...resample((i, N) => i / (N - 1), half),
-        ...resample((i, N) => 1 - i / (N - 1), half),
-      ];
-    }
-
-    codePathFrames = sampledWPs;
-    genPlaySeq = sampledWPs;
-    renderScatter();
-
-    const N       = sampledWPs.length;
+    if (!genPlaySeq || !genPlaySeq.length) { setStatus('Draw a path first.', true); return; }
+    const N       = genPlaySeq.length;
     const blended = new Float32Array(D * N);
     for (let i = 0; i < N; i++) {
-      const { src, idx } = sampledWPs[i];
+      const { src, idx } = genPlaySeq[i];
       const emb = src === 'A' ? currentEmbeds.embQuantA : currentEmbeds.embQuantB;
       const T   = src === 'A' ? T_A : T_B;
       for (let d = 0; d < D; d++) blended[d * N + i] = emb[d * T + idx];
     }
-
     getAudioCtx();
     playJobId = ++jobSeq;
     const dirLabel = { forward: 'fwd', backward: 'bwd', pingpong: 'ping' }[trajDir];
     setStatus(`Decoding code/${dirLabel} (${N} frames, ${(N / fps).toFixed(1)} s)…`);
-    const codeScales = makeFrameScales(sampledWPs, currentEmbeds);
+    const codeScales = makeFrameScales(genPlaySeq, currentEmbeds);
     const codeXfers  = [blended.buffer];
     if (codeScales) codeXfers.push(codeScales.buffer);
     worker.postMessage({
@@ -1480,33 +1616,9 @@ async function playTrajectory() {
 
   // ── Snap mode ─────────────────────────────────────────────────────────────
   if (pathMode === 'snap') {
-    const fwdWPs = computeSnapWaypoints(snapWaypointArgs());
-    if (!fwdWPs.length) { setStatus('Draw a path first.', true); return; }
-    const bwdWPs = [...fwdWPs].reverse();
-
-    snapFrames = trajDir === 'backward' ? bwdWPs : fwdWPs;
-
-    const is48k  = mp.getModelHz() === '48k';
-    const K_post = is48k ? Math.max(2, Math.round(fps * 0.03)) : 0;
-
-    const N_total  = Math.max(2, Math.round(snapDurVal * fps));
-    const buildSeq = (wps, N_target = N_total) => snapMode === 'k_frames'
-      ? buildSnapSequence(wps, snapKVal, K_post, ctxSwapRange, coordsA, coordsB, currentEmbeds)
-      : buildSnapSequenceFixed(wps, Math.max(wps.length, N_target), K_post, ctxSwapRange, coordsA, coordsB, currentEmbeds, snapCtxArg());
-
-    let seq;
-    if (trajDir === 'forward')       seq = buildSeq(fwdWPs);
-    else if (trajDir === 'backward') seq = buildSeq(bwdWPs);
-    else /* pingpong — each half gets half the budget */ {
-      const half = Math.ceil(N_total / 2);
-      seq = [...buildSeq(fwdWPs, half), ...buildSeq(bwdWPs, half)];
-    }
-
-    snapPlayFrames = seq;
-    genPlaySeq = seq;
-    renderScatter();
-
-    const N = seq.length;
+    if (!genPlaySeq || !genPlaySeq.length) { setStatus('Draw a path first.', true); return; }
+    const seq     = genPlaySeq;
+    const N       = seq.length;
     const blended = new Float32Array(D * N);
     for (let i = 0; i < N; i++) {
       const { src, idx } = seq[i];

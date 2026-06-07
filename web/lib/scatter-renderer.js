@@ -46,7 +46,7 @@ export function renderScatter(canvas, dpr, state) {
   const lastTransform = { xMin, yMin, scale, offX, offY, H };
 
   const {
-    pinPoints, selectedPoint, waveHighlight, userTrajectory,
+    pinPoints, highlightedPinIdx = -1, selectedPoint, waveHighlight, userTrajectory,
     pathMode, snapFrames, codePathFrames, trajAnchorPos,
     snapPlayFrames, trajDir, showTrail, ctxSwapRange,
     snapMode, snapKVal, snapDurVal, framesPerSec, canvasMode,
@@ -67,6 +67,8 @@ export function renderScatter(canvas, dpr, state) {
 
   function drawCirclesEmpty(coords, color) {
     const r = 2.5 * dpr;
+    ctx.save();
+    ctx.globalAlpha = 0.35;
     ctx.strokeStyle = color;
     ctx.lineWidth   = 1 * dpr;
     for (const [x, y] of coords) {
@@ -74,10 +76,13 @@ export function renderScatter(canvas, dpr, state) {
       ctx.arc(toX(x), toY(y), r, 0, 2 * Math.PI);
       ctx.stroke();
     }
+    ctx.restore();
   }
 
   function drawTrianglesEmpty(coords, color) {
     const r = 3 * dpr;
+    ctx.save();
+    ctx.globalAlpha = 0.35;
     ctx.strokeStyle = color;
     ctx.lineWidth   = 1 * dpr;
     for (const [x, y] of coords) {
@@ -89,17 +94,21 @@ export function renderScatter(canvas, dpr, state) {
       ctx.closePath();
       ctx.stroke();
     }
+    ctx.restore();
   }
 
   drawTrail(coordsA, '#c87800');
   drawTrail(coordsB, '#2090c0');
 
-  // Pins drawn BEFORE data points so A/B markers stay on top
-  if (pinPoints.length > 0) {
+  drawCirclesEmpty(coordsA,   '#c87800');
+  drawTrianglesEmpty(coordsB, '#2090c0');
+
+  // Pins drawn AFTER data points so they sit on the highest layer
+  if (canvasMode === 'pins' && pinPoints.length > 0) {
     const r = 8 * dpr;
     if (pinPoints.length >= 2) {
       ctx.save();
-      ctx.strokeStyle = '#ffd70055';
+      ctx.strokeStyle = '#aaaaaa44';
       ctx.lineWidth   = 1 * dpr;
       ctx.beginPath();
       ctx.moveTo(toX(pinPoints[0][0]), toY(pinPoints[0][1]));
@@ -113,20 +122,18 @@ export function renderScatter(canvas, dpr, state) {
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     for (let i = 0; i < pinPoints.length; i++) {
+      const highlighted = i === highlightedPinIdx;
       const cx = toX(pinPoints[i][0]), cy = toY(pinPoints[i][1]);
-      ctx.fillStyle   = '#ffd700';
-      ctx.strokeStyle = '#000000';
+      ctx.fillStyle   = highlighted ? '#ffd700' : '#aaaaaa';
+      ctx.strokeStyle = '#333333';
       ctx.lineWidth   = 1 * dpr;
-      ctx.beginPath(); ctx.arc(cx, cy, r, 0, 2 * Math.PI);
+      ctx.beginPath(); ctx.rect(cx - r, cy - r, 2 * r, 2 * r);
       ctx.fill(); ctx.stroke();
       ctx.fillStyle = '#000000';
       ctx.fillText(String(i + 1), cx, cy);
     }
     ctx.restore();
   }
-
-  drawCirclesEmpty(coordsA,   '#c87800');
-  drawTrianglesEmpty(coordsB, '#2090c0');
 
   if (selectedPoint) {
     const coords = selectedPoint.src === 'A' ? coordsA : coordsB;
@@ -246,13 +253,15 @@ export function renderScatter(canvas, dpr, state) {
       ctx.beginPath(); ctx.arc(toX(x), toY(y), 3 * dpr, 0, 2 * Math.PI); ctx.fill();
     }
 
-    ctx.globalAlpha = 1;
-    const [sx, sy] = ptOf(snapFrames[0]);
-    const [ex, ey] = ptOf(snapFrames[snapFrames.length - 1]);
-    ctx.fillStyle = '#44ff88';
-    ctx.beginPath(); ctx.arc(toX(sx), toY(sy), 4 * dpr, 0, 2 * Math.PI); ctx.fill();
-    ctx.fillStyle = '#ff4466';
-    ctx.beginPath(); ctx.arc(toX(ex), toY(ey), 4 * dpr, 0, 2 * Math.PI); ctx.fill();
+    if (canvasMode !== 'pins') {
+      ctx.globalAlpha = 1;
+      const [sx, sy] = ptOf(snapFrames[0]);
+      const [ex, ey] = ptOf(snapFrames[snapFrames.length - 1]);
+      ctx.fillStyle = '#44ff88';
+      ctx.beginPath(); ctx.arc(toX(sx), toY(sy), 4 * dpr, 0, 2 * Math.PI); ctx.fill();
+      ctx.fillStyle = '#ff4466';
+      ctx.beginPath(); ctx.arc(toX(ex), toY(ey), 4 * dpr, 0, 2 * Math.PI); ctx.fill();
+    }
     ctx.restore();
   }
 
@@ -275,13 +284,15 @@ export function renderScatter(canvas, dpr, state) {
       const [x, y] = ptOf(f);
       ctx.beginPath(); ctx.arc(toX(x), toY(y), 2.5 * dpr, 0, 2 * Math.PI); ctx.fill();
     }
-    ctx.globalAlpha = 1;
-    const [sx, sy] = ptOf(codePathFrames[0]);
-    const [ex, ey] = ptOf(codePathFrames[codePathFrames.length - 1]);
-    ctx.fillStyle = '#44ff88';
-    ctx.beginPath(); ctx.arc(toX(sx), toY(sy), 4 * dpr, 0, 2 * Math.PI); ctx.fill();
-    ctx.fillStyle = '#ff4466';
-    ctx.beginPath(); ctx.arc(toX(ex), toY(ey), 4 * dpr, 0, 2 * Math.PI); ctx.fill();
+    if (canvasMode !== 'pins') {
+      ctx.globalAlpha = 1;
+      const [sx, sy] = ptOf(codePathFrames[0]);
+      const [ex, ey] = ptOf(codePathFrames[codePathFrames.length - 1]);
+      ctx.fillStyle = '#44ff88';
+      ctx.beginPath(); ctx.arc(toX(sx), toY(sy), 4 * dpr, 0, 2 * Math.PI); ctx.fill();
+      ctx.fillStyle = '#ff4466';
+      ctx.beginPath(); ctx.arc(toX(ex), toY(ey), 4 * dpr, 0, 2 * Math.PI); ctx.fill();
+    }
     ctx.restore();
   }
 
