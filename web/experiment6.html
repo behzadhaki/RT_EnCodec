@@ -1029,6 +1029,39 @@ function appendDeltas(frames) {
   return out;
 }
 
+// Per-dimension z-score normalisation across all frames from both sources.
+// Computed jointly so A and B frames are in the same coordinate space.
+// Why: in Emb+Δ mode the embedding dims (e.g. ±2–5) dwarf the delta dims
+// (e.g. ±0.02–0.1) so UMAP distances are dominated by the emb half.
+// Same issue with multi-level VQ concatenation or history window mixing.
+// Normalising each dimension to zero mean / unit variance gives every
+// feature equal influence on pairwise distances.
+// Dimensions with zero variance (constant across all frames, e.g. a dead
+// codebook entry) get std=1 so they contribute nothing — correct behaviour.
+function zscoreFrames(framesA, framesB) {
+  const D = framesA[0].length;
+  const N = framesA.length + framesB.length;
+  const mean = new Float64Array(D);
+  const std  = new Float64Array(D);
+
+  for (const frames of [framesA, framesB])
+    for (const f of frames)
+      for (let d = 0; d < D; d++) mean[d] += f[d];
+  for (let d = 0; d < D; d++) mean[d] /= N;
+
+  for (const frames of [framesA, framesB])
+    for (const f of frames)
+      for (let d = 0; d < D; d++) { const e = f[d] - mean[d]; std[d] += e * e; }
+  for (let d = 0; d < D; d++) std[d] = Math.sqrt(std[d] / N) || 1;  // std=0 → no-op
+
+  const apply = frames => frames.map(f => {
+    const out = new Float32Array(D);
+    for (let d = 0; d < D; d++) out[d] = (f[d] - mean[d]) / std[d];
+    return out;
+  });
+  return [apply(framesA), apply(framesB)];
+}
+
 function embQuantToFrames(embQuant, dims) {
   const [, D, T] = dims;
   const frames = [];
@@ -1096,6 +1129,10 @@ async function runUMAP() {
     framesA = applyWindowWithAnchor(rawA, framesA, K);
     framesB = applyWindowWithAnchor(rawB, framesB, K);
   }
+
+  // Normalise after all feature construction so every dimension contributes
+  // equally to UMAP distances regardless of raw magnitude differences.
+  [framesA, framesB] = zscoreFrames(framesA, framesB);
 
   const T_A = framesA.length;
   const T_B = framesB.length;
