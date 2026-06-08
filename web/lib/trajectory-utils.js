@@ -171,10 +171,10 @@ export function computeSnapWaypoints({
       const last = raw[raw.length - 1];
       if (!last || last.src !== bestSrc || last.idx !== bestIdx) raw.push({ src: bestSrc, idx: bestIdx });
     }
-    return raw;
+    return { wps: raw, segBoundaries: [] };
   }
 
-  if (!userTrajectory || userTrajectory.length < 2) return [];
+  if (!userTrajectory || userTrajectory.length < 2) return { wps: [], segBoundaries: [] };
 
   const dur = pathMode === 'snap' ? snapDurVal
             : pathMode === 'code' ? codeSecVal

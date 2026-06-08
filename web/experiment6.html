@@ -36,6 +36,20 @@
               transition: background 0.15s, border-color 0.15s; }
 .umap-dot.ready  { background: #666; border-color: #888; }
 .umap-dot.active { background: var(--accent) !important; border-color: var(--accent) !important; }
+/* Draw-segment context menu */
+#segCtxMenu {
+  display: none; position: fixed; z-index: 900;
+  background: #1e1e1e; border: 1px solid #444; border-radius: 5px;
+  padding: 3px 0; min-width: 110px;
+  box-shadow: 0 4px 14px rgba(0,0,0,0.6);
+  font-size: 12px;
+}
+#segCtxMenu .seg-ctx-item {
+  padding: 6px 14px; cursor: pointer; color: #ddd; white-space: nowrap;
+}
+#segCtxMenu .seg-ctx-item:hover { background: #2c2c2c; }
+#segCtxMenu .seg-ctx-item.danger { color: #e06060; }
+#segCtxMenu .seg-ctx-sep { height: 1px; background: #333; margin: 3px 0; }
 </style>
 </head>
 <body>
@@ -127,6 +141,13 @@
         </svg>Source B</span>
     </div>
   </div>
+</div>
+
+<!-- Draw-segment right-click context menu -->
+<div id="segCtxMenu">
+  <div class="seg-ctx-item" id="segCtxToggle">Disable</div>
+  <div class="seg-ctx-sep"></div>
+  <div class="seg-ctx-item danger" id="segCtxDelete">Delete</div>
 </div>
 
 <script type="module">
@@ -367,7 +388,7 @@ let pinSeqDragSrc   = -1;
 
 // Trajectory
 let userTrajectory       = [];
-let rawDrawSegments      = [];  // completed draw strokes: [[x,y][]]
+let rawDrawSegments      = [];  // completed draw strokes: [{pts:[x,y][], enabled:bool}]
 let rawDrawPoints        = [];  // currently in-progress stroke: [x,y][]
 let drawSegmentBoundaries = []; // indices in userTrajectory where each non-first segment begins
 let pinPoints       = [];
@@ -554,10 +575,13 @@ function getAudioCtx() {
 // (a hard cut at the boundary, not a smooth traversal of the gap).
 // Each segment gets frames proportional to its own arc length.
 function buildDrawUserTrajectory() {
-  const segs = (rawDrawPoints.length >= 2
-    ? [...rawDrawSegments, rawDrawPoints]
-    : rawDrawSegments
-  ).filter(s => s.length >= 2);
+  // Only enabled completed segments + in-progress stroke
+  const activePts = rawDrawSegments
+    .filter(s => s.enabled && s.pts.length >= 2)
+    .map(s => s.pts);
+  const segs = rawDrawPoints.length >= 2
+    ? [...activePts, rawDrawPoints]
+    : activePts;
   if (segs.length === 0) return [];
 
   // Compute arc length of each segment.
@@ -592,7 +616,7 @@ function renderScatter() {
   // Build the visual segments array: completed segments + live stroke if any.
   const drawSegments = pathMode === 'draw'
     ? (rawDrawPoints.length >= 1
-        ? [...rawDrawSegments, rawDrawPoints]
+        ? [...rawDrawSegments, { pts: rawDrawPoints, enabled: true }]
         : rawDrawSegments)
     : [];
   const result = _renderScatter(umapCanvas, dpr, {
@@ -748,7 +772,7 @@ function onUMAPWorkerMsg({ data: msg }) {
     pcaCoords = slot;
 
     viewZoom = 1; viewPanX = 0; viewPanY = 0;
-    const hadDrawTraj = rawDrawSegments.some(s => s.length >= 2) || rawDrawPoints.length >= 2;
+    const hadDrawTraj = rawDrawSegments.some(s => s.pts.length >= 2) || rawDrawPoints.length >= 2;
     rawDrawSegments = []; rawDrawPoints = []; drawSegmentBoundaries = [];
     userTrajectory = pinPoints.length >= 2 ? resamplePath(pinCoords(), 300) : [];
     coordsA = slot.coordsA;
@@ -790,7 +814,7 @@ function onUMAPWorkerMsg({ data: msg }) {
     //   - pin trajectories are {src,idx} based and auto-remap — no reset needed
     if (slotIdx === 0) {
       viewZoom = 1; viewPanX = 0; viewPanY = 0;
-      const hadDrawTraj = rawDrawSegments.some(s => s.length >= 2) || rawDrawPoints.length >= 2;
+      const hadDrawTraj = rawDrawSegments.some(s => s.pts.length >= 2) || rawDrawPoints.length >= 2;
       rawDrawSegments = []; rawDrawPoints = []; drawSegmentBoundaries = [];
       userTrajectory = pinPoints.length >= 2 ? resamplePath(pinCoords(), 300) : [];
       if (hadDrawTraj && pinPoints.length < 2) {
@@ -1017,12 +1041,12 @@ function updateLevelMenuBtn() {
 
 function populateLevelSelect(K) {
   levelMenu.innerHTML = '';
-  umapLevels = Array.from({ length: K }, (_, k) => k);  // all selected
+  umapLevels = [0, 1].filter(k => k < K);  // levels 1 & 2 by default
   for (let k = 0; k < K; k++) {
     const lbl = document.createElement('label');
     const cb  = document.createElement('input');
     cb.type    = 'checkbox';
-    cb.checked = true;
+    cb.checked = k < 2;
     cb.dataset.level = k;
     cb.addEventListener('change', () => {
       umapLevels = [...levelMenu.querySelectorAll('input[type=checkbox]')]
@@ -1821,7 +1845,7 @@ const finishPinDrag = () => {
 const finishDraw = () => {
   if (!isDrawing) return;
   isDrawing = false;
-  if (rawDrawPoints.length >= 2) rawDrawSegments.push(rawDrawPoints);
+  if (rawDrawPoints.length >= 2) rawDrawSegments.push({ pts: rawDrawPoints, enabled: true });
   rawDrawPoints = [];
   userTrajectory = buildDrawUserTrajectory();
   autoRegenerate();
@@ -1829,6 +1853,79 @@ const finishDraw = () => {
 
 umapCanvas.addEventListener('mouseup',    () => { finishPanDrag(); finishShiftDrag(); finishDraw(); finishPinDrag(); });
 umapCanvas.addEventListener('mouseleave', () => { finishPanDrag(); finishShiftDrag(); finishDraw(); finishPinDrag(); });
+
+// ── Draw-segment context menu ─────────────────────────────────────────────────
+
+const segCtxMenu   = document.getElementById('segCtxMenu');
+const segCtxToggle = document.getElementById('segCtxToggle');
+const segCtxDelete = document.getElementById('segCtxDelete');
+let   ctxMenuSegIdx = -1;
+
+function closeSegCtxMenu() { segCtxMenu.style.display = 'none'; ctxMenuSegIdx = -1; }
+
+// Point-to-segment minimum squared distance (canvas pixel space).
+function ptSegDist2(px, py, ax, ay, bx, by) {
+  const dx = bx - ax, dy = by - ay;
+  const len2 = dx * dx + dy * dy;
+  if (len2 < 1e-9) return (px - ax) ** 2 + (py - ay) ** 2;
+  const t = Math.max(0, Math.min(1, ((px - ax) * dx + (py - ay) * dy) / len2));
+  return (px - ax - t * dx) ** 2 + (py - ay - t * dy) ** 2;
+}
+
+// Returns index of rawDrawSegments closest to (physX, physY) within threshold, or -1.
+function hitTestSegments(physX, physY, threshPx = 7) {
+  if (!lastTransform) return -1;
+  const thresh2 = (threshPx * dpr) ** 2;
+  let bestDist2 = Infinity, bestIdx = -1;
+  for (let si = 0; si < rawDrawSegments.length; si++) {
+    const pts = rawDrawSegments[si].pts;
+    for (let i = 1; i < pts.length; i++) {
+      const [ax, ay] = umapToCanvas(pts[i - 1][0], pts[i - 1][1]);
+      const [bx, by] = umapToCanvas(pts[i][0],     pts[i][1]);
+      const d2 = ptSegDist2(physX, physY, ax, ay, bx, by);
+      if (d2 < bestDist2) { bestDist2 = d2; bestIdx = si; }
+    }
+  }
+  return bestDist2 <= thresh2 ? bestIdx : -1;
+}
+
+umapCanvas.addEventListener('contextmenu', e => {
+  e.preventDefault();
+  closeSegCtxMenu();
+  if (canvasMode !== 'draw' || !rawDrawSegments.length || !lastTransform) return;
+  const rect = umapCanvas.getBoundingClientRect();
+  const physX = (e.clientX - rect.left) * dpr;
+  const physY = (e.clientY - rect.top)  * dpr;
+  const idx = hitTestSegments(physX, physY);
+  if (idx < 0) return;
+  ctxMenuSegIdx = idx;
+  segCtxToggle.textContent = rawDrawSegments[idx].enabled ? 'Disable' : 'Enable';
+  segCtxMenu.style.left    = e.clientX + 'px';
+  segCtxMenu.style.top     = e.clientY + 'px';
+  segCtxMenu.style.display = 'block';
+});
+
+segCtxDelete.addEventListener('click', () => {
+  if (ctxMenuSegIdx < 0) return;
+  rawDrawSegments.splice(ctxMenuSegIdx, 1);
+  closeSegCtxMenu();
+  userTrajectory = buildDrawUserTrajectory();
+  autoRegenerate();
+});
+
+segCtxToggle.addEventListener('click', () => {
+  if (ctxMenuSegIdx < 0) return;
+  rawDrawSegments[ctxMenuSegIdx].enabled = !rawDrawSegments[ctxMenuSegIdx].enabled;
+  closeSegCtxMenu();
+  userTrajectory = buildDrawUserTrajectory();
+  autoRegenerate();
+});
+
+// Close menu on any outside click
+document.addEventListener('click', e => {
+  if (!segCtxMenu.contains(e.target)) closeSegCtxMenu();
+});
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeSegCtxMenu(); });
 
 // ── Double-click: add/remove pins ────────────────────────────────────────────
 
@@ -2058,7 +2155,11 @@ function computeWaypoints() {
       const kFwd        = Math.max(1, Math.ceil(snapKVal / 2));
       const kBwd        = Math.max(1, Math.floor(snapKVal / 2));
       const halfCtxArg  = { ...snapCtxArg(), snapDurVal: snapDurVal / 2 };
-      seq = [...buildSeq(fwdWPs, half, kFwd, halfCtxArg), ...buildSeq(bwdWPs, half, kBwd, halfCtxArg)];
+      const fwdSeq      = buildSeq(fwdWPs, half, kFwd, halfCtxArg);
+      const bwdSeq      = buildSeq(bwdWPs, half, kBwd, halfCtxArg);
+      // Offset bwd _wp tags by M so the renderer indexes snapFrames[M..2M-1] (bwd waypoints)
+      // rather than [0..M-1] (fwd waypoints) during the backward half.
+      seq = [...fwdSeq, ...bwdSeq.map(f => ({ ...f, _wp: f._wp + M }))];
     }
     snapPlayFrames = seq;
     genPlaySeq     = seq;
