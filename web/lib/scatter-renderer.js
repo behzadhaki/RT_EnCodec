@@ -59,7 +59,7 @@ export function renderScatter(canvas, dpr, state) {
     ctx.save();
     ctx.strokeStyle = color;
     ctx.lineWidth   = 0.8 * dpr;
-    ctx.globalAlpha = 0.18;
+    ctx.globalAlpha = 0.07;
     ctx.beginPath();
     ctx.moveTo(toX(coords[0][0]), toY(coords[0][1]));
     for (let i = 1; i < coords.length; i++) ctx.lineTo(toX(coords[i][0]), toY(coords[i][1]));
@@ -167,33 +167,37 @@ export function renderScatter(canvas, dpr, state) {
   }
 
   if (canvasMode === 'draw' && drawSegments && drawSegments.length > 0) {
-    // Draw each segment as a dashed white line.
+    // Each entry is {pts:[[x,y]…], enabled:bool}.
+    // Enabled → solid white dashed line; disabled → dimmed gray dashed line.
     ctx.save();
-    ctx.strokeStyle = '#ffffff';
-    ctx.lineWidth   = 2 * dpr;
-    ctx.globalAlpha = 0.75;
+    ctx.lineWidth = 2 * dpr;
     ctx.setLineDash([4 * dpr, 3 * dpr]);
     for (const seg of drawSegments) {
-      if (seg.length < 2) continue;
+      const pts     = seg.pts ?? seg;          // fallback for plain arrays
+      const enabled = seg.pts ? seg.enabled !== false : true;
+      if (pts.length < 2) continue;
+      ctx.strokeStyle = '#ffffff';
+      ctx.globalAlpha = enabled ? 0.80 : 0.22;
       ctx.beginPath();
-      ctx.moveTo(toX(seg[0][0]), toY(seg[0][1]));
-      for (let i = 1; i < seg.length; i++)
-        ctx.lineTo(toX(seg[i][0]), toY(seg[i][1]));
+      ctx.moveTo(toX(pts[0][0]), toY(pts[0][1]));
+      for (let i = 1; i < pts.length; i++)
+        ctx.lineTo(toX(pts[i][0]), toY(pts[i][1]));
       ctx.stroke();
     }
     ctx.restore();
 
-    // Small filled circle at the start of each non-first segment — marks where
-    // the user began that stroke so segment boundaries are visually clear.
+    // Small filled circle at the start of each non-first segment.
     ctx.save();
-    ctx.fillStyle   = '#ffffff';
-    ctx.globalAlpha = 0.85;
     ctx.setLineDash([]);
     for (let si = 1; si < drawSegments.length; si++) {
-      const seg = drawSegments[si];
-      if (seg.length < 1) continue;
+      const seg     = drawSegments[si];
+      const pts     = seg.pts ?? seg;
+      const enabled = seg.pts ? seg.enabled !== false : true;
+      if (pts.length < 1) continue;
+      ctx.fillStyle   = '#ffffff';
+      ctx.globalAlpha = enabled ? 0.85 : 0.25;
       ctx.beginPath();
-      ctx.arc(toX(seg[0][0]), toY(seg[0][1]), 3.5 * dpr, 0, 2 * Math.PI);
+      ctx.arc(toX(pts[0][0]), toY(pts[0][1]), 3.5 * dpr, 0, 2 * Math.PI);
       ctx.fill();
     }
     ctx.restore();
