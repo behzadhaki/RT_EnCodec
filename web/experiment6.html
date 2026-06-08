@@ -26,6 +26,16 @@
 #progressWrap { width: auto; overflow: visible; }
 #seqInfo    { font-family: monospace; font-size: 0.78em; color: #aaa; margin-left: 0.6em;
               flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; }
+/* UMAP slot switcher */
+#slotWrap   { display: none; align-items: center; gap: 2px; margin-right: 4px; }
+#slotWrap.visible { display: flex; }
+#slotPrev, #slotNext { padding: 1px 5px; min-width: 20px; font-size: 12px; line-height: 1; }
+#slotDots   { display: flex; gap: 3px; align-items: center; padding: 0 2px; }
+.umap-dot   { width: 8px; height: 8px; border-radius: 50%; border: 1.5px solid #555;
+              background: transparent; cursor: pointer; padding: 0; flex-shrink: 0;
+              transition: background 0.15s, border-color 0.15s; }
+.umap-dot.ready  { background: #666; border-color: #888; }
+.umap-dot.active { background: var(--accent) !important; border-color: var(--accent) !important; }
 </style>
 </head>
 <body>
@@ -43,6 +53,11 @@
           <button id="levelMenuBtn" class="tog">All</button>
           <div id="levelMenu"></div>
         </div>
+      </div>
+      <div id="slotWrap">
+        <button id="slotPrev" class="tog">◀</button>
+        <div id="slotDots"></div>
+        <button id="slotNext" class="tog">▶</button>
       </div>
       <span style="flex:1"></span>
       <button class="tog active" id="togExplore">Explore</button>
@@ -273,6 +288,10 @@ const umapWindowEl  = document.getElementById('umapWindow');
 const togExplore    = document.getElementById('togExplore');
 const togDraw       = document.getElementById('togDraw');
 const togPins       = document.getElementById('togPins');
+const slotWrap      = document.getElementById('slotWrap');
+const slotDots      = document.getElementById('slotDots');
+const slotPrevBtn   = document.getElementById('slotPrev');
+const slotNextBtn   = document.getElementById('slotNext');
 const pinSeqBar     = document.getElementById('pinSeqBar');
 const trajDurationEl = document.getElementById('trajDuration');
 const durRow         = document.getElementById('durRow');
@@ -309,6 +328,13 @@ let embSpace        = 'pre_vq'; // 'pre_vq' | 'post_vq'
 let embMode         = 'emb';    // 'emb' | 'emb+delta' | 'delta'
 let coordsA         = null;
 let coordsB         = null;
+
+// UMAP multi-slot (reproducible layout browser)
+const UMAP_N_SLOTS  = 6;
+let umapSlots       = Array(UMAP_N_SLOTS).fill(null); // [{coordsA,coordsB}|null]
+let umapSlotIdx     = 0;    // currently displayed slot
+let umapSessionId   = 0;    // incremented every full re-compute; guards stale completions
+let umapFeatureData = null; // {flat,T_A,T_B,D,nNeighbors,minDist} — shared across slots
 
 // Viewport (zoom / pan)
 let viewZoom = 1;
@@ -605,38 +631,103 @@ function initWorker() {
 
 function initUMAPWorker() {
   if (umapWorker) umapWorker.terminate();
-  umapWorker = new Worker(new URL('./umap-worker.js?v=2', import.meta.url), { type: 'module' });
+  umapWorker = new Worker(new URL('./umap-worker.js?v=3', import.meta.url), { type: 'module' });
   umapWorker.onmessage = onUMAPWorkerMsg;
 }
+
+// ── Slot switcher helpers ──────────────────────────────────────────────────────
+
+function initSlotDots() {
+  slotDots.innerHTML = '';
+  for (let i = 0; i < UMAP_N_SLOTS; i++) {
+    const btn = document.createElement('button');
+    btn.className = 'umap-dot';
+    btn.title = `Layout ${i + 1}`;
+    btn.addEventListener('click', () => setUMAPSlotIdx(i));
+    slotDots.appendChild(btn);
+  }
+}
+
+function updateSlotDots() {
+  [...slotDots.children].forEach((btn, i) => {
+    btn.className = 'umap-dot'
+      + (umapSlots[i] ? ' ready' : '')
+      + (i === umapSlotIdx ? ' active' : '');
+  });
+  slotPrevBtn.disabled = umapSlotIdx <= 0;
+  slotNextBtn.disabled = umapSlotIdx >= UMAP_N_SLOTS - 1;
+}
+
+// Switch to a pre-computed slot (or mark as pending if not yet ready).
+function setUMAPSlotIdx(idx) {
+  if (idx < 0 || idx >= UMAP_N_SLOTS) return;
+  umapSlotIdx = idx;
+  const slot = umapSlots[idx];
+  if (slot) {
+    coordsA = slot.coordsA;
+    coordsB = slot.coordsB;
+    setStatus(`Layout ${idx + 1} / ${UMAP_N_SLOTS}`);
+    updateSlotDots();
+    markDirty('WAYPOINTS', 'AUDIO', 'RENDER');
+  } else {
+    // Not yet computed — update desired slot; onUMAPWorkerMsg will display it when ready.
+    updateSlotDots();
+    setStatus(`Waiting for layout ${idx + 1}…`);
+  }
+}
+
+// ── UMAP worker message handler ────────────────────────────────────────────────
 
 function onUMAPWorkerMsg({ data: msg }) {
   if (msg.jobId !== activeUMAPJobId) return;
 
   if (msg.type === 'umap_progress') {
-    const pct = Math.round(msg.epoch / msg.nEpochs * 100);
+    const pct   = Math.round(msg.epoch / msg.nEpochs * 100);
+    const label = `Layout ${(msg.slotIdx ?? 0) + 1}/${UMAP_N_SLOTS}`;
     progBar.style.width = pct + '%';
-    setStatus(`UMAP — epoch ${msg.epoch} / ${msg.nEpochs}`);
+    setStatus(`UMAP ${label} — epoch ${msg.epoch} / ${msg.nEpochs}`);
 
   } else if (msg.type === 'umap_result') {
-    const { result, T_A, T_B } = msg;
-    coordsA = [];
-    coordsB = [];
-    viewZoom = 1; viewPanX = 0; viewPanY = 0;
-    for (let i = 0; i < T_A; i++) coordsA.push([result[i * 2], result[i * 2 + 1]]);
-    for (let i = 0; i < T_B; i++) coordsB.push([result[(T_A + i) * 2], result[(T_A + i) * 2 + 1]]);
-    progWrap.style.display = 'none';
+    const { slotIdx, result, T_A, T_B } = msg;
 
-    // Draw trajectories are defined in UMAP space and are now invalid.
-    // Pin trajectories store {src,idx} and auto-remap since coordsA/B just updated.
-    const hadDrawTraj = rawDrawPoints.length >= 2;
-    rawDrawPoints = [];
-    userTrajectory = pinPoints.length >= 2 ? resamplePath(pinCoords(), 300) : [];
-    if (hadDrawTraj && pinPoints.length < 2) {
-      setStatus(`UMAP updated — draw trajectory cleared. Redraw to regenerate.`);
-    } else {
-      setStatus(`Done — ${T_A} frames (A) · ${T_B} frames (B)`);
+    // Decode and store this slot.
+    const slot = { coordsA: [], coordsB: [] };
+    for (let i = 0; i < T_A; i++) slot.coordsA.push([result[i * 2], result[i * 2 + 1]]);
+    for (let i = 0; i < T_B; i++) slot.coordsB.push([result[(T_A + i) * 2], result[(T_A + i) * 2 + 1]]);
+    umapSlots[slotIdx] = slot;
+    updateSlotDots();
+
+    // Slot 0 (the very first result for this session):
+    //   - reset viewport and clear draw trajectory (now defined in stale UMAP coords)
+    //   - pin trajectories are {src,idx} based and auto-remap — no reset needed
+    if (slotIdx === 0) {
+      viewZoom = 1; viewPanX = 0; viewPanY = 0;
+      const hadDrawTraj = rawDrawPoints.length >= 2;
+      rawDrawPoints  = [];
+      userTrajectory = pinPoints.length >= 2 ? resamplePath(pinCoords(), 300) : [];
+      if (hadDrawTraj && pinPoints.length < 2) {
+        setStatus('UMAP updated — draw trajectory cleared. Redraw to regenerate.');
+      } else {
+        setStatus(`Done — ${T_A} frames (A) · ${T_B} frames (B). Computing more layouts…`);
+      }
     }
-    markDirty('WAYPOINTS', 'AUDIO', 'RENDER');
+
+    // If this is the currently-desired slot, display it now.
+    if (slotIdx === umapSlotIdx) {
+      coordsA = slot.coordsA;
+      coordsB = slot.coordsB;
+      if (slotIdx !== 0) setStatus(`Layout ${slotIdx + 1} / ${UMAP_N_SLOTS}`);
+      markDirty('WAYPOINTS', 'AUDIO', 'RENDER');
+    }
+
+    // Chain the next slot in the background (sequential, same worker).
+    const next = slotIdx + 1;
+    if (next < UMAP_N_SLOTS && umapFeatureData) {
+      launchUMAPSlot(next);
+    } else {
+      progWrap.style.display = 'none';
+      if (slotIdx === UMAP_N_SLOTS - 1) setStatus(`All ${UMAP_N_SLOTS} layouts ready.`);
+    }
 
   } else if (msg.type === 'umap_error') {
     progWrap.style.display = 'none';
@@ -1094,19 +1185,37 @@ function codebookLookupFrames(cb, codes, dims, levels) {
 
 // ── UMAP ──────────────────────────────────────────────────────────────────────
 
+// Kick off a full multi-slot UMAP session.
+// Builds features once, then chains slots 0 → UMAP_N_SLOTS-1 sequentially,
+// each with a different seed for a reproducible but varied layout.
 function triggerUMAP() {
   if (!currentEmbeds) return;
-  runUMAP().catch(err => setStatus(err.message, true));
+  const sid = ++umapSessionId;
+  umapSlots       = Array(UMAP_N_SLOTS).fill(null);
+  umapSlotIdx     = 0;
+  umapFeatureData = null;
+  updateSlotDots();
+  slotWrap.classList.add('visible');
+
+  buildUMAPFeatureData()
+    .then(fd => {
+      if (umapSessionId !== sid) return; // superseded by a newer triggerUMAP
+      umapFeatureData = fd;
+      launchUMAPSlot(0);
+    })
+    .catch(err => setStatus(err.message, true));
 }
 
-async function runUMAP() {
-  if (!currentEmbeds) return;
-
+// Build the shared feature matrix (expensive; run once per session).
+// Returns {flat, T_A, T_B, D, nNeighbors, minDist} — flat is NOT transferred
+// so it can be reused across all slot sends.
+async function buildUMAPFeatureData() {
   let framesA, framesB, rawA, rawB;
+
   if (umapMode === 'combined') {
     if (embSpace === 'pre_vq') {
-      rawA = embQuantToFrames(currentEmbeds.embEncA, currentEmbeds.embEncDimsA);
-      rawB = embQuantToFrames(currentEmbeds.embEncB, currentEmbeds.embEncDimsB);
+      rawA = embQuantToFrames(currentEmbeds.embEncA,   currentEmbeds.embEncDimsA);
+      rawB = embQuantToFrames(currentEmbeds.embEncB,   currentEmbeds.embEncDimsB);
     } else {
       rawA = embQuantToFrames(currentEmbeds.embQuantA, currentEmbeds.embQuantDimsA);
       rawB = embQuantToFrames(currentEmbeds.embQuantB, currentEmbeds.embQuantDimsB);
@@ -1130,14 +1239,14 @@ async function runUMAP() {
     framesB = applyWindowWithAnchor(rawB, framesB, K);
   }
 
-  // Normalise after all feature construction so every dimension contributes
-  // equally to UMAP distances regardless of raw magnitude differences.
+  // Normalise: every dimension contributes equally regardless of raw magnitude.
   [framesA, framesB] = zscoreFrames(framesA, framesB);
 
   const T_A = framesA.length;
   const T_B = framesB.length;
   const D   = framesA[0].length;
 
+  // Allocate flat array — NOT transferred, shared across all slot sends via copy.
   const flat = new Float32Array((T_A + T_B) * D);
   framesA.forEach((f, i) => flat.set(f, i * D));
   framesB.forEach((f, i) => flat.set(f, (T_A + i) * D));
@@ -1148,17 +1257,31 @@ async function runUMAP() {
   );
   const minDist = parseFloat(minDistEl.value) || 0.1;
 
+  return { flat, T_A, T_B, D, nNeighbors, minDist };
+}
+
+// Send one slot job to the worker. Each slot gets a unique seed (slotIdx + 1)
+// so layouts are reproducible across sessions but visually distinct.
+// flat is sent as a copy (no transfer) so buildUMAPFeatureData only runs once.
+function launchUMAPSlot(slotIdx) {
+  if (slotIdx >= UMAP_N_SLOTS || !umapFeatureData) return;
+  const { flat, T_A, T_B, D, nNeighbors, minDist } = umapFeatureData;
+
   initUMAPWorker();
   activeUMAPJobId = ++jobSeq;
 
   progWrap.style.display = 'block';
   progBar.style.width = '0%';
-  setStatus(`UMAP — starting… (${T_A + T_B} frames)`);
+  if (slotIdx === 0) setStatus(`UMAP — starting… (${T_A + T_B} frames, ${UMAP_N_SLOTS} layouts)`);
 
-  umapWorker.postMessage(
-    { type: 'compute_umap', jobId: activeUMAPJobId, flat, T_A, T_B, D, nNeighbors, minDist },
-    [flat.buffer]
-  );
+  // No transferable — flat stays alive for subsequent slot sends.
+  umapWorker.postMessage({
+    type: 'compute_umap',
+    jobId: activeUMAPJobId,
+    slotIdx,
+    seed: slotIdx + 1,
+    flat, T_A, T_B, D, nNeighbors, minDist,
+  });
 }
 
 // ── Post-processing chain ─────────────────────────────────────────────────────
@@ -1252,6 +1375,13 @@ playerG.setLoopBtn(document.getElementById('wbLoopG'));
     p.setLoop(!btn.classList.contains('active'));
   });
 });
+
+// ── UMAP slot switcher wiring ─────────────────────────────────────────────────
+
+initSlotDots(); // create dot buttons from UMAP_N_SLOTS
+
+slotPrevBtn.addEventListener('click', () => setUMAPSlotIdx(umapSlotIdx - 1));
+slotNextBtn.addEventListener('click', () => setUMAPSlotIdx(umapSlotIdx + 1));
 
 // ── Mode toggles (canvas) ─────────────────────────────────────────────────────
 

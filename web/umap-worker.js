@@ -11,18 +11,17 @@ function mulberry32(seed) {
   };
 }
 
-// Override Math.random at module level so umap-js picks it up via
-// `this.random = Math.random` in its constructor. Workers have their own
-// global scope so this doesn't affect the main thread.
-Math.random = mulberry32(42);
-
 self.onmessage = ({ data: msg }) => {
   if (msg.type !== 'compute_umap') return;
 
-  const { jobId, flat, T_A, T_B, D, nNeighbors, minDist } = msg;
+  const { jobId, slotIdx = 0, seed = 1, flat, T_A, T_B, D, nNeighbors, minDist } = msg;
+
+  // Reset Math.random with this slot's seed — workers have their own global scope
+  // so this doesn't affect the main thread. Doing it inside the handler (not at
+  // module level) means each slot starts from a fresh, reproducible sequence.
+  Math.random = mulberry32(seed);
 
   try {
-    // Reconstruct number[][] from flat Float32Array
     const n = T_A + T_B;
     const all = [];
     for (let i = 0; i < n; i++) {
@@ -35,7 +34,7 @@ self.onmessage = ({ data: msg }) => {
     for (let e = 0; e < nEpochs; e++) {
       umap.step();
       if (e % 10 === 0 || e === nEpochs - 1) {
-        self.postMessage({ type: 'umap_progress', jobId, epoch: e, nEpochs });
+        self.postMessage({ type: 'umap_progress', jobId, slotIdx, epoch: e, nEpochs });
       }
     }
 
@@ -46,8 +45,8 @@ self.onmessage = ({ data: msg }) => {
       result[i * 2 + 1] = coords[i][1];
     }
 
-    self.postMessage({ type: 'umap_result', jobId, result, T_A, T_B }, [result.buffer]);
+    self.postMessage({ type: 'umap_result', jobId, slotIdx, result, T_A, T_B }, [result.buffer]);
   } catch (err) {
-    self.postMessage({ type: 'umap_error', jobId, message: err.message });
+    self.postMessage({ type: 'umap_error', jobId, slotIdx, message: err.message });
   }
 };
