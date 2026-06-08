@@ -1,5 +1,21 @@
 import { UMAP } from 'https://esm.sh/umap-js';
 
+// Mulberry32 — fast 32-bit seeded PRNG.
+function mulberry32(seed) {
+  let s = seed >>> 0;
+  return () => {
+    s += 0x6d2b79f5;
+    let t = Math.imul(s ^ (s >>> 15), 1 | s);
+    t ^= t + Math.imul(t ^ (t >>> 7), 61 | t);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// Override Math.random at module level so umap-js picks it up via
+// `this.random = Math.random` in its constructor. Workers have their own
+// global scope so this doesn't affect the main thread.
+Math.random = mulberry32(42);
+
 self.onmessage = ({ data: msg }) => {
   if (msg.type !== 'compute_umap') return;
 
@@ -13,8 +29,8 @@ self.onmessage = ({ data: msg }) => {
       all.push(Array.from(flat.subarray(i * D, (i + 1) * D)));
     }
 
-    const umap     = new UMAP({ nComponents: 2, nNeighbors, minDist });
-    const nEpochs  = umap.initializeFit(all);
+    const umap    = new UMAP({ nComponents: 2, nNeighbors, minDist });
+    const nEpochs = umap.initializeFit(all);
 
     for (let e = 0; e < nEpochs; e++) {
       umap.step();
