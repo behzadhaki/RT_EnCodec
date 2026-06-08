@@ -99,6 +99,7 @@
         <div class="waveHeader">
           <span class="waveLbl">Source A</span>
           <div class="waveCtrl">
+            <button id="togSrcA" style="background:none;border:1px solid #e89a2066;border-radius:3px;color:#e89a20;font-weight:700;font-size:11px;padding:1px 6px;cursor:pointer;opacity:1" title="Toggle source A">A</button>
             <button class="waveBtn" id="wbPlayA">▶</button>
             <button class="waveBtn" id="wbStopA">■</button>
             <button class="waveBtn" id="wbLoopA">⟳</button>
@@ -110,6 +111,7 @@
         <div class="waveHeader">
           <span class="waveLbl">Source B</span>
           <div class="waveCtrl">
+            <button id="togSrcB" style="background:none;border:1px solid #30aadc66;border-radius:3px;color:#30aadc;font-weight:700;font-size:11px;padding:1px 6px;cursor:pointer;opacity:1" title="Toggle source B">B</button>
             <button class="waveBtn" id="wbPlayB">▶</button>
             <button class="waveBtn" id="wbStopB">■</button>
             <button class="waveBtn" id="wbLoopB">⟳</button>
@@ -386,6 +388,16 @@ let isPinDragging   = false;
 let pinDragIdx      = -1;
 let pinSeqDragSrc   = -1;
 
+// Source visibility
+let srcAEnabled = true;
+let srcBEnabled = true;
+function getEnabledSrcs() {
+  const s = [];
+  if (srcAEnabled) s.push('A');
+  if (srcBEnabled) s.push('B');
+  return s.length > 0 ? s : ['A', 'B']; // safety: never disable both
+}
+
 // Trajectory
 let userTrajectory       = [];
 let rawDrawSegments      = [];  // completed draw strokes: [{pts:[x,y][], enabled:bool}]
@@ -630,6 +642,7 @@ function renderScatter() {
     pathMode, snapFrames, snapSegBoundaries, codePathFrames, trajAnchorPos,
     snapPlayFrames, trajDir, showTrail: chkTrail.checked, canvasMode, ctxSwapRange,
     snapMode, snapKVal, snapDurVal, framesPerSec: fps,
+    srcAEnabled, srcBEnabled,
   });
   if (result !== null) lastTransform = result;
 }
@@ -1106,6 +1119,20 @@ createToggleGroup([
 
 document.getElementById('togUMAPMode').addEventListener('click', () => setProjectionMode('umap'));
 document.getElementById('togPCAMode') .addEventListener('click', () => setProjectionMode('pca'));
+
+// Source A / B visibility toggles
+document.getElementById('togSrcA').addEventListener('click', () => {
+  srcAEnabled = !srcAEnabled;
+  document.getElementById('togSrcA').style.opacity = srcAEnabled ? '1' : '0.3';
+  scheduleRender();
+  autoRegenerate();
+});
+document.getElementById('togSrcB').addEventListener('click', () => {
+  srcBEnabled = !srcBEnabled;
+  document.getElementById('togSrcB').style.opacity = srcBEnabled ? '1' : '0.3';
+  scheduleRender();
+  autoRegenerate();
+});
 
 // umapWindow affects the feature matrix → recompute everything.
 umapWindowEl.addEventListener('change', () => markDirty('COORDS', 'WAYPOINTS', 'AUDIO', 'RENDER'));
@@ -1785,7 +1812,7 @@ umapCanvas.addEventListener('mousemove', e => {
   if (isPinDragging) {
     if (!coordsA || !coordsB) return;
     const [umapX, umapY] = canvasToUmap(e);
-    const { src, idx } = findNearestUmapPoint(umapX, umapY, coordsA, coordsB);
+    const { src, idx } = findNearestUmapPoint(umapX, umapY, coordsA, coordsB, getEnabledSrcs());
     pinPoints[pinDragIdx] = { src, idx };
     userTrajectory = pinPoints.length >= 2 ? resamplePath(pinCoords(), 300) : [];
     updatePinSeqBar();
@@ -1947,15 +1974,20 @@ umapCanvas.addEventListener('dblclick', e => {
   } else {
     const SNAP_R2 = (18 * dpr) ** 2;
     let bestDist2 = Infinity, bestSrc = null, bestIdx = -1;
-    for (let i = 0; i < coordsA.length; i++) {
-      const [cx, cy] = umapToCanvas(coordsA[i][0], coordsA[i][1]);
-      const d2 = (cx - physX) ** 2 + (cy - physY) ** 2;
-      if (d2 < bestDist2) { bestDist2 = d2; bestSrc = 'A'; bestIdx = i; }
+    const _srcs = getEnabledSrcs();
+    if (_srcs.includes('A')) {
+      for (let i = 0; i < coordsA.length; i++) {
+        const [cx, cy] = umapToCanvas(coordsA[i][0], coordsA[i][1]);
+        const d2 = (cx - physX) ** 2 + (cy - physY) ** 2;
+        if (d2 < bestDist2) { bestDist2 = d2; bestSrc = 'A'; bestIdx = i; }
+      }
     }
-    for (let i = 0; i < coordsB.length; i++) {
-      const [cx, cy] = umapToCanvas(coordsB[i][0], coordsB[i][1]);
-      const d2 = (cx - physX) ** 2 + (cy - physY) ** 2;
-      if (d2 < bestDist2) { bestDist2 = d2; bestSrc = 'B'; bestIdx = i; }
+    if (_srcs.includes('B')) {
+      for (let i = 0; i < coordsB.length; i++) {
+        const [cx, cy] = umapToCanvas(coordsB[i][0], coordsB[i][1]);
+        const d2 = (cx - physX) ** 2 + (cy - physY) ** 2;
+        if (d2 < bestDist2) { bestDist2 = d2; bestSrc = 'B'; bestIdx = i; }
+      }
     }
     if (bestIdx < 0 || bestDist2 > SNAP_R2) {
       setStatus('Double-click closer to a UMAP point to add a pin.');
@@ -1979,7 +2011,7 @@ umapCanvas.addEventListener('click', async e => {
   if (encodePhase !== null) return;
 
   const [umapX, umapY] = canvasToUmap(e);
-  const { src: bestSrc, idx: bestIdx } = findNearestUmapPoint(umapX, umapY, coordsA, coordsB);
+  const { src: bestSrc, idx: bestIdx } = findNearestUmapPoint(umapX, umapY, coordsA, coordsB, getEnabledSrcs());
   if (bestIdx < 0) return;
 
   selectedPoint = { src: bestSrc, idx: bestIdx };
@@ -2081,6 +2113,7 @@ function snapWaypointArgs() {
     trajDuration: parseFloat(trajDurationEl.value) || 4,
     framesPerSec: coordsA ? coordsA.length / srcWidget.getDuration() : 1,
     drawSegmentBoundaries,
+    enabledSrcs: getEnabledSrcs(),
   };
 }
 
@@ -2292,15 +2325,19 @@ async function playTrajectory() {
     // Find two nearest points for interpolation
     let d1 = Infinity, d2 = Infinity;
     let src1 = null, idx1 = -1, src2 = null, idx2 = -1;
-    for (let j = 0; j < coordsA.length; j++) {
-      const d = (coordsA[j][0] - px) ** 2 + (coordsA[j][1] - py) ** 2;
-      if (d < d1) { d2=d1; src2=src1; idx2=idx1; d1=d; src1='A'; idx1=j; }
-      else if (d < d2) { d2=d; src2='A'; idx2=j; }
+    if (srcAEnabled) {
+      for (let j = 0; j < coordsA.length; j++) {
+        const d = (coordsA[j][0] - px) ** 2 + (coordsA[j][1] - py) ** 2;
+        if (d < d1) { d2=d1; src2=src1; idx2=idx1; d1=d; src1='A'; idx1=j; }
+        else if (d < d2) { d2=d; src2='A'; idx2=j; }
+      }
     }
-    for (let j = 0; j < coordsB.length; j++) {
-      const d = (coordsB[j][0] - px) ** 2 + (coordsB[j][1] - py) ** 2;
-      if (d < d1) { d2=d1; src2=src1; idx2=idx1; d1=d; src1='B'; idx1=j; }
-      else if (d < d2) { d2=d; src2='B'; idx2=j; }
+    if (srcBEnabled) {
+      for (let j = 0; j < coordsB.length; j++) {
+        const d = (coordsB[j][0] - px) ** 2 + (coordsB[j][1] - py) ** 2;
+        if (d < d1) { d2=d1; src2=src1; idx2=idx1; d1=d; src1='B'; idx1=j; }
+        else if (d < d2) { d2=d; src2='B'; idx2=j; }
+      }
     }
 
     const f1  = getFrame(src1, idx1);

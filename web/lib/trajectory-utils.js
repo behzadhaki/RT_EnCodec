@@ -137,15 +137,19 @@ export function findCodePath(userTrajectory, coordsA, coordsB, nNeighbors) {
 }
 
 // Returns { src, idx, dist2 } of the nearest UMAP point to (umapX, umapY).
-export function findNearestUmapPoint(umapX, umapY, coordsA, coordsB) {
+export function findNearestUmapPoint(umapX, umapY, coordsA, coordsB, enabledSrcs = ['A', 'B']) {
   let bestDist2 = Infinity, bestSrc = 'A', bestIdx = 0;
-  for (let i = 0; i < coordsA.length; i++) {
-    const d2 = (coordsA[i][0] - umapX) ** 2 + (coordsA[i][1] - umapY) ** 2;
-    if (d2 < bestDist2) { bestDist2 = d2; bestSrc = 'A'; bestIdx = i; }
+  if (enabledSrcs.includes('A')) {
+    for (let i = 0; i < coordsA.length; i++) {
+      const d2 = (coordsA[i][0] - umapX) ** 2 + (coordsA[i][1] - umapY) ** 2;
+      if (d2 < bestDist2) { bestDist2 = d2; bestSrc = 'A'; bestIdx = i; }
+    }
   }
-  for (let i = 0; i < coordsB.length; i++) {
-    const d2 = (coordsB[i][0] - umapX) ** 2 + (coordsB[i][1] - umapY) ** 2;
-    if (d2 < bestDist2) { bestDist2 = d2; bestSrc = 'B'; bestIdx = i; }
+  if (enabledSrcs.includes('B')) {
+    for (let i = 0; i < coordsB.length; i++) {
+      const d2 = (coordsB[i][0] - umapX) ** 2 + (coordsB[i][1] - umapY) ** 2;
+      if (d2 < bestDist2) { bestDist2 = d2; bestSrc = 'B'; bestIdx = i; }
+    }
   }
   return { src: bestSrc, idx: bestIdx, dist2: bestDist2 };
 }
@@ -161,13 +165,14 @@ export function computeSnapWaypoints({
   userTrajectory, pathMode, snapMode, snapDurVal, codeSecVal,
   trajDuration, framesPerSec,
   drawSegmentBoundaries = [],
+  enabledSrcs = ['A', 'B'],
 }) {
   if (!coordsA || !coordsB) return [];
 
   if (canvasMode === 'pins' && pinPoints.length >= 1) {
     const raw = [];
     for (const [px, py] of pinPoints) {
-      const { src: bestSrc, idx: bestIdx } = findNearestUmapPoint(px, py, coordsA, coordsB);
+      const { src: bestSrc, idx: bestIdx } = findNearestUmapPoint(px, py, coordsA, coordsB, enabledSrcs);
       const last = raw[raw.length - 1];
       if (!last || last.src !== bestSrc || last.idx !== bestIdx) raw.push({ src: bestSrc, idx: bestIdx });
     }
@@ -203,7 +208,7 @@ export function computeSnapWaypoints({
         const tt   = ti - Math.floor(ti);
         const px   = userTrajectory[lo][0] + tt * (userTrajectory[hi][0] - userTrajectory[lo][0]);
         const py   = userTrajectory[lo][1] + tt * (userTrajectory[hi][1] - userTrajectory[lo][1]);
-        const { src: bestSrc, idx: bestIdx } = findNearestUmapPoint(px, py, coordsA, coordsB);
+        const { src: bestSrc, idx: bestIdx } = findNearestUmapPoint(px, py, coordsA, coordsB, enabledSrcs);
         const last = raw[raw.length - 1];
         if (!last || last.src !== bestSrc || last.idx !== bestIdx) raw.push({ src: bestSrc, idx: bestIdx });
       }
@@ -220,7 +225,7 @@ export function computeSnapWaypoints({
     const tt   = ti - lo;
     const px   = userTrajectory[lo][0] + tt * (userTrajectory[hi][0] - userTrajectory[lo][0]);
     const py   = userTrajectory[lo][1] + tt * (userTrajectory[hi][1] - userTrajectory[lo][1]);
-    const { src: bestSrc, idx: bestIdx } = findNearestUmapPoint(px, py, coordsA, coordsB);
+    const { src: bestSrc, idx: bestIdx } = findNearestUmapPoint(px, py, coordsA, coordsB, enabledSrcs);
     const last = raw[raw.length - 1];
     if (!last || last.src !== bestSrc || last.idx !== bestIdx) raw.push({ src: bestSrc, idx: bestIdx });
   }

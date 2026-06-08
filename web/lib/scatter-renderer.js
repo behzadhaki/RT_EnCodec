@@ -52,6 +52,7 @@ export function renderScatter(canvas, dpr, state) {
     pathMode, snapFrames, snapSegBoundaries, codePathFrames, trajAnchorPos,
     snapPlayFrames, trajDir, showTrail, ctxSwapRange,
     snapMode, snapKVal, snapDurVal, framesPerSec, canvasMode,
+    srcAEnabled = true, srcBEnabled = true,
   } = state;
 
   function drawTrail(coords, color) {
@@ -99,11 +100,11 @@ export function renderScatter(canvas, dpr, state) {
     ctx.restore();
   }
 
-  drawTrail(coordsA, '#c87800');
-  drawTrail(coordsB, '#2090c0');
+  if (srcAEnabled) drawTrail(coordsA, '#c87800');
+  if (srcBEnabled) drawTrail(coordsB, '#2090c0');
 
-  drawCirclesEmpty(coordsA,   '#c87800');
-  drawTrianglesEmpty(coordsB, '#2090c0');
+  if (srcAEnabled) drawCirclesEmpty(coordsA,   '#c87800');
+  if (srcBEnabled) drawTrianglesEmpty(coordsB, '#2090c0');
 
   // Pins drawn AFTER data points so they sit on the highest layer
   if (canvasMode === 'pins' && pinPoints.length > 0) {
