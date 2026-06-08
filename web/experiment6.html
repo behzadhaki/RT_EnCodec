@@ -170,7 +170,11 @@ controls.appendChild(mp.modeSection);
 const umapSection = document.createElement('div');
 umapSection.className = 'section';
 umapSection.innerHTML = `
-  <div class="section-title">UMAP</div>
+  <div class="section-title">Projection</div>
+  <div class="row" style="gap:3px">
+    <button class="tog active" id="togUMAPMode" style="flex:1">UMAP</button>
+    <button class="tog"        id="togPCAMode"  style="flex:1">PCA</button>
+  </div>
   <div class="row">
     <span class="lbl">Features</span>
     <div style="display:flex;gap:3px">
@@ -184,11 +188,11 @@ umapSection.innerHTML = `
     <input type="number" id="umapWindow" value="1" min="1" max="16" step="1">
     <span style="font-size:11px;color:var(--muted);margin-left:2px">frames</span>
   </div>
-  <div class="row">
+  <div class="row" id="neighborRow">
     <span class="lbl">Neighbors</span>
     <input type="number" id="nNeighbors" value="15" min="3" max="100" step="1">
   </div>
-  <div class="row">
+  <div class="row" id="minDistRow">
     <span class="lbl">Min dist</span>
     <input type="number" id="minDist" value="0.1" min="0.0" max="0.99" step="0.05">
   </div>
@@ -329,6 +333,10 @@ let embSpace        = 'pre_vq'; // 'pre_vq' | 'post_vq'
 let embMode         = 'emb';    // 'emb' | 'emb+delta' | 'delta'
 let coordsA         = null;
 let coordsB         = null;
+
+// Projection mode — 'umap' | 'pca'
+let projectionMode  = 'umap';
+let pcaCoords       = null;  // {coordsA, coordsB} — cached PCA result for current features
 
 // UMAP multi-slot (reproducible layout browser)
 const UMAP_N_SLOTS  = 6;
@@ -579,7 +587,7 @@ function hasWaypointSource() {
 function runEffects() {
   if (dirty.COORDS && currentEmbeds) {
     dirty.COORDS = false;
-    triggerUMAP();
+    triggerProjection();
   }
   if (dirty.WAYPOINTS && coordsA && coordsB && hasWaypointSource()) {
     dirty.WAYPOINTS = false;
@@ -632,7 +640,7 @@ function initWorker() {
 
 function initUMAPWorker() {
   if (umapWorker) umapWorker.terminate();
-  umapWorker = new Worker(new URL('./umap-worker.js?v=3', import.meta.url), { type: 'module' });
+  umapWorker = new Worker(new URL('./umap-worker.js?v=4', import.meta.url), { type: 'module' });
   umapWorker.onmessage = onUMAPWorkerMsg;
 }
 
@@ -677,11 +685,41 @@ function setUMAPSlotIdx(idx) {
   }
 }
 
-// ── UMAP worker message handler ────────────────────────────────────────────────
+// ── Projection worker message handler ─────────────────────────────────────────
 
 function onUMAPWorkerMsg({ data: msg }) {
   if (msg.jobId !== activeUMAPJobId) return;
 
+  // ── PCA result ─────────────────────────────────────────────────────────────
+  if (msg.type === 'pca_result') {
+    const { result, T_A, T_B } = msg;
+    const slot = { coordsA: [], coordsB: [] };
+    for (let i = 0; i < T_A; i++) slot.coordsA.push([result[i * 2], result[i * 2 + 1]]);
+    for (let i = 0; i < T_B; i++) slot.coordsB.push([result[(T_A + i) * 2], result[(T_A + i) * 2 + 1]]);
+    pcaCoords = slot;
+
+    viewZoom = 1; viewPanX = 0; viewPanY = 0;
+    const hadDrawTraj = rawDrawPoints.length >= 2;
+    rawDrawPoints  = [];
+    userTrajectory = pinPoints.length >= 2 ? resamplePath(pinCoords(), 300) : [];
+    coordsA = slot.coordsA;
+    coordsB = slot.coordsB;
+    progWrap.style.display = 'none';
+    if (hadDrawTraj && pinPoints.length < 2) {
+      setStatus('PCA updated — draw trajectory cleared. Redraw to regenerate.');
+    } else {
+      setStatus(`PCA — ${T_A} frames (A) · ${T_B} frames (B)`);
+    }
+    markDirty('WAYPOINTS', 'AUDIO', 'RENDER');
+    return;
+
+  } else if (msg.type === 'pca_error') {
+    progWrap.style.display = 'none';
+    setStatus(msg.message, true);
+    return;
+  }
+
+  // ── UMAP progress / result / error ─────────────────────────────────────────
   if (msg.type === 'umap_progress') {
     const pct   = Math.round(msg.epoch / msg.nEpochs * 100);
     const label = `Layout ${(msg.slotIdx ?? 0) + 1}/${UMAP_N_SLOTS}`;
@@ -714,25 +752,92 @@ function onUMAPWorkerMsg({ data: msg }) {
     }
 
     // If this is the currently-desired slot, display it now.
-    if (slotIdx === umapSlotIdx) {
+    if (slotIdx === umapSlotIdx && projectionMode === 'umap') {
       coordsA = slot.coordsA;
       coordsB = slot.coordsB;
       if (slotIdx !== 0) setStatus(`Layout ${slotIdx + 1} / ${UMAP_N_SLOTS}`);
       markDirty('WAYPOINTS', 'AUDIO', 'RENDER');
     }
 
-    // Chain the next slot in the background (sequential, same worker).
+    // Chain the next slot — but only when UMAP is the active mode.
     const next = slotIdx + 1;
-    if (next < UMAP_N_SLOTS && umapFeatureData) {
+    if (next < UMAP_N_SLOTS && umapFeatureData && projectionMode === 'umap') {
       launchUMAPSlot(next);
     } else {
       progWrap.style.display = 'none';
-      if (slotIdx === UMAP_N_SLOTS - 1) setStatus(`All ${UMAP_N_SLOTS} layouts ready.`);
+      if (projectionMode === 'umap' && slotIdx === UMAP_N_SLOTS - 1)
+        setStatus(`All ${UMAP_N_SLOTS} layouts ready.`);
     }
 
   } else if (msg.type === 'umap_error') {
     progWrap.style.display = 'none';
     setStatus(msg.message, true);
+  }
+}
+
+// ── PCA launch ─────────────────────────────────────────────────────────────────
+
+function launchPCA() {
+  if (!umapFeatureData) return;
+  const { flat, T_A, T_B, D } = umapFeatureData;
+
+  initUMAPWorker();
+  activeUMAPJobId = ++jobSeq;
+
+  progWrap.style.display = 'block';
+  progBar.style.width = '30%';
+  setStatus(`PCA — computing… (${T_A + T_B} frames, ${D} dims)`);
+
+  umapWorker.postMessage({ type: 'compute_pca', jobId: activeUMAPJobId, flat, T_A, T_B, D });
+}
+
+// ── Projection mode toggle ─────────────────────────────────────────────────────
+
+function setProjectionMode(mode) {
+  projectionMode = mode;
+  document.getElementById('togUMAPMode').classList.toggle('active', mode === 'umap');
+  document.getElementById('togPCAMode') .classList.toggle('active', mode === 'pca');
+  document.getElementById('neighborRow').style.display = mode === 'umap' ? '' : 'none';
+  document.getElementById('minDistRow') .style.display = mode === 'umap' ? '' : 'none';
+  slotWrap.classList.toggle('visible', mode === 'umap' && umapSlots.some(s => s));
+
+  if (!umapFeatureData) return; // nothing computed yet — triggerProjection() will dispatch when ready
+
+  if (mode === 'pca') {
+    if (pcaCoords) {
+      // Already have a cached PCA result for current features — switch instantly.
+      coordsA = pcaCoords.coordsA;
+      coordsB = pcaCoords.coordsB;
+      viewZoom = 1; viewPanX = 0; viewPanY = 0;
+      setStatus('PCA');
+      markDirty('WAYPOINTS', 'AUDIO', 'RENDER');
+    } else {
+      launchPCA(); // cancels any in-progress UMAP slot
+    }
+  } else { // umap
+    slotWrap.classList.add('visible');
+    updateSlotDots();
+    if (umapSlots[umapSlotIdx]) {
+      // Desired slot already computed — display immediately.
+      coordsA = umapSlots[umapSlotIdx].coordsA;
+      coordsB = umapSlots[umapSlotIdx].coordsB;
+      viewZoom = 1; viewPanX = 0; viewPanY = 0;
+      setStatus(`Layout ${umapSlotIdx + 1} / ${UMAP_N_SLOTS}`);
+      markDirty('WAYPOINTS', 'AUDIO', 'RENDER');
+    } else {
+      // Find first computed slot and display it; resume background computation.
+      const firstReady = umapSlots.findIndex(s => s);
+      if (firstReady >= 0) {
+        setUMAPSlotIdx(firstReady);
+      } else {
+        umapSlots = Array(UMAP_N_SLOTS).fill(null);
+        umapSlotIdx = 0;
+        updateSlotDots();
+      }
+    }
+    // Resume slot computation from the first uncomputed slot.
+    const nextMissing = umapSlots.findIndex(s => !s);
+    if (nextMissing >= 0) launchUMAPSlot(nextMissing);
   }
 }
 
@@ -926,8 +1031,17 @@ createToggleGroup([
   { el: document.getElementById('togDeltaOnly'), value: 'delta' },
 ], v => { embMode = v; markDirty('COORDS', 'WAYPOINTS', 'AUDIO', 'RENDER'); });
 
-[nNeighborsEl, minDistEl, umapWindowEl].forEach(el =>
-  el.addEventListener('change', () => markDirty('COORDS', 'WAYPOINTS', 'AUDIO', 'RENDER'))
+document.getElementById('togUMAPMode').addEventListener('click', () => setProjectionMode('umap'));
+document.getElementById('togPCAMode') .addEventListener('click', () => setProjectionMode('pca'));
+
+// umapWindow affects the feature matrix → recompute everything.
+umapWindowEl.addEventListener('change', () => markDirty('COORDS', 'WAYPOINTS', 'AUDIO', 'RENDER'));
+
+// nNeighbors / minDist only affect UMAP — skip recompute when in PCA mode.
+[nNeighborsEl, minDistEl].forEach(el =>
+  el.addEventListener('change', () => {
+    if (projectionMode === 'umap') markDirty('COORDS', 'WAYPOINTS', 'AUDIO', 'RENDER');
+  })
 );
 
 document.getElementById('chkTrail').addEventListener('change', scheduleRender);
@@ -1190,23 +1304,28 @@ function codebookLookupFrames(cb, codes, dims, levels) {
 
 // ── UMAP ──────────────────────────────────────────────────────────────────────
 
-// Kick off a full multi-slot UMAP session.
-// Builds features once, then chains slots 0 → UMAP_N_SLOTS-1 sequentially,
-// each with a different seed for a reproducible but varied layout.
-function triggerUMAP() {
+// Kick off a full projection session (PCA or UMAP depending on projectionMode).
+// Builds the shared feature matrix once, then dispatches to the appropriate method.
+function triggerProjection() {
   if (!currentEmbeds) return;
   const sid = ++umapSessionId;
   umapSlots       = Array(UMAP_N_SLOTS).fill(null);
   umapSlotIdx     = 0;
   umapFeatureData = null;
+  pcaCoords       = null;
   updateSlotDots();
-  slotWrap.classList.add('visible');
+  slotWrap.classList.toggle('visible', projectionMode === 'umap');
 
   buildUMAPFeatureData()
     .then(fd => {
-      if (umapSessionId !== sid) return; // superseded by a newer triggerUMAP
+      if (umapSessionId !== sid) return; // superseded by a newer call
       umapFeatureData = fd;
-      launchUMAPSlot(0);
+      if (projectionMode === 'pca') {
+        launchPCA();
+      } else {
+        slotWrap.classList.add('visible');
+        launchUMAPSlot(0);
+      }
     })
     .catch(err => setStatus(err.message, true));
 }
