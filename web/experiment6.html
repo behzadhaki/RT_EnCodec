@@ -366,13 +366,16 @@ let pinDragIdx      = -1;
 let pinSeqDragSrc   = -1;
 
 // Trajectory
-let userTrajectory  = [];
-let rawDrawPoints   = [];
+let userTrajectory       = [];
+let rawDrawSegments      = [];  // completed draw strokes: [[x,y][]]
+let rawDrawPoints        = [];  // currently in-progress stroke: [x,y][]
+let drawSegmentBoundaries = []; // indices in userTrajectory where each non-first segment begins
 let pinPoints       = [];
 let pathMode        = 'draw';      // 'draw' | 'code' | 'snap'
 let trajDir         = 'forward';   // 'forward' | 'backward' | 'pingpong'
 let codePathFrames  = null;
 let snapFrames      = null;
+let snapSegBoundaries = [];   // indices in snapFrames where each non-first segment begins
 let snapPlayFrames  = null;
 let genPlaySeq      = null;
 let codeDurMode     = 'frames';    // 'frames' | 'seconds'
@@ -544,8 +547,54 @@ function getAudioCtx() {
   return audioCtx;
 }
 
+// Build userTrajectory for draw mode: resample each segment independently
+// then concatenate.  Segments are never joined — there is no connecting path
+// between the end of one stroke and the start of the next, so audio jumps
+// directly from one segment's endpoint to the next segment's start point
+// (a hard cut at the boundary, not a smooth traversal of the gap).
+// Each segment gets frames proportional to its own arc length.
+function buildDrawUserTrajectory() {
+  const segs = (rawDrawPoints.length >= 2
+    ? [...rawDrawSegments, rawDrawPoints]
+    : rawDrawSegments
+  ).filter(s => s.length >= 2);
+  if (segs.length === 0) return [];
+
+  // Compute arc length of each segment.
+  const segLens = segs.map(seg => {
+    let len = 0;
+    for (let i = 1; i < seg.length; i++) {
+      const dx = seg[i][0] - seg[i-1][0], dy = seg[i][1] - seg[i-1][1];
+      len += Math.sqrt(dx*dx + dy*dy);
+    }
+    return len;
+  });
+  const totalLen = segLens.reduce((a, b) => a + b, 0);
+  if (totalLen < 1e-12) return [];
+
+  // Resample each segment to a frame count proportional to its length,
+  // then concatenate — no connector between segments.
+  // Record the starting index of each non-first segment so playTrajectory
+  // can skip the cross-boundary lerp.
+  const N_TOTAL = 300;
+  const out = [];
+  drawSegmentBoundaries = [];
+  for (let i = 0; i < segs.length; i++) {
+    if (i > 0) drawSegmentBoundaries.push(out.length);
+    const n = Math.max(2, Math.round(segLens[i] / totalLen * N_TOTAL));
+    out.push(...resamplePath(segs[i], n));
+  }
+  return out;
+}
+
 function renderScatter() {
   const fps = coordsA ? coordsA.length / srcWidget.getDuration() : 1;
+  // Build the visual segments array: completed segments + live stroke if any.
+  const drawSegments = pathMode === 'draw'
+    ? (rawDrawPoints.length >= 1
+        ? [...rawDrawSegments, rawDrawPoints]
+        : rawDrawSegments)
+    : [];
   const result = _renderScatter(umapCanvas, dpr, {
     coordsA, coordsB,
     viewZoom, viewPanX, viewPanY,
@@ -553,8 +602,8 @@ function renderScatter() {
     highlightedPinIdx: waveHighlight
       ? pinPoints.findIndex(p => p.src === waveHighlight.src && p.idx === waveHighlight.idx)
       : -1,
-    selectedPoint, waveHighlight, userTrajectory,
-    pathMode, snapFrames, codePathFrames, trajAnchorPos,
+    selectedPoint, waveHighlight, userTrajectory, drawSegments,
+    pathMode, snapFrames, snapSegBoundaries, codePathFrames, trajAnchorPos,
     snapPlayFrames, trajDir, showTrail: chkTrail.checked, canvasMode, ctxSwapRange,
     snapMode, snapKVal, snapDurVal, framesPerSec: fps,
   });
@@ -699,8 +748,8 @@ function onUMAPWorkerMsg({ data: msg }) {
     pcaCoords = slot;
 
     viewZoom = 1; viewPanX = 0; viewPanY = 0;
-    const hadDrawTraj = rawDrawPoints.length >= 2;
-    rawDrawPoints  = [];
+    const hadDrawTraj = rawDrawSegments.some(s => s.length >= 2) || rawDrawPoints.length >= 2;
+    rawDrawSegments = []; rawDrawPoints = []; drawSegmentBoundaries = [];
     userTrajectory = pinPoints.length >= 2 ? resamplePath(pinCoords(), 300) : [];
     coordsA = slot.coordsA;
     coordsB = slot.coordsB;
@@ -741,8 +790,8 @@ function onUMAPWorkerMsg({ data: msg }) {
     //   - pin trajectories are {src,idx} based and auto-remap — no reset needed
     if (slotIdx === 0) {
       viewZoom = 1; viewPanX = 0; viewPanY = 0;
-      const hadDrawTraj = rawDrawPoints.length >= 2;
-      rawDrawPoints  = [];
+      const hadDrawTraj = rawDrawSegments.some(s => s.length >= 2) || rawDrawPoints.length >= 2;
+      rawDrawSegments = []; rawDrawPoints = []; drawSegmentBoundaries = [];
       userTrajectory = pinPoints.length >= 2 ? resamplePath(pinCoords(), 300) : [];
       if (hadDrawTraj && pinPoints.length < 2) {
         setStatus('UMAP updated — draw trajectory cleared. Redraw to regenerate.');
@@ -1090,7 +1139,7 @@ const setSnapMode = mode => {
   document.getElementById('togSnapEq')  .classList.toggle('active', mode === 'equal');
   document.getElementById('togSnapProp').classList.toggle('active', mode === 'proportional');
   applySnapParamUI();
-  snapFrames = null; snapPlayFrames = null;
+  snapFrames = null; snapSegBoundaries = []; snapPlayFrames = null;
   autoRegenerate();
 };
 document.getElementById('togSnapK')   .addEventListener('click', () => setSnapMode('k_frames'));
@@ -1108,7 +1157,7 @@ const setPathMode = mode => {
   document.getElementById('trailToggle').style.display   = mode === 'snap' ? '' : 'none';
   if (mode === 'code') applyCodeParamUI();
   if (mode === 'snap') applySnapParamUI();
-  codePathFrames = null; snapFrames = null; snapPlayFrames = null;
+  codePathFrames = null; snapFrames = null; snapSegBoundaries = []; snapPlayFrames = null;
   autoRegenerate();
 };
 document.getElementById('togDrawMode').addEventListener('click', () => setPathMode('draw'));
@@ -1153,9 +1202,9 @@ document.getElementById('ctxSwapSlider').addEventListener('input', e => {
 document.getElementById('clearTraj').addEventListener('click', () => {
   stopTrajPlayback();
   playerG.stop();
-  userTrajectory = []; rawDrawPoints = []; pinPoints = [];
+  userTrajectory = []; rawDrawSegments = []; rawDrawPoints = []; drawSegmentBoundaries = []; pinPoints = [];
   trajAudioBuf = null; codePathFrames = null;
-  snapFrames = null; snapPlayFrames = null; genPlaySeq = null;
+  snapFrames = null; snapSegBoundaries = []; snapPlayFrames = null; genPlaySeq = null;
   trajAnchorPos = -1;
   updatePinSeqBar();
   scheduleRender(); setStatus('Trajectory cleared.');
@@ -1564,14 +1613,14 @@ function setCanvasMode(mode) {
   togDraw   .classList.toggle('active', mode === 'draw');
   togPins   .classList.toggle('active', mode === 'pins');
   umapCanvas.style.cursor = mode === 'pins' ? 'cell' : 'crosshair';
-  if (mode === 'draw')    setStatus('Click and drag on the UMAP to draw a trajectory.');
+  if (mode === 'draw')    setStatus('Click and drag to draw. Each stroke adds a new segment.');
   if (mode === 'pins')    setStatus('Double-click near a UMAP point to add/remove pins.');
   if (mode === 'explore') setStatus('');
   updatePinSeqBar();
   // Sync trajectory source to new mode and regenerate
-  if (mode === 'draw')      userTrajectory = rawDrawPoints.length >= 2 ? resamplePath(rawDrawPoints, 300) : [];
+  if (mode === 'draw')      userTrajectory = buildDrawUserTrajectory();
   else if (mode === 'pins') userTrajectory = pinPoints.length    >= 2 ? resamplePath(pinCoords(), 300)    : [];
-  if (userTrajectory.length < 2) { snapFrames = null; codePathFrames = null; snapPlayFrames = null; }
+  if (userTrajectory.length < 2) { snapFrames = null; snapSegBoundaries = []; codePathFrames = null; snapPlayFrames = null; }
   autoRegenerate();
 }
 
@@ -1680,8 +1729,7 @@ umapCanvas.addEventListener('mousedown', e => {
   }
   if (canvasMode === 'draw') {
     isDrawing = true;
-    rawDrawPoints = [canvasToUmap(e)];
-    userTrajectory = rawDrawPoints.slice();
+    rawDrawPoints = [canvasToUmap(e)];  // start fresh stroke; rawDrawSegments kept
     trajAnchorPos = -1;
     scheduleRender();
     return;
@@ -1734,7 +1782,7 @@ umapCanvas.addEventListener('mousemove', e => {
     const dy = (pt[1] - last[1]) * lastTransform.scale;
     if (dx*dx + dy*dy < (2 * dpr) ** 2) return;
     rawDrawPoints.push(pt);
-    userTrajectory = rawDrawPoints;
+    userTrajectory = buildDrawUserTrajectory();
     scheduleRender();
     return;
   }
@@ -1773,7 +1821,9 @@ const finishPinDrag = () => {
 const finishDraw = () => {
   if (!isDrawing) return;
   isDrawing = false;
-  userTrajectory = rawDrawPoints.length >= 2 ? resamplePath(rawDrawPoints, 300) : [];
+  if (rawDrawPoints.length >= 2) rawDrawSegments.push(rawDrawPoints);
+  rawDrawPoints = [];
+  userTrajectory = buildDrawUserTrajectory();
   autoRegenerate();
 };
 
@@ -1933,6 +1983,7 @@ function snapWaypointArgs() {
     userTrajectory, pathMode, snapMode, snapDurVal, codeSecVal,
     trajDuration: parseFloat(trajDurationEl.value) || 4,
     framesPerSec: coordsA ? coordsA.length / srcWidget.getDuration() : 1,
+    drawSegmentBoundaries,
   };
 }
 
@@ -1945,7 +1996,7 @@ function computeWaypoints() {
       ? Math.max(2, codeKVal)
       : Math.max(2, Math.round(codeSecVal * fps));
 
-    const fwdWPs = computeSnapWaypoints(snapWaypointArgs());
+    const { wps: fwdWPs } = computeSnapWaypoints(snapWaypointArgs());
     if (!fwdWPs.length) return;
     const bwdWPs = [...fwdWPs].reverse();
 
@@ -1963,13 +2014,24 @@ function computeWaypoints() {
     setCodeSeqInfo(orderedWPs, K);
 
   } else if (pathMode === 'snap') {
-    const fwdWPs = computeSnapWaypoints(snapWaypointArgs());
+    const { wps: fwdWPs, segBoundaries: fwdSegBounds } = computeSnapWaypoints(snapWaypointArgs());
     if (!fwdWPs.length) return;
     const bwdWPs = [...fwdWPs].reverse();
+    const M = fwdWPs.length;
+    // Mirror fwd boundaries into the reversed sequence: boundary at b → M-b in bwd
+    const bwdSegBounds = fwdSegBounds.map(b => M - b).reverse();
 
-    snapFrames = trajDir === 'backward' ? bwdWPs
-               : trajDir === 'pingpong' ? [...fwdWPs, ...bwdWPs]
-               : fwdWPs;
+    if (trajDir === 'backward') {
+      snapFrames        = bwdWPs;
+      snapSegBoundaries = bwdSegBounds;
+    } else if (trajDir === 'pingpong') {
+      snapFrames        = [...fwdWPs, ...bwdWPs];
+      // fwd boundaries + bwd boundaries shifted by M (junction itself is connected — turnaround)
+      snapSegBoundaries = [...fwdSegBounds, ...bwdSegBounds.map(b => M + b)];
+    } else {
+      snapFrames        = fwdWPs;
+      snapSegBoundaries = fwdSegBounds;
+    }
 
     const is48k   = mp.getModelHz() === '48k';
     const K_post  = is48k ? Math.max(2, Math.round(fps * 0.03)) : 0;
@@ -2120,7 +2182,9 @@ async function playTrajectory() {
     const frac = drawFrac(i);
     const ti   = frac * (userTrajectory.length - 1);
     const lo   = Math.floor(ti), hi = Math.min(lo + 1, userTrajectory.length - 1);
-    const t    = ti - lo;
+    // Never interpolate across a segment boundary — that would traverse the gap
+    // between two unconnected strokes and generate frames the user never drew.
+    const t    = drawSegmentBoundaries.some(b => lo < b && hi >= b) ? 0 : (ti - lo);
     const px   = userTrajectory[lo][0] + t * (userTrajectory[hi][0] - userTrajectory[lo][0]);
     const py   = userTrajectory[lo][1] + t * (userTrajectory[hi][1] - userTrajectory[lo][1]);
 

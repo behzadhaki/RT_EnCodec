@@ -152,10 +152,15 @@ export function findNearestUmapPoint(umapX, umapY, coordsA, coordsB) {
 
 // Sample the drawn path / pin list and snap each sample to the nearest UMAP frame.
 // Returns deduplicated [{src,idx}] waypoints.
+//
+// drawSegmentBoundaries (optional): array of indices in userTrajectory where each
+// non-first draw segment begins.  When present, each segment is sampled independently
+// so the gap between unconnected strokes is never traversed.
 export function computeSnapWaypoints({
   canvasMode, pinPoints, coordsA, coordsB,
   userTrajectory, pathMode, snapMode, snapDurVal, codeSecVal,
   trajDuration, framesPerSec,
+  drawSegmentBoundaries = [],
 }) {
   if (!coordsA || !coordsB) return [];
 
@@ -176,6 +181,37 @@ export function computeSnapWaypoints({
             : (trajDuration || 4);
   const N = Math.max(2, Math.round(dur * framesPerSec));
 
+  // ── Multi-segment: sample each segment independently, then concatenate ────────
+  // userTrajectory points are pre-allocated proportional to each segment's arc
+  // length by buildDrawUserTrajectory, so (end-start)/totalPts gives the correct
+  // frame share for each segment.
+  if (drawSegmentBoundaries.length > 0) {
+    const allBounds = [0, ...drawSegmentBoundaries, userTrajectory.length];
+    const totalPts  = userTrajectory.length;
+    const raw = [];
+    const segBoundaries = [];  // indices in raw[] where each non-first segment begins
+    for (let si = 0; si < allBounds.length - 1; si++) {
+      const start = allBounds[si], end = allBounds[si + 1];
+      if (end - start < 2) continue;
+      if (si > 0) segBoundaries.push(raw.length);
+      const segN = Math.max(2, Math.round((end - start) / totalPts * N));
+      for (let i = 0; i < segN; i++) {
+        const frac = i / (segN - 1);
+        const ti   = frac * (end - start - 1);
+        const lo   = start + Math.floor(ti);
+        const hi   = Math.min(lo + 1, end - 1);
+        const tt   = ti - Math.floor(ti);
+        const px   = userTrajectory[lo][0] + tt * (userTrajectory[hi][0] - userTrajectory[lo][0]);
+        const py   = userTrajectory[lo][1] + tt * (userTrajectory[hi][1] - userTrajectory[lo][1]);
+        const { src: bestSrc, idx: bestIdx } = findNearestUmapPoint(px, py, coordsA, coordsB);
+        const last = raw[raw.length - 1];
+        if (!last || last.src !== bestSrc || last.idx !== bestIdx) raw.push({ src: bestSrc, idx: bestIdx });
+      }
+    }
+    return { wps: raw, segBoundaries };
+  }
+
+  // ── Single segment (or pins mode): original logic ─────────────────────────────
   const raw = [];
   for (let i = 0; i < N; i++) {
     const frac = i / (N - 1);
@@ -188,7 +224,7 @@ export function computeSnapWaypoints({
     const last = raw[raw.length - 1];
     if (!last || last.src !== bestSrc || last.idx !== bestIdx) raw.push({ src: bestSrc, idx: bestIdx });
   }
-  return raw;
+  return { wps: raw, segBoundaries: [] };
 }
 
 // Compute per-waypoint context (pre-roll) frame counts.

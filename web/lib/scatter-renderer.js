@@ -10,7 +10,8 @@ import { getContextKs, walkBackward } from './trajectory-utils.js';
 //   pinPoints               — [[umapX,umapY],…]
 //   selectedPoint           — {src,idx} | null
 //   waveHighlight           — {src,idx} | null
-//   userTrajectory          — [[umapX,umapY],…]
+//   userTrajectory          — [[umapX,umapY],…]  (concatenated flat path for playback)
+//   drawSegments            — [[[umapX,umapY],…],…]  (per-stroke for rendering; draw mode only)
 //   pathMode                — 'draw'|'code'|'snap'
 //   snapFrames, codePathFrames
 //   trajAnchorPos           — 0..1 during playback, -1 = off
@@ -47,7 +48,8 @@ export function renderScatter(canvas, dpr, state) {
 
   const {
     pinPoints, highlightedPinIdx = -1, selectedPoint, waveHighlight, userTrajectory,
-    pathMode, snapFrames, codePathFrames, trajAnchorPos,
+    drawSegments,
+    pathMode, snapFrames, snapSegBoundaries, codePathFrames, trajAnchorPos,
     snapPlayFrames, trajDir, showTrail, ctxSwapRange,
     snapMode, snapKVal, snapDurVal, framesPerSec, canvasMode,
   } = state;
@@ -164,17 +166,36 @@ export function renderScatter(canvas, dpr, state) {
     }
   }
 
-  if (canvasMode === 'draw' && userTrajectory.length >= 2) {
+  if (canvasMode === 'draw' && drawSegments && drawSegments.length > 0) {
+    // Draw each segment as a dashed white line.
     ctx.save();
     ctx.strokeStyle = '#ffffff';
     ctx.lineWidth   = 2 * dpr;
     ctx.globalAlpha = 0.75;
     ctx.setLineDash([4 * dpr, 3 * dpr]);
-    ctx.beginPath();
-    ctx.moveTo(toX(userTrajectory[0][0]), toY(userTrajectory[0][1]));
-    for (let i = 1; i < userTrajectory.length; i++)
-      ctx.lineTo(toX(userTrajectory[i][0]), toY(userTrajectory[i][1]));
-    ctx.stroke();
+    for (const seg of drawSegments) {
+      if (seg.length < 2) continue;
+      ctx.beginPath();
+      ctx.moveTo(toX(seg[0][0]), toY(seg[0][1]));
+      for (let i = 1; i < seg.length; i++)
+        ctx.lineTo(toX(seg[i][0]), toY(seg[i][1]));
+      ctx.stroke();
+    }
+    ctx.restore();
+
+    // Small filled circle at the start of each non-first segment — marks where
+    // the user began that stroke so segment boundaries are visually clear.
+    ctx.save();
+    ctx.fillStyle   = '#ffffff';
+    ctx.globalAlpha = 0.85;
+    ctx.setLineDash([]);
+    for (let si = 1; si < drawSegments.length; si++) {
+      const seg = drawSegments[si];
+      if (seg.length < 1) continue;
+      ctx.beginPath();
+      ctx.arc(toX(seg[0][0]), toY(seg[0][1]), 3.5 * dpr, 0, 2 * Math.PI);
+      ctx.fill();
+    }
     ctx.restore();
   }
 
@@ -239,10 +260,11 @@ export function renderScatter(canvas, dpr, state) {
     ctx.strokeStyle = '#888888';
     ctx.lineWidth   = 1.5 * dpr;
     ctx.globalAlpha = 0.75;
+    const segBoundSet = new Set(snapSegBoundaries || []);
     ctx.beginPath();
     for (let i = 0; i < snapFrames.length; i++) {
       const [x, y] = ptOf(snapFrames[i]);
-      i === 0 ? ctx.moveTo(toX(x), toY(y)) : ctx.lineTo(toX(x), toY(y));
+      (i === 0 || segBoundSet.has(i)) ? ctx.moveTo(toX(x), toY(y)) : ctx.lineTo(toX(x), toY(y));
     }
     ctx.stroke();
 
