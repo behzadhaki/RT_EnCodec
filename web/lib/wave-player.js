@@ -20,12 +20,18 @@ export function makeWavePlayer(canvasId, waveColor, { getAudioCtx, getMasterDest
   let cursorPos = -1;
   let playBtnEl = null, loopBtnEl = null;
 
+  // Optional per-pixel color function: colorFn(pos: 0..1) → CSS color string.
+  // When set, each pixel column is filled with its own color instead of waveColor.
+  // pixelColors is the precomputed per-pixel cache (rebuilt on resize / audio change).
+  let colorFn     = null;
+  let pixelColors = null;
+
   const dur      = () => audio ? audio.length / sr : 0;
   const elapsed  = () => playing ? playOffset + (getAudioCtx().currentTime - playStart) : playOffset;
   const position = () => dur() > 0 ? Math.min(1, elapsed() / dur()) : 0;
 
   function buildPeaks() {
-    if (!audio || !cvs.width) { peaks = null; return; }
+    if (!audio || !cvs.width) { peaks = null; pixelColors = null; return; }
     const W = cvs.width;
     peaks = new Float32Array(W * 2);
     for (let px = 0; px < W; px++) {
@@ -36,6 +42,14 @@ export function makeWavePlayer(canvasId, waveColor, { getAudioCtx, getMasterDest
         const v = audio[s]; if (v < mn) mn = v; if (v > mx) mx = v;
       }
       peaks[px * 2] = mn; peaks[px * 2 + 1] = mx;
+    }
+
+    // Precompute per-pixel colors if a color function is set.
+    if (colorFn) {
+      pixelColors = new Array(W);
+      for (let px = 0; px < W; px++) pixelColors[px] = colorFn(px / W);
+    } else {
+      pixelColors = null;
     }
   }
 
@@ -52,12 +66,32 @@ export function makeWavePlayer(canvasId, waveColor, { getAudioCtx, getMasterDest
     }
 
     const cy = H / 2;
-    c2.fillStyle = waveColor;
     c2.globalAlpha = 0.5;
-    for (let px = 0; px < W; px++) {
-      const mn = peaks[px * 2], mx = peaks[px * 2 + 1];
-      c2.fillRect(px, cy - mx * cy, 1, Math.max(1, (mx - mn) * cy));
+
+    if (pixelColors) {
+      // Per-pixel color — group consecutive same-color pixels into runs for efficiency.
+      let runColor = pixelColors[0];
+      let runStart = 0;
+      for (let px = 1; px <= W; px++) {
+        const col = px < W ? pixelColors[px] : null;
+        if (col !== runColor) {
+          c2.fillStyle = runColor;
+          for (let rx = runStart; rx < px; rx++) {
+            const mn = peaks[rx * 2], mx = peaks[rx * 2 + 1];
+            c2.fillRect(rx, cy - mx * cy, 1, Math.max(1, (mx - mn) * cy));
+          }
+          runColor = col;
+          runStart = px;
+        }
+      }
+    } else {
+      c2.fillStyle = waveColor;
+      for (let px = 0; px < W; px++) {
+        const mn = peaks[px * 2], mx = peaks[px * 2 + 1];
+        c2.fillRect(px, cy - mx * cy, 1, Math.max(1, (mx - mn) * cy));
+      }
     }
+
     c2.globalAlpha = 1;
 
     if (cursorPos >= 0) {
@@ -157,7 +191,10 @@ export function makeWavePlayer(canvasId, waveColor, { getAudioCtx, getMasterDest
   ro.observe(cvs);
 
   return {
-    setAudio(f32, sampleRate) {
+    // colorFn: optional (pos: 0..1) => CSS color string.
+    // Pass null to revert to the player's default waveColor.
+    setAudio(f32, sampleRate, newColorFn = null) {
+      colorFn = newColorFn;
       const wasPlaying = playing;
       const wasOffset  = playing ? elapsed() : 0;
       audio = f32; sr = sampleRate;

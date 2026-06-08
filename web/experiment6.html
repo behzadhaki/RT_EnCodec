@@ -160,7 +160,8 @@ controls.appendChild(srcWidget.element);
 const { panelA, panelB } = srcWidget;
 
 const mp = createModelPanel({
-  defaultModel: '24k',
+  defaultModel: '48k',
+  defaultBw:    24,
   onChange: () => { currentEmbeds = null; scheduleEncode(0); },
 });
 controls.appendChild(mp.modelSection);
@@ -371,7 +372,7 @@ let codeKVal        = 100;
 let codeSecVal      = 4;
 let snapMode        = 'k_frames';  // 'k_frames' | 'equal' | 'proportional'
 let snapKVal        = 8;
-let snapDurVal      = 4;
+let snapDurVal      = 2;
 let ctxSwapRange    = 0;
 
 // Playback
@@ -755,7 +756,7 @@ function onWorkerMsg(e) {
     if (msg.jobId === playJobId) {
       const sr = mp.getSampleRate();
       stopTrajPlayback();
-      playerG.setAudio(msg.decoded, sr);
+      playerG.setAudio(msg.decoded, sr, makeGenColorFn());
       setStatus('');
     }
     return;
@@ -999,6 +1000,10 @@ const setPathMode = mode => {
 document.getElementById('togDrawMode').addEventListener('click', () => setPathMode('draw'));
 document.getElementById('togCodeMode').addEventListener('click', () => setPathMode('code'));
 document.getElementById('togSnapMode').addEventListener('click', () => setPathMode('snap'));
+
+// Apply startup defaults — Equal/2s snap so "duration" is the active parameter.
+setSnapMode('equal');
+setPathMode('snap');
 
 const setTrajDir = dir => {
   trajDir = dir;
@@ -1887,6 +1892,21 @@ function autoRegenerate() {
     setStatus('Path drawn. Encode sources and run UMAP to play.');
   }
   markDirty('WAYPOINTS', 'AUDIO', 'RENDER');
+}
+
+// Build a per-position color function for the generated waveform based on
+// the source (A or B) of each frame in genPlaySeq.
+// Returns null for draw mode (interpolated — no discrete source attribution).
+function makeGenColorFn() {
+  if (!genPlaySeq || genPlaySeq.length === 0 || pathMode === 'draw') return null;
+  const seq = genPlaySeq; // capture snapshot
+  const N   = seq.length;
+  const colA = '#c87800'; // matches playerA waveColor
+  const colB = '#2090c0'; // matches playerB waveColor
+  return pos => {
+    const fi = Math.min(N - 1, Math.floor(pos * N));
+    return seq[fi].src === 'A' ? colA : colB;
+  };
 }
 
 async function playTrajectory() {
