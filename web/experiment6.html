@@ -614,7 +614,7 @@ function buildDrawUserTrajectory() {
 function renderScatter() {
   const fps = coordsA ? coordsA.length / srcWidget.getDuration() : 1;
   // Build the visual segments array: completed segments + live stroke if any.
-  const drawSegments = pathMode === 'draw'
+  const drawSegments = canvasMode === 'draw'
     ? (rawDrawPoints.length >= 1
         ? [...rawDrawSegments, { pts: rawDrawPoints, enabled: true }]
         : rawDrawSegments)
@@ -1751,7 +1751,7 @@ umapCanvas.addEventListener('mousedown', e => {
     umapCanvas.style.cursor = 'move';
     return;
   }
-  if (canvasMode === 'draw') {
+  if (canvasMode === 'draw' && e.button === 0) {
     isDrawing = true;
     rawDrawPoints = [canvasToUmap(e)];  // start fresh stroke; rawDrawSegments kept
     trajAnchorPos = -1;
@@ -1851,7 +1851,7 @@ const finishDraw = () => {
   autoRegenerate();
 };
 
-umapCanvas.addEventListener('mouseup',    () => { finishPanDrag(); finishShiftDrag(); finishDraw(); finishPinDrag(); });
+umapCanvas.addEventListener('mouseup', e => { finishPanDrag(); finishShiftDrag(); if (e.button === 0) finishDraw(); finishPinDrag(); });
 umapCanvas.addEventListener('mouseleave', () => { finishPanDrag(); finishShiftDrag(); finishDraw(); finishPinDrag(); });
 
 // ── Draw-segment context menu ─────────────────────────────────────────────────
@@ -1873,7 +1873,7 @@ function ptSegDist2(px, py, ax, ay, bx, by) {
 }
 
 // Returns index of rawDrawSegments closest to (physX, physY) within threshold, or -1.
-function hitTestSegments(physX, physY, threshPx = 7) {
+function hitTestSegments(physX, physY, threshPx = 12) {
   if (!lastTransform) return -1;
   const thresh2 = (threshPx * dpr) ** 2;
   let bestDist2 = Infinity, bestIdx = -1;
