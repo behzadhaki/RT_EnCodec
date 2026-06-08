@@ -14,6 +14,7 @@ export function makeWavePlayer(canvasId, waveColor, { getAudioCtx, getMasterDest
   let looping = false;
   let playing = false;
   let srcNode = null, gainNode = null;
+  let volume  = 1.0;
   let playStart  = 0;
   let playOffset = 0;
   let animId  = null;
@@ -146,13 +147,13 @@ export function makeWavePlayer(canvasId, waveColor, { getAudioCtx, getMasterDest
       oldGain.gain.setValueAtTime(oldGain.gain.value, now);
       oldGain.gain.linearRampToValueAtTime(0, now + XFADE_S);
       newGain.gain.setValueAtTime(0, now);
-      newGain.gain.linearRampToValueAtTime(1, now + XFADE_S);
+      newGain.gain.linearRampToValueAtTime(volume, now + XFADE_S);
       oldSrc.stop(now + XFADE_S + 0.01);
       oldSrc.onended = () => { try { oldGain.disconnect(); } catch (_) {} };
     } else {
       if (oldSrc)  { try { oldSrc.stop();       } catch (_) {} }
       if (oldGain) { try { oldGain.disconnect(); } catch (_) {} }
-      newGain.gain.value = 1;
+      newGain.gain.value = volume;
     }
 
     newSrc.start(now, playOffset);
@@ -222,6 +223,10 @@ export function makeWavePlayer(canvasId, waveColor, { getAudioCtx, getMasterDest
       cancelAnimationFrame(animId); updatePlayBtn(); draw(); onFrameCb?.(-1);
     },
     setLoop(on) { looping = on; loopBtnEl?.classList.toggle('active', on); },
+    setVolume(v) {
+      volume = Math.max(0, v);
+      if (gainNode) gainNode.gain.setTargetAtTime(volume, getAudioCtx().currentTime, 0.01);
+    },
     setCursor(pos) { cursorPos = pos; draw(); },
     setPlayBtn(el) { playBtnEl = el; updatePlayBtn(); },
     setLoopBtn(el) { loopBtnEl = el; },

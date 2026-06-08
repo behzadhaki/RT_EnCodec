@@ -122,6 +122,20 @@
       <div class="wavePanel">
         <div class="waveHeader">
           <span class="waveLbl">Generated</span>
+          <div style="display:flex;align-items:center;gap:3px">
+            <span style="font-size:10px;color:var(--muted)">fade</span>
+            <input type="number" id="fadeInMs"  value="10" min="0" max="2000" step="5"
+                   style="width:34px;font-size:10px;background:var(--surface2);border:1px solid var(--border2);color:var(--text);border-radius:2px;padding:1px 3px">
+            <span style="font-size:10px;color:var(--muted)">in</span>
+            <input type="number" id="fadeOutMs" value="10" min="0" max="2000" step="5"
+                   style="width:34px;font-size:10px;background:var(--surface2);border:1px solid var(--border2);color:var(--text);border-radius:2px;padding:1px 3px">
+            <span style="font-size:10px;color:var(--muted)">out ms</span>
+          </div>
+          <div style="display:flex;align-items:center;gap:3px">
+            <span style="font-size:10px;color:var(--muted)">vol</span>
+            <input type="range" id="genVolSlider" min="0" max="2" step="0.01" value="1"
+                   style="width:52px;accent-color:var(--accent);cursor:pointer">
+          </div>
           <div class="waveCtrl">
             <button class="waveBtn" id="wbPlayG">▶</button>
             <button class="waveBtn" id="wbStopG">■</button>
@@ -411,6 +425,8 @@ let snapFrames      = null;
 let snapSegBoundaries = [];   // indices in snapFrames where each non-first segment begins
 let snapPlayFrames  = null;
 let genPlaySeq      = null;
+let lastRawPcm      = null;   // unfaded decoded PCM, kept so fade edits apply instantly
+let lastRawPcmSr    = 44100;
 let codeDurMode     = 'frames';    // 'frames' | 'seconds'
 let codeKVal        = 100;
 let codeSecVal      = 4;
@@ -927,6 +943,21 @@ function setProjectionMode(mode) {
   }
 }
 
+function applyFade(pcm, sr, fadeInMs, fadeOutMs) {
+  const out     = pcm.slice();
+  const fadeIn  = Math.round(fadeInMs  / 1000 * sr);
+  const fadeOut = Math.round(fadeOutMs / 1000 * sr);
+  for (let i = 0; i < Math.min(fadeIn,  out.length); i++) out[i]                  *= i / fadeIn;
+  for (let i = 0; i < Math.min(fadeOut, out.length); i++) out[out.length - 1 - i] *= i / fadeOut;
+  return out;
+}
+
+function applyGenFade(pcm, sr) {
+  const fadeIn  = parseFloat(document.getElementById('fadeInMs').value)  || 0;
+  const fadeOut = parseFloat(document.getElementById('fadeOutMs').value) || 0;
+  return (fadeIn > 0 || fadeOut > 0) ? applyFade(pcm, sr, fadeIn, fadeOut) : pcm;
+}
+
 function onWorkerMsg(e) {
   const msg = e.data;
 
@@ -946,8 +977,10 @@ function onWorkerMsg(e) {
   if (msg.type === 'trajectory_audio_exp6') {
     if (msg.jobId === playJobId) {
       const sr = mp.getSampleRate();
+      lastRawPcm   = msg.decoded;
+      lastRawPcmSr = sr;
       stopTrajPlayback();
-      playerG.setAudio(msg.decoded, sr, makeGenColorFn());
+      playerG.setAudio(applyGenFade(msg.decoded, sr), sr, makeGenColorFn());
       setStatus('');
     }
     return;
@@ -1243,6 +1276,17 @@ snapParamInput.addEventListener('change', e => {
 });
 
 trajDurationEl.addEventListener('change', () => autoRegenerate());
+
+['fadeInMs', 'fadeOutMs'].forEach(id => {
+  document.getElementById(id).addEventListener('input', () => {
+    if (!lastRawPcm) return;
+    playerG.setAudio(applyGenFade(lastRawPcm, lastRawPcmSr), lastRawPcmSr, makeGenColorFn());
+  });
+});
+
+document.getElementById('genVolSlider').addEventListener('input', e => {
+  playerG.setVolume(parseFloat(e.target.value));
+});
 
 document.getElementById('ctxSwapSlider').addEventListener('input', e => {
   ctxSwapRange = parseFloat(e.target.value);
