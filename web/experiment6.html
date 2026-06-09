@@ -1231,16 +1231,52 @@ function renderBookmarkList() {
   }
 }
 
-function addBookmark() {
+// Render PCM through the notch filter chain offline (mirrors the live audio graph).
+// Returns a new Float32Array with the filter applied, or the original if disabled.
+async function applyNotchOffline(pcm, sr) {
+  if (!postProcEnabled) return pcm;
+  const maxFreq = sr / 2 - 1;
+  const freqs = [];
+  for (let h = 1; h * notchFundamental <= maxFreq; h++) freqs.push(h * notchFundamental);
+  if (freqs.length === 0) return pcm;
+
+  const offCtx = new OfflineAudioContext(1, pcm.length, sr);
+  const buf    = offCtx.createBuffer(1, pcm.length, sr);
+  buf.copyToChannel(pcm, 0);
+  const src = offCtx.createBufferSource();
+  src.buffer = buf;
+
+  let prev = src;
+  for (const freq of freqs) {
+    const f = offCtx.createBiquadFilter();
+    f.type = 'notch';
+    f.frequency.value = freq;
+    f.Q.value = notchQ;
+    prev.connect(f);
+    prev = f;
+  }
+  prev.connect(offCtx.destination);
+  src.start(0);
+
+  const rendered = await offCtx.startRendering();
+  return rendered.getChannelData(0);
+}
+
+async function addBookmark() {
   if (!lastRawPcm) return;
-  const pcm  = applyGenFade(lastRawPcm, lastRawPcmSr); // snapshot with current fade settings
+  // Disable button while rendering to prevent double-clicks
+  const btn = document.getElementById('wbBookmark');
+  btn.style.opacity = '0.5';
+  btn.style.cursor  = 'default';
+
+  let pcm = applyGenFade(lastRawPcm, lastRawPcmSr);
+  pcm = await applyNotchOffline(pcm, lastRawPcmSr);
+
   const name = makeBookmarkName();
   bookmarks.push({ id: bookmarkSeq, name, pcm, sr: lastRawPcmSr });
   renderBookmarkList();
   // Brief visual flash on the button to confirm
-  const btn = document.getElementById('wbBookmark');
-  btn.style.opacity = '1';
-  btn.style.color   = 'var(--accent)';
+  btn.style.color = 'var(--accent)';
   setTimeout(() => { btn.style.color = ''; updateBookmarkBtn(); }, 600);
 }
 
