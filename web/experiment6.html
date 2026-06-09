@@ -762,6 +762,8 @@ function hasWaypointSource() {
   return (canvasMode === 'pins' && pinPoints.length >= 1) || userTrajectory.length >= 2;
 }
 
+let audioDebounceTimer = null;
+
 function runEffects() {
   if (dirty.COORDS && currentEmbeds) {
     dirty.COORDS = false;
@@ -777,7 +779,11 @@ function runEffects() {
       && hasWaypointSource()
       && (genPlaySeq !== null || pathMode === 'draw')) {
     dirty.AUDIO = false;
-    playTrajectory();
+    // Immediately stale any in-flight decode so its response is discarded.
+    playJobId = ++jobSeq;
+    // Debounce the actual dispatch — only fires after 200 ms of quiet.
+    clearTimeout(audioDebounceTimer);
+    audioDebounceTimer = setTimeout(playTrajectory, 200);
   }
   if (dirty.RENDER) {
     dirty.RENDER = false;
