@@ -1796,14 +1796,15 @@ umapCanvas.addEventListener('wheel', e => {
   const cx   = (e.clientX - rect.left) * dpr;
   const cy   = (e.clientY - rect.top)  * dpr;
   if (e.ctrlKey || e.metaKey) {
+    // Pinch-to-zoom (macOS trackpad reports pinch as ctrlKey wheel)
     applyZoom(cx, cy, Math.exp(-e.deltaY * 0.01));
   } else if (e.shiftKey) {
-    // Shift + two-finger scroll → pan
-    viewPanX -= e.deltaX; viewPanY -= e.deltaY;
-  } else if (Math.abs(e.deltaX) > Math.abs(e.deltaY) * 0.5 && Math.abs(e.deltaX) > 2) {
-    viewPanX -= e.deltaX; viewPanY -= e.deltaY;
+    // Shift + swipe → zoom in/out centered on cursor
+    applyZoom(cx, cy, Math.exp(-e.deltaY * 0.005));
   } else {
-    applyZoom(cx, cy, Math.exp(-e.deltaY * 0.003));
+    // Plain two-finger swipe → pan in any direction
+    viewPanX -= e.deltaX;
+    viewPanY -= e.deltaY;
   }
   scheduleRender();
 }, { passive: false });
