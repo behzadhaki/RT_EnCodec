@@ -319,43 +319,36 @@ Builds the pre-roll context (K frames) that leads into each snap waypoint. Two p
 
 ### Algorithm
 
-Each step has two phases:
+The decision is **per-waypoint**, not per-step:
 
-1. **Temporal step (always happens)** — move to `(cSrc, cIdx - 1)` and record it.
+1. **Pure temporal walk** — walk K steps backward: `[A33, A34, A35, A36, A37, A38, A39]` → waypoint A40.
 
-2. **Post-step swap check (probabilistic)** — with probability `ctxSwapProb`, collect all frames from **both sources A and B** whose UMAP distance to the current position is `< ctxSwapDist` (excluding the exact current frame). If any exist, pick one **at random** and record it; subsequent steps continue from that frame.
+2. **Waypoint swap decision** — roll `ctxSwapProb` once. If it doesn't fire, return the pure temporal walk unchanged.
 
-```js
-// Step 1 — temporal
-cIdx -= 1;
-frames.unshift({ src: cSrc, idx: cIdx });
+3. **Random branch point** — pick a uniformly random position in the pre-roll (e.g. A36 at index 3).
 
-// Step 2 — probabilistic swap
-if (prob > 0 && range > 0 && Math.random() < prob) {
-  const [cx, cy] = (cSrc === 'A' ? coordsA : coordsB)[cIdx];
-  const candidates = [];
-  // collect from both sources within range (d > 0 excludes self)
-  for (let j = 0; j < coordsA.length; j++) {
-    const d = dist(coordsA[j], [cx, cy]);
-    if (d > 0 && d < range) candidates.push({ src: 'A', idx: j });
-  }
-  for (let j = 0; j < coordsB.length; j++) {
-    const d = dist(coordsB[j], [cx, cy]);
-    if (d > 0 && d < range) candidates.push({ src: 'B', idx: j });
-  }
-  if (candidates.length > 0) {
-    const chosen = candidates[Math.floor(Math.random() * candidates.length)];
-    cSrc = chosen.src; cIdx = chosen.idx;
-    frames.unshift({ src: cSrc, idx: cIdx }); // swap frame also recorded
-  }
-}
+4. **Find nearby frames** — collect all frames from **both sources** within `ctxSwapDist` UMAP units of the branch frame, excluding the branch frame itself.  If none exist, return the pure temporal walk unchanged.
+
+5. **Pick a candidate randomly** (e.g. B78) and walk its temporal pre-roll backward to fill the older portion (3 steps → B75, B76, B77).
+
+6. **Reassemble**: `[B75, B76, B77, B78 | A36, A37, A38, A39]` → waypoint A40.
+   - Chosen frame B78 is inserted at the branch position.
+   - Everything newer than the branch (A36, A37…) stays unchanged.
+   - Everything older than the branch is replaced by the chosen frame's temporal pre-roll.
+
+```
+temporal walk:  A33  A34  A35 [A36] A37  A38  A39  →  A40
+                               ↓ branch
+chosen B78:     B75  B76  B77  B78
+reassembled:    B75  B76  B77  B78  A37  A38  A39  →  A40
 ```
 
 **Key properties:**
-- Temporal progress is guaranteed every step — the walk never stalls.
-- **Swap happens at most once per pre-roll walk** — a `swapped` flag is set on the first successful swap and blocks any further swap checks for the remaining steps. Each waypoint's context contains at most one branch point.
-- Swap includes same-source candidates (e.g. can jump to A@120 while in A@40).
-- At `ctxSwapProb = 0` or `ctxSwapDist = 0` the swap is fully disabled — pure temporal walk.
+- Swap decision is per-waypoint — at most one branch point per pre-roll.
+- Pure temporal walk on both sides of the branch.
+- Swap includes same-source candidates (can jump to a different position within the same source).
+- At `ctxSwapProb = 0` or `ctxSwapDist = 0` swap is fully disabled.
+- If no candidate exists within range at the branch point, the pure temporal walk is returned unchanged.
 
 `pingPongExtend` pads the result if the walk terminates early (cIdx reached 0), bouncing the short sequence to fill exactly K slots.
 

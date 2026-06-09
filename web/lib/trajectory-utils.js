@@ -17,50 +17,60 @@ export function pingPongExtend(frames, K) {
 }
 
 // Walk backward K steps through the latent graph.
-// Each step always takes the temporal predecessor (cIdx - 1), records it, then
-// with probability `prob` looks for all frames from EITHER source within `range`
-// UMAP units.  If any are found (excluding the current frame) one is chosen at
-// random and recorded; subsequent steps continue from there.
-// Returns [{src,idx}] in forward (oldest-first) order.
+//
+// Base walk: always pure temporal (cIdx - 1, K steps), oldest-first.
+//
+// Context swap (when prob > 0 and range > 0):
+//   - Decision is per-waypoint: roll prob ONCE for this entire walk.
+//   - If it fires, pick a random position in the temporal pre-roll as the branch point.
+//   - Find all frames from either source within `range` UMAP units of the branch frame.
+//   - Pick one at random; walk its temporal pre-roll backward to fill the older portion.
+//   - Result: [...chosen_preroll, chosen_frame | branch_frame, ...newer_frames] → waypoint
+//
+// Returns [{src,idx}] in forward (oldest-first) order, length ≤ K.
 export function walkBackward(src, idx, K, { prob = 0, range = 0 }, coordsA, coordsB) {
+  // 1. Pure temporal walk.
   const frames = [];
   let cSrc = src, cIdx = idx;
-  let swapped = false;  // swap allowed at most once per pre-roll walk
-
   for (let step = 0; step < K; step++) {
     if (cIdx <= 0) break;
-
-    // 1. Always take the temporal step.
     cIdx -= 1;
     frames.unshift({ src: cSrc, idx: cIdx });
-
-    // 2. After stepping, maybe swap to a nearby frame from either source (once per walk).
-    if (!swapped && prob > 0 && range > 0 && Math.random() < prob) {
-      const cCoords = cSrc === 'A' ? coordsA : coordsB;
-      const [cx, cy] = cCoords[cIdx];
-
-      // Collect all frames within range from both sources (excluding current position).
-      const candidates = [];
-      for (let j = 0; j < coordsA.length; j++) {
-        const d = Math.sqrt((coordsA[j][0] - cx) ** 2 + (coordsA[j][1] - cy) ** 2);
-        if (d > 0 && d < range) candidates.push({ src: 'A', idx: j });
-      }
-      for (let j = 0; j < coordsB.length; j++) {
-        const d = Math.sqrt((coordsB[j][0] - cx) ** 2 + (coordsB[j][1] - cy) ** 2);
-        if (d > 0 && d < range) candidates.push({ src: 'B', idx: j });
-      }
-
-      if (candidates.length > 0) {
-        const chosen = candidates[Math.floor(Math.random() * candidates.length)];
-        cSrc = chosen.src;
-        cIdx = chosen.idx;
-        // Record the swap-target frame; next step continues from here.
-        frames.unshift({ src: cSrc, idx: cIdx });
-        swapped = true;
-      }
-    }
   }
-  return frames;
+
+  // 2. Per-waypoint swap decision.
+  if (frames.length === 0 || prob <= 0 || range <= 0 || Math.random() >= prob) return frames;
+
+  // 3. Random branch point within the pre-roll.
+  const swapPos    = Math.floor(Math.random() * frames.length);
+  const branchFrame = frames[swapPos];
+  const [bx, by]   = (branchFrame.src === 'A' ? coordsA : coordsB)[branchFrame.idx];
+
+  // 4. Collect nearby frames from both sources (excluding the branch frame itself).
+  const candidates = [];
+  for (let j = 0; j < coordsA.length; j++) {
+    const d = Math.sqrt((coordsA[j][0] - bx) ** 2 + (coordsA[j][1] - by) ** 2);
+    if (d > 0 && d < range) candidates.push({ src: 'A', idx: j });
+  }
+  for (let j = 0; j < coordsB.length; j++) {
+    const d = Math.sqrt((coordsB[j][0] - bx) ** 2 + (coordsB[j][1] - by) ** 2);
+    if (d > 0 && d < range) candidates.push({ src: 'B', idx: j });
+  }
+  if (candidates.length === 0) return frames; // no nearby frame — keep pure temporal walk
+
+  // 5. Chosen frame's temporal pre-roll fills the older portion (before swapPos).
+  const chosen   = candidates[Math.floor(Math.random() * candidates.length)];
+  const oldLen   = swapPos; // how many frames to replace
+  const newOld   = [];
+  let rSrc = chosen.src, rIdx = chosen.idx;
+  for (let step = 0; step < oldLen; step++) {
+    if (rIdx <= 0) break;
+    rIdx -= 1;
+    newOld.unshift({ src: rSrc, idx: rIdx });
+  }
+
+  // 6. Reassemble: chosen pre-roll + chosen frame + original newer frames.
+  return [...newOld, { src: chosen.src, idx: chosen.idx }, ...frames.slice(swapPos + 1)];
 }
 
 export function buildCodePathGraph(coordsA, coordsB, nNeighbors) {
