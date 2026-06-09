@@ -48,6 +48,29 @@
 .lib-btn:hover { color: var(--text); border-color: #555; }
 .lib-btn.lib-del:hover { color: #e06060; border-color: #c04040; }
 #libEmpty { font-size: 11px; color: var(--muted); padding: 3px 0; }
+/* ── Floating trajectory panel ── */
+#trajPanel {
+  position: absolute; top: 8px; left: 8px; z-index: 20;
+  width: 174px;
+  background: rgba(18,18,18,0.93);
+  border: 1px solid var(--border2);
+  border-radius: 6px;
+  padding: 7px 9px 8px;
+  box-shadow: 0 2px 14px rgba(0,0,0,0.55);
+  backdrop-filter: blur(3px);
+  --lbl-w: 4.9em;
+  font-size: 12px;
+}
+#trajPanel .section-title {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 0.45em; cursor: pointer; user-select: none;
+}
+#trajPanelCollapseBtn {
+  background: none; border: none; color: var(--muted); font-size: 11px;
+  cursor: pointer; padding: 0; line-height: 1;
+}
+#trajPanel.collapsed #trajPanelBody { display: none; }
+#trajPanel.collapsed { padding-bottom: 7px; }
 /* Draw-segment context menu */
 #segCtxMenu {
   display: none; position: fixed; z-index: 900;
@@ -70,10 +93,10 @@
 
   <div id="vizArea">
     <div id="modeBar">
-      <button class="tog active" id="togPreVQMode">Pre-VQ</button>
-      <button class="tog"        id="togVQMode">VQ</button>
+      <button class="tog"        id="togPreVQMode">Pre-VQ</button>
+      <button class="tog active" id="togVQMode">VQ</button>
       <button class="tog"        id="togPostVQMode">Post-VQ</button>
-      <div id="levelWrap" style="display:none">
+      <div id="levelWrap">
         <label>Levels</label>
         <div id="levelDropdown">
           <button id="levelMenuBtn" class="tog">All</button>
@@ -174,6 +197,8 @@
 
 <!-- Draw-segment right-click context menu -->
 <div id="segCtxMenu">
+  <div class="seg-ctx-item" id="segCtxSolo">Solo</div>
+  <div class="seg-ctx-sep"></div>
   <div class="seg-ctx-item" id="segCtxToggle">Disable</div>
   <div class="seg-ctx-sep"></div>
   <div class="seg-ctx-item danger" id="segCtxDelete">Delete</div>
@@ -250,65 +275,76 @@ umapSection.innerHTML = `
 controls.appendChild(umapSection);
 
 const trajSection = document.createElement('div');
-trajSection.className = 'section';
+trajSection.id = 'trajPanel';
 trajSection.innerHTML = `
-  <div class="section-title">Trajectory</div>
-  <div class="row" style="gap:3px">
-    <button class="tog active" id="togDrawMode" style="flex:1">Draw</button>
-    <button class="tog"        id="togCodeMode" style="flex:1">Code</button>
-    <button class="tog"        id="togSnapMode" style="flex:1">Snap</button>
+  <div class="section-title" id="trajPanelTitle">
+    Trajectory
+    <button id="trajPanelCollapseBtn" title="Collapse">▾</button>
   </div>
-  <div class="row" style="gap:3px">
-    <button class="tog active" id="togDirFwd"  style="flex:1">→ Fwd</button>
-    <button class="tog"        id="togDirBwd"  style="flex:1">← Bwd</button>
-    <button class="tog"        id="togDirPing" style="flex:1">↔ Ping</button>
-  </div>
-  <div class="row" id="durRow">
-    <span class="lbl">Duration</span>
-    <input type="number" id="trajDuration" value="4" min="0.5" max="30" step="0.5">
-    <span style="font-size:11px;color:var(--muted);margin-left:2px">s</span>
-  </div>
-  <div id="codeBlock" style="display:none">
+  <div id="trajPanelBody">
     <div class="row" style="gap:3px">
-      <button class="tog active" id="togCodeK"   style="flex:1">K frames</button>
-      <button class="tog"        id="togCodeSec" style="flex:1">Seconds</button>
-    </div>
-    <div class="row">
-      <span class="lbl" id="codeParamLbl">K</span>
-      <input type="number" id="codeParamInput" value="1" min="1" max="32" step="1">
-      <span id="codeParamUnit" style="font-size:11px;color:var(--muted)">×</span>
-    </div>
-  </div>
-  <div id="snapBlock" style="display:none">
-    <div class="row" style="margin-bottom:0.15em">
-      <span style="font-size:10px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;color:var(--muted)">Duration</span>
+      <button class="tog active" id="togDrawMode" style="flex:1">Draw</button>
+      <button class="tog"        id="togCodeMode" style="flex:1">Code</button>
+      <button class="tog"        id="togSnapMode" style="flex:1">Snap</button>
     </div>
     <div class="row" style="gap:3px">
-      <button class="tog active" id="togSnapK"    style="flex:1">K frames</button>
-      <button class="tog"        id="togSnapEq"   style="flex:1">Equal</button>
-      <button class="tog"        id="togSnapProp" style="flex:1">Prop.</button>
+      <button class="tog active" id="togDirFwd"  style="flex:1">→ Fwd</button>
+      <button class="tog"        id="togDirBwd"  style="flex:1">← Bwd</button>
+      <button class="tog"        id="togDirPing" style="flex:1">↔ Ping</button>
     </div>
-    <div class="row">
-      <span class="lbl" id="snapParamLbl">K</span>
-      <input type="number" id="snapParamInput" value="8" min="1" max="128" step="1">
-      <span id="snapParamUnit" style="font-size:11px;color:var(--muted)">frames</span>
+    <div class="row" id="durRow">
+      <span class="lbl">Duration</span>
+      <input type="number" id="trajDuration" value="4" min="0.5" max="30" step="0.5">
+      <span style="font-size:11px;color:var(--muted);margin-left:2px">s</span>
     </div>
-    <div class="row" id="ctxSwapRow">
-      <span class="lbl">Ctx swap</span>
-      <input type="range" id="ctxSwapSlider" min="0" max="1" step="0.01" value="0" style="flex:1">
-      <span id="ctxSwapVal" style="font-size:11px;color:var(--muted);min-width:2.8em;text-align:right">0%</span>
+    <div id="codeBlock" style="display:none">
+      <div class="row" style="gap:3px">
+        <button class="tog active" id="togCodeK"   style="flex:1">K frames</button>
+        <button class="tog"        id="togCodeSec" style="flex:1">Seconds</button>
+      </div>
+      <div class="row">
+        <span class="lbl" id="codeParamLbl">K</span>
+        <input type="number" id="codeParamInput" value="1" min="1" max="32" step="1">
+        <span id="codeParamUnit" style="font-size:11px;color:var(--muted)">×</span>
+      </div>
     </div>
-    <div class="row" id="ctxRangeRow">
-      <span class="lbl">Ctx range</span>
-      <input type="number" id="ctxRangeInput" value="0.3" min="0.01" max="5" step="0.05"
-             style="width:50px;font-size:11px">
+    <div id="snapBlock" style="display:none">
+      <div class="row" style="margin-bottom:0.15em">
+        <span style="font-size:10px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;color:var(--muted)">Duration</span>
+      </div>
+      <div class="row" style="gap:3px">
+        <button class="tog active" id="togSnapK"    style="flex:1">K frames</button>
+        <button class="tog"        id="togSnapEq"   style="flex:1">Equal</button>
+        <button class="tog"        id="togSnapProp" style="flex:1">Prop.</button>
+      </div>
+      <div class="row">
+        <span class="lbl" id="snapParamLbl">K</span>
+        <input type="number" id="snapParamInput" value="8" min="1" max="128" step="1">
+        <span id="snapParamUnit" style="font-size:11px;color:var(--muted)">frames</span>
+      </div>
+      <div class="row" id="ctxSwapRow">
+        <span class="lbl">Ctx swap</span>
+        <input type="range" id="ctxSwapSlider" min="0" max="1" step="0.01" value="0" style="flex:1">
+        <span id="ctxSwapVal" style="font-size:11px;color:var(--muted);min-width:2.8em;text-align:right">0%</span>
+      </div>
+      <div class="row" id="ctxRangeRow">
+        <span class="lbl">Ctx range</span>
+        <input type="number" id="ctxRangeInput" value="0.3" min="0.01" max="5" step="0.05"
+               style="width:50px;font-size:11px">
+      </div>
     </div>
-  </div>
-  <div class="row" style="margin-top:2px">
-    <button class="tog" id="clearTraj" style="flex:1">Clear</button>
+    <div class="row" style="margin-top:2px">
+      <button class="tog" id="clearTraj" style="flex:1">Clear</button>
+    </div>
   </div>
 `.trim();
-controls.appendChild(trajSection);
+// Append to umapWrap so it overlays the canvas
+document.getElementById('umapWrap').appendChild(trajSection);
+
+document.getElementById('trajPanelTitle').addEventListener('click', () => {
+  const collapsed = trajSection.classList.toggle('collapsed');
+  document.getElementById('trajPanelCollapseBtn').textContent = collapsed ? '▸' : '▾';
+});
 
 const postProcSection = document.createElement('div');
 postProcSection.className = 'section';
@@ -398,7 +434,7 @@ let umapWorker      = null;
 let activeUMAPJobId = -1;
 let umapMode        = 'combined';
 let umapLevels      = [];   // selected codebook levels (all by default)
-let embSpace        = 'pre_vq'; // 'pre_vq' | 'post_vq'
+let embSpace        = 'vq';     // 'pre_vq' | 'vq' | 'post_vq'
 let embMode         = 'emb';    // 'emb' | 'emb+delta' | 'delta'
 let coordsA         = null;
 let coordsB         = null;
@@ -447,6 +483,8 @@ function getEnabledSrcs() {
 // Trajectory
 let userTrajectory       = [];
 let rawDrawSegments      = [];  // completed draw strokes: [{pts:[x,y][], enabled:bool}]
+let soloedSegIdx         = -1;  // index of currently soloed segment, -1 = none
+let presoloEnabled       = null; // bool[] — saved enabled states before solo
 let rawDrawPoints        = [];  // currently in-progress stroke: [x,y][]
 let drawSegmentBoundaries = []; // indices in userTrajectory where each non-first segment begins
 let pinPoints       = [];
@@ -840,7 +878,7 @@ function onUMAPWorkerMsg({ data: msg }) {
 
     viewZoom = 1; viewPanX = 0; viewPanY = 0;
     const hadDrawTraj = rawDrawSegments.some(s => s.pts.length >= 2) || rawDrawPoints.length >= 2;
-    rawDrawSegments = []; rawDrawPoints = []; drawSegmentBoundaries = [];
+    rawDrawSegments = []; rawDrawPoints = []; drawSegmentBoundaries = []; clearSoloState();
     userTrajectory = pinPoints.length >= 2 ? resamplePath(pinCoords(), 300) : [];
     coordsA = slot.coordsA;
     coordsB = slot.coordsB;
@@ -882,7 +920,7 @@ function onUMAPWorkerMsg({ data: msg }) {
     if (slotIdx === 0) {
       viewZoom = 1; viewPanX = 0; viewPanY = 0;
       const hadDrawTraj = rawDrawSegments.some(s => s.pts.length >= 2) || rawDrawPoints.length >= 2;
-      rawDrawSegments = []; rawDrawPoints = []; drawSegmentBoundaries = [];
+      rawDrawSegments = []; rawDrawPoints = []; drawSegmentBoundaries = []; clearSoloState();
       userTrajectory = pinPoints.length >= 2 ? resamplePath(pinCoords(), 300) : [];
       if (hadDrawTraj && pinPoints.length < 2) {
         setStatus('UMAP updated — draw trajectory cleared. Redraw to regenerate.');
@@ -1572,6 +1610,7 @@ document.getElementById('clearTraj').addEventListener('click', () => {
   stopTrajPlayback();
   playerG.stop();
   userTrajectory = []; rawDrawSegments = []; rawDrawPoints = []; drawSegmentBoundaries = []; pinPoints = [];
+  clearSoloState();
   trajAudioBuf = null; codePathFrames = null;
   snapFrames = null; snapSegBoundaries = []; snapPlayFrames = null; genPlaySeq = null;
   trajAnchorPos = -1;
@@ -2206,9 +2245,30 @@ umapCanvas.addEventListener('mouseleave', () => { finishPanDrag(); finishShiftDr
 const segCtxMenu   = document.getElementById('segCtxMenu');
 const segCtxToggle = document.getElementById('segCtxToggle');
 const segCtxDelete = document.getElementById('segCtxDelete');
+const segCtxSolo   = document.getElementById('segCtxSolo');
 let   ctxMenuSegIdx = -1;
 
 function closeSegCtxMenu() { segCtxMenu.style.display = 'none'; ctxMenuSegIdx = -1; }
+
+function soloSegment(idx) {
+  presoloEnabled = rawDrawSegments.map(s => s.enabled);
+  soloedSegIdx   = idx;
+  rawDrawSegments.forEach((s, i) => { s.enabled = (i === idx); });
+  userTrajectory = buildDrawUserTrajectory();
+  autoRegenerate();
+}
+
+function unsoloSegment() {
+  if (presoloEnabled) {
+    rawDrawSegments.forEach((s, i) => { s.enabled = presoloEnabled[i] ?? true; });
+    presoloEnabled = null;
+  }
+  soloedSegIdx = -1;
+  userTrajectory = buildDrawUserTrajectory();
+  autoRegenerate();
+}
+
+function clearSoloState() { soloedSegIdx = -1; presoloEnabled = null; }
 
 // Point-to-segment minimum squared distance (canvas pixel space).
 function ptSegDist2(px, py, ax, ay, bx, by) {
@@ -2246,15 +2306,40 @@ umapCanvas.addEventListener('contextmenu', e => {
   const idx = hitTestSegments(physX, physY);
   if (idx < 0) return;
   ctxMenuSegIdx = idx;
+  segCtxSolo.textContent   = soloedSegIdx === idx ? 'Unsolo' : 'Solo';
   segCtxToggle.textContent = rawDrawSegments[idx].enabled ? 'Disable' : 'Enable';
   segCtxMenu.style.left    = e.clientX + 'px';
   segCtxMenu.style.top     = e.clientY + 'px';
   segCtxMenu.style.display = 'block';
 });
 
+segCtxSolo.addEventListener('click', () => {
+  if (ctxMenuSegIdx < 0) return;
+  const idx = ctxMenuSegIdx;
+  closeSegCtxMenu();
+  if (soloedSegIdx === idx) {
+    unsoloSegment();           // clicking "Unsolo" on the soloed segment
+  } else {
+    if (soloedSegIdx >= 0) {   // steal solo: restore first, then re-solo
+      unsoloSegment();
+    }
+    soloSegment(idx);
+  }
+});
+
 segCtxDelete.addEventListener('click', () => {
   if (ctxMenuSegIdx < 0) return;
-  rawDrawSegments.splice(ctxMenuSegIdx, 1);
+  const idx = ctxMenuSegIdx;
+  // Adjust or clear solo state around the deletion
+  if (soloedSegIdx === idx) {
+    clearSoloState();                      // soloed segment deleted — just drop solo
+  } else if (soloedSegIdx > idx) {
+    soloedSegIdx--;                        // index shifts down after splice
+    if (presoloEnabled) presoloEnabled.splice(idx, 1);
+  } else if (presoloEnabled) {
+    presoloEnabled.splice(idx, 1);
+  }
+  rawDrawSegments.splice(idx, 1);
   closeSegCtxMenu();
   userTrajectory = buildDrawUserTrajectory();
   autoRegenerate();

@@ -67,7 +67,10 @@ select:focus, input[type=number]:focus { outline: none; border-color: var(--acce
 .tog:disabled { opacity: 0.4; cursor: default; }
 .tog:disabled:hover { color: var(--muted); }
 
-.vol-slider { flex: 1; accent-color: var(--accent); cursor: pointer; }
+.vol-slider { flex: 1; min-width: 0; accent-color: var(--accent); cursor: pointer; }
+
+/* Range inputs that participate in flex rows must never overflow their container */
+input[type=range] { min-width: 0; }
 
 /* ── Right panel ────────────────────────────────────────────────────── */
 #right { display: flex; flex-direction: column; min-width: 0; }
