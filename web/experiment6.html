@@ -36,6 +36,18 @@
               transition: background 0.15s, border-color 0.15s; }
 .umap-dot.ready  { background: #666; border-color: #888; }
 .umap-dot.active { background: var(--accent) !important; border-color: var(--accent) !important; }
+/* ── Bookmark library ── */
+#libList { display: flex; flex-direction: column; gap: 3px; margin-top: 5px;
+           max-height: 220px; overflow-y: auto; }
+.lib-item { display: flex; align-items: center; gap: 3px; }
+.lib-name { flex: 1; min-width: 0; background: #1c1c1c; border: 1px solid var(--border2);
+            color: var(--text); font-size: 10px; padding: 2px 4px; border-radius: 2px; }
+.lib-name:focus { outline: none; border-color: var(--accent); }
+.lib-btn  { flex: none; background: none; border: 1px solid var(--border2); color: var(--muted);
+            font-size: 11px; padding: 1px 5px; border-radius: 2px; cursor: pointer; line-height: 1.5; }
+.lib-btn:hover { color: var(--text); border-color: #555; }
+.lib-btn.lib-del:hover { color: #e06060; border-color: #c04040; }
+#libEmpty { font-size: 11px; color: var(--muted); padding: 3px 0; }
 /* Draw-segment context menu */
 #segCtxMenu {
   display: none; position: fixed; z-index: 900;
@@ -140,6 +152,7 @@
             <button class="waveBtn" id="wbPlayG">▶</button>
             <button class="waveBtn" id="wbStopG">■</button>
             <button class="waveBtn" id="wbLoopG">⟳</button>
+            <button class="waveBtn" id="wbBookmark" title="Bookmark this sample" style="opacity:0.35;cursor:default">🔖</button>
           </div>
         </div>
         <canvas class="waveCanvas" id="waveCanvG"></canvas>
@@ -317,6 +330,19 @@ postProcSection.innerHTML = `
 `.trim();
 controls.appendChild(postProcSection);
 
+const librarySection = document.createElement('div');
+librarySection.className = 'section';
+librarySection.id = 'librarySection';
+librarySection.innerHTML = `
+  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.45em">
+    <span class="section-title" style="margin-bottom:0">Library <span id="libCount" style="font-weight:400">(0)</span></span>
+    <button id="libDownloadAll" class="tog" style="flex:none;padding:1px 7px;font-size:10px" disabled>↓ All</button>
+  </div>
+  <div id="libList"></div>
+  <div id="libEmpty" style="font-size:11px;color:var(--muted);padding:2px 0">No bookmarks yet.</div>
+`.trim();
+controls.appendChild(librarySection);
+
 // ── DOM refs ──────────────────────────────────────────────────────────────────
 
 const umapCanvas    = document.getElementById('umapCanvas');
@@ -453,6 +479,10 @@ let trajAudioBuf        = null;
 let trajLooping         = false;
 let trajAnchorPos       = -1;
 let trajCurrentDuration = 0;
+
+// Bookmarks
+let bookmarks    = [];   // [{id, name, pcm, sr}]
+let bookmarkSeq  = 0;   // monotonic counter for filenames
 
 // Post-processing
 let postProcEnabled  = true;
@@ -966,6 +996,218 @@ function applyGenFade(pcm, sr) {
   return (fadeIn > 0 || fadeOut > 0) ? applyFade(pcm, sr, fadeIn, fadeOut) : pcm;
 }
 
+// ── Bookmark utilities ────────────────────────────────────────────────────────
+
+// Minimal ZIP builder — STORE method (no compression), no external dependencies.
+function buildZip(files) {
+  // files: [{ name: string, data: Uint8Array }]
+  const enc = new TextEncoder();
+
+  // CRC-32 lookup table
+  const crcTab = new Uint32Array(256);
+  for (let i = 0; i < 256; i++) {
+    let c = i;
+    for (let j = 0; j < 8; j++) c = (c & 1) ? 0xEDB88320 ^ (c >>> 1) : c >>> 1;
+    crcTab[i] = c;
+  }
+  const crc32 = data => {
+    let c = 0xFFFFFFFF;
+    for (let i = 0; i < data.length; i++) c = crcTab[(c ^ data[i]) & 0xFF] ^ (c >>> 8);
+    return (c ^ 0xFFFFFFFF) >>> 0;
+  };
+
+  const localParts = [];  // [{bytes, size}]  — local headers + data
+  const cdParts    = [];  // central directory records
+  let localOffset  = 0;
+
+  for (const { name, data } of files) {
+    const nb   = enc.encode(name);
+    const crc  = crc32(data);
+    const size = data.length;
+
+    // Local file header (30 + nb.length bytes)
+    const lh = new DataView(new ArrayBuffer(30 + nb.length));
+    lh.setUint32( 0, 0x04034b50, true);   // local file sig
+    lh.setUint16( 4, 20, true);            // version needed
+    lh.setUint16( 6, 0,  true);            // flags
+    lh.setUint16( 8, 0,  true);            // STORE
+    lh.setUint16(10, 0,  true);            // mod time
+    lh.setUint16(12, 0,  true);            // mod date
+    lh.setUint32(14, crc,  true);          // CRC-32
+    lh.setUint32(18, size, true);          // compressed size
+    lh.setUint32(22, size, true);          // uncompressed size
+    lh.setUint16(26, nb.length, true);     // filename len
+    lh.setUint16(28, 0, true);             // extra len
+    new Uint8Array(lh.buffer, 30).set(nb);
+
+    // Central directory header (46 + nb.length bytes)
+    const cd = new DataView(new ArrayBuffer(46 + nb.length));
+    cd.setUint32( 0, 0x02014b50, true);   // central dir sig
+    cd.setUint16( 4, 20, true);            // version made by
+    cd.setUint16( 6, 20, true);            // version needed
+    cd.setUint16( 8, 0,  true);            // flags
+    cd.setUint16(10, 0,  true);            // STORE
+    cd.setUint16(12, 0,  true);            // mod time
+    cd.setUint16(14, 0,  true);            // mod date
+    cd.setUint32(16, crc,  true);          // CRC-32
+    cd.setUint32(20, size, true);          // compressed size
+    cd.setUint32(24, size, true);          // uncompressed size
+    cd.setUint16(28, nb.length, true);     // filename len
+    cd.setUint16(30, 0, true);             // extra len
+    cd.setUint16(32, 0, true);             // comment len
+    cd.setUint16(34, 0, true);             // disk number start
+    cd.setUint16(36, 0, true);             // internal attr
+    cd.setUint32(38, 0, true);             // external attr
+    cd.setUint32(42, localOffset, true);   // local header offset
+    new Uint8Array(cd.buffer, 46).set(nb);
+
+    const lhBytes = new Uint8Array(lh.buffer);
+    localParts.push(lhBytes, data);
+    cdParts.push(new Uint8Array(cd.buffer));
+    localOffset += lhBytes.length + size;
+  }
+
+  const cdSize   = cdParts.reduce((s, p) => s + p.length, 0);
+  const cdOffset = localOffset;
+
+  // End of central directory (22 bytes)
+  const eocd = new DataView(new ArrayBuffer(22));
+  eocd.setUint32( 0, 0x06054b50, true);      // EOCD sig
+  eocd.setUint16( 4, 0, true);               // disk number
+  eocd.setUint16( 6, 0, true);               // disk with CD
+  eocd.setUint16( 8, files.length, true);    // entries on this disk
+  eocd.setUint16(10, files.length, true);    // total entries
+  eocd.setUint32(12, cdSize,   true);        // central dir size
+  eocd.setUint32(16, cdOffset, true);        // central dir offset
+  eocd.setUint16(20, 0, true);               // comment len
+
+  const all   = [...localParts, ...cdParts, new Uint8Array(eocd.buffer)];
+  const total = all.reduce((s, p) => s + p.length, 0);
+  const out   = new Uint8Array(total);
+  let pos = 0;
+  for (const p of all) { out.set(p, pos); pos += p.length; }
+  return out;
+}
+
+// Encode Float32Array mono PCM → 16-bit WAV ArrayBuffer.
+function encodeWav(f32, sr) {
+  const N   = f32.length;
+  const buf = new ArrayBuffer(44 + N * 2);
+  const v   = new DataView(buf);
+  const u32 = (o, n) => v.setUint32(o, n, true);
+  const u16 = (o, n) => v.setUint16(o, n, true);
+  const str = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  str(0, 'RIFF'); u32(4, 36 + N * 2); str(8, 'WAVE');
+  str(12, 'fmt '); u32(16, 16); u16(20, 1); u16(22, 1);
+  u32(24, sr); u32(28, sr * 2); u16(32, 2); u16(34, 16);
+  str(36, 'data'); u32(40, N * 2);
+  for (let i = 0; i < N; i++) {
+    const s = Math.max(-1, Math.min(1, f32[i]));
+    v.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+  }
+  return buf;
+}
+
+function downloadWav(pcm, sr, filename) {
+  const blob = new Blob([encodeWav(pcm, sr)], { type: 'audio/wav' });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement('a');
+  a.href = url; a.download = filename + '.wav'; a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
+}
+
+// Build a descriptive base filename for the current generation state.
+function makeBookmarkName() {
+  const mode = pathMode === 'snap' ? 'snap' : pathMode === 'code' ? 'code' : 'draw';
+  const dir  = trajDir === 'forward' ? 'fwd' : trajDir === 'backward' ? 'bwd' : 'ping';
+
+  let wpTag = '';
+  if (genPlaySeq && genPlaySeq.length > 0) {
+    // Collect the first frame of each waypoint group (_wp transitions).
+    const wps = [];
+    let last = undefined;
+    for (const f of genPlaySeq) {
+      if (f._wp !== undefined && f._wp !== last) { last = f._wp; wps.push(f); }
+    }
+    if (wps.length > 0) {
+      const parts = wps.slice(0, 4).map(f => `${f.src}${f.idx}`);
+      if (wps.length > 4) parts.push('…');
+      wpTag = '_' + parts.join('-');
+    }
+  }
+
+  const now = new Date();
+  const hh  = String(now.getHours()).padStart(2, '0');
+  const mm  = String(now.getMinutes()).padStart(2, '0');
+  const ss  = String(now.getSeconds()).padStart(2, '0');
+  bookmarkSeq++;
+  return `${mode}_${dir}${wpTag}_${String(bookmarkSeq).padStart(3, '0')}_${hh}${mm}${ss}`;
+}
+
+function renderBookmarkList() {
+  const list    = document.getElementById('libList');
+  const empty   = document.getElementById('libEmpty');
+  const count   = document.getElementById('libCount');
+  const dlAll   = document.getElementById('libDownloadAll');
+  count.textContent = `(${bookmarks.length})`;
+  dlAll.disabled    = bookmarks.length === 0;
+  empty.style.display = bookmarks.length === 0 ? '' : 'none';
+  list.innerHTML = '';
+  for (const bm of bookmarks) {
+    const row = document.createElement('div');
+    row.className = 'lib-item';
+    row.dataset.id = bm.id;
+
+    const nameEl = document.createElement('input');
+    nameEl.className = 'lib-name';
+    nameEl.type  = 'text';
+    nameEl.value = bm.name;
+    nameEl.title = bm.name;
+    nameEl.addEventListener('change', () => { bm.name = nameEl.value.trim() || bm.name; });
+
+    const dlBtn = document.createElement('button');
+    dlBtn.className = 'lib-btn';
+    dlBtn.title = 'Download';
+    dlBtn.textContent = '↓';
+    dlBtn.addEventListener('click', () => downloadWav(bm.pcm, bm.sr, bm.name));
+
+    const delBtn = document.createElement('button');
+    delBtn.className = 'lib-btn lib-del';
+    delBtn.title = 'Delete';
+    delBtn.textContent = '✕';
+    delBtn.addEventListener('click', () => {
+      bookmarks = bookmarks.filter(b => b.id !== bm.id);
+      renderBookmarkList();
+    });
+
+    row.appendChild(nameEl);
+    row.appendChild(dlBtn);
+    row.appendChild(delBtn);
+    list.appendChild(row);
+  }
+}
+
+function addBookmark() {
+  if (!lastRawPcm) return;
+  const pcm  = applyGenFade(lastRawPcm, lastRawPcmSr); // snapshot with current fade settings
+  const name = makeBookmarkName();
+  bookmarks.push({ id: bookmarkSeq, name, pcm, sr: lastRawPcmSr });
+  renderBookmarkList();
+  // Brief visual flash on the button to confirm
+  const btn = document.getElementById('wbBookmark');
+  btn.style.opacity = '1';
+  btn.style.color   = 'var(--accent)';
+  setTimeout(() => { btn.style.color = ''; updateBookmarkBtn(); }, 600);
+}
+
+function updateBookmarkBtn() {
+  const btn = document.getElementById('wbBookmark');
+  if (!btn) return;
+  const has = !!lastRawPcm;
+  btn.style.opacity = has ? '1' : '0.35';
+  btn.style.cursor  = has ? 'pointer' : 'default';
+}
+
 function onWorkerMsg(e) {
   const msg = e.data;
 
@@ -989,6 +1231,7 @@ function onWorkerMsg(e) {
       lastRawPcmSr = sr;
       stopTrajPlayback();
       playerG.setAudio(applyGenFade(msg.decoded, sr), sr, makeGenColorFn());
+      updateBookmarkBtn();
       setStatus('');
     }
     return;
@@ -1294,6 +1537,24 @@ trajDurationEl.addEventListener('change', () => autoRegenerate());
 
 document.getElementById('genVolSlider').addEventListener('input', e => {
   playerG.setVolume(parseFloat(e.target.value));
+});
+
+document.getElementById('wbBookmark').addEventListener('click', () => { addBookmark(); });
+
+document.getElementById('libDownloadAll').addEventListener('click', () => {
+  if (!bookmarks.length) return;
+  const files = bookmarks.map(bm => ({
+    name: bm.name + '.wav',
+    data: new Uint8Array(encodeWav(bm.pcm, bm.sr)),
+  }));
+  const zip  = buildZip(files);
+  const blob = new Blob([zip], { type: 'application/zip' });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement('a');
+  a.href = url;
+  a.download = `bookmarks_${bookmarks.length}.zip`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
 });
 
 document.getElementById('ctxSwapSlider').addEventListener('input', e => {
@@ -1646,6 +1907,7 @@ playerB.setPlayBtn(document.getElementById('wbPlayB'));
 playerB.setLoopBtn(document.getElementById('wbLoopB'));
 playerG.setPlayBtn(document.getElementById('wbPlayG'));
 playerG.setLoopBtn(document.getElementById('wbLoopG'));
+renderBookmarkList();
 
 ['A', 'B', 'G'].forEach(id => {
   const p = id === 'A' ? playerA : id === 'B' ? playerB : playerG;
