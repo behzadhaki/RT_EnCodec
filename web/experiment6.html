@@ -282,8 +282,13 @@ trajSection.innerHTML = `
     </div>
     <div class="row" id="ctxSwapRow">
       <span class="lbl">Ctx swap</span>
-      <input type="range" id="ctxSwapSlider" min="0" max="2" step="0.02" value="0" style="flex:1">
-      <span id="ctxSwapVal" style="font-size:11px;color:var(--muted);min-width:2.5em;text-align:right">0.00</span>
+      <input type="range" id="ctxSwapSlider" min="0" max="1" step="0.01" value="0" style="flex:1">
+      <span id="ctxSwapVal" style="font-size:11px;color:var(--muted);min-width:2.8em;text-align:right">0%</span>
+    </div>
+    <div class="row" id="ctxRangeRow">
+      <span class="lbl">Ctx range</span>
+      <input type="number" id="ctxRangeInput" value="0.3" min="0.01" max="5" step="0.05"
+             style="width:50px;font-size:11px">
     </div>
   </div>
   <div class="row" style="margin-top:2px">
@@ -346,6 +351,7 @@ const snapParamInput = document.getElementById('snapParamInput');
 const snapParamLbl   = document.getElementById('snapParamLbl');
 const snapParamUnit  = document.getElementById('snapParamUnit');
 const ctxSwapValEl   = document.getElementById('ctxSwapVal');
+const ctxRangeInput  = document.getElementById('ctxRangeInput');
 const dpr = devicePixelRatio || 1;
 
 // ── State ─────────────────────────────────────────────────────────────────────
@@ -433,7 +439,8 @@ let codeSecVal      = 4;
 let snapMode        = 'k_frames';  // 'k_frames' | 'equal' | 'proportional'
 let snapKVal        = 8;
 let snapDurVal      = 2;
-let ctxSwapRange    = 0;
+let ctxSwapProb     = 0;     // 0–1: probability of attempting a swap at each pre-roll step
+let ctxSwapDist     = 0.3;  // UMAP-space radius for nearby-frame search
 
 // Playback
 let audioCtx            = null;
@@ -656,7 +663,8 @@ function renderScatter() {
       : -1,
     selectedPoint, waveHighlight, userTrajectory, drawSegments,
     pathMode, snapFrames, snapSegBoundaries, codePathFrames, trajAnchorPos,
-    snapPlayFrames, trajDir, showTrail: chkTrail.checked, canvasMode, ctxSwapRange,
+    snapPlayFrames, trajDir, showTrail: chkTrail.checked, canvasMode,
+    ctxSwap: { prob: ctxSwapProb, range: ctxSwapDist },
     snapMode, snapKVal, snapDurVal, framesPerSec: fps,
     srcAEnabled, srcBEnabled,
   });
@@ -1289,8 +1297,13 @@ document.getElementById('genVolSlider').addEventListener('input', e => {
 });
 
 document.getElementById('ctxSwapSlider').addEventListener('input', e => {
-  ctxSwapRange = parseFloat(e.target.value);
-  ctxSwapValEl.textContent = ctxSwapRange.toFixed(2);
+  ctxSwapProb = parseFloat(e.target.value);
+  ctxSwapValEl.textContent = Math.round(ctxSwapProb * 100) + '%';
+  autoRegenerate();
+});
+
+document.getElementById('ctxRangeInput').addEventListener('input', e => {
+  ctxSwapDist = Math.max(0.01, parseFloat(e.target.value) || 0.3);
   autoRegenerate();
 });
 
@@ -2213,9 +2226,10 @@ function computeWaypoints() {
 
     // Builds one direction's frame sequence.
     // ctxArg defaults to snapCtxArg() — pingpong halves pass a half-duration arg so all waypoints fit.
+    const ctxSwap = { prob: ctxSwapProb, range: ctxSwapDist };
     const buildSeq = (wps, N_target = N_total, kOverride = snapKVal, ctxArg = null) => snapMode === 'k_frames'
-      ? buildSnapSequence(wps, kOverride, K_post, ctxSwapRange, coordsA, coordsB, currentEmbeds)
-      : buildSnapSequenceFixed(wps, Math.max(wps.length, N_target), K_post, ctxSwapRange, coordsA, coordsB, currentEmbeds, ctxArg ?? snapCtxArg());
+      ? buildSnapSequence(wps, kOverride, K_post, ctxSwap, coordsA, coordsB, currentEmbeds)
+      : buildSnapSequenceFixed(wps, Math.max(wps.length, N_target), K_post, ctxSwap, coordsA, coordsB, currentEmbeds, ctxArg ?? snapCtxArg());
 
     let seq;
     if (trajDir === 'forward')       seq = buildSeq(fwdWPs);

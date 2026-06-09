@@ -17,36 +17,48 @@ export function pingPongExtend(frames, K) {
 }
 
 // Walk backward K steps through the latent graph.
-// At each step prefers the cross-source frame nearest to the current position
-// if it is within `range` UMAP units AND closer than the temporal predecessor.
-// Returns [{src,idx}] in forward (oldest-first) order, length ≤ K.
-export function walkBackward(src, idx, K, range, coordsA, coordsB) {
+// Each step always takes the temporal predecessor (cIdx - 1), records it, then
+// with probability `prob` looks for all frames from EITHER source within `range`
+// UMAP units.  If any are found (excluding the current frame) one is chosen at
+// random and recorded; subsequent steps continue from there.
+// Returns [{src,idx}] in forward (oldest-first) order.
+export function walkBackward(src, idx, K, { prob = 0, range = 0 }, coordsA, coordsB) {
   const frames = [];
   let cSrc = src, cIdx = idx;
+  let swapped = false;  // swap allowed at most once per pre-roll walk
 
   for (let step = 0; step < K; step++) {
-    const cCoords = cSrc === 'A' ? coordsA : coordsB;
-    const [cx, cy] = cCoords[cIdx];
+    if (cIdx <= 0) break;
 
-    let bSrc = null, bIdx = -1, bDist = Infinity;
-    if (cIdx > 0) {
-      const [px, py] = cCoords[cIdx - 1];
-      bDist = Math.sqrt((cx - px) ** 2 + (cy - py) ** 2);
-      bSrc = cSrc; bIdx = cIdx - 1;
-    }
+    // 1. Always take the temporal step.
+    cIdx -= 1;
+    frames.unshift({ src: cSrc, idx: cIdx });
 
-    if (range > 0) {
-      const oSrc    = cSrc === 'A' ? 'B' : 'A';
-      const oCoords = oSrc === 'A' ? coordsA : coordsB;
-      for (let j = 0; j < oCoords.length; j++) {
-        const d = Math.sqrt((oCoords[j][0] - cx) ** 2 + (oCoords[j][1] - cy) ** 2);
-        if (d < range && d < bDist) { bDist = d; bSrc = oSrc; bIdx = j; }
+    // 2. After stepping, maybe swap to a nearby frame from either source (once per walk).
+    if (!swapped && prob > 0 && range > 0 && Math.random() < prob) {
+      const cCoords = cSrc === 'A' ? coordsA : coordsB;
+      const [cx, cy] = cCoords[cIdx];
+
+      // Collect all frames within range from both sources (excluding current position).
+      const candidates = [];
+      for (let j = 0; j < coordsA.length; j++) {
+        const d = Math.sqrt((coordsA[j][0] - cx) ** 2 + (coordsA[j][1] - cy) ** 2);
+        if (d > 0 && d < range) candidates.push({ src: 'A', idx: j });
+      }
+      for (let j = 0; j < coordsB.length; j++) {
+        const d = Math.sqrt((coordsB[j][0] - cx) ** 2 + (coordsB[j][1] - cy) ** 2);
+        if (d > 0 && d < range) candidates.push({ src: 'B', idx: j });
+      }
+
+      if (candidates.length > 0) {
+        const chosen = candidates[Math.floor(Math.random() * candidates.length)];
+        cSrc = chosen.src;
+        cIdx = chosen.idx;
+        // Record the swap-target frame; next step continues from here.
+        frames.unshift({ src: cSrc, idx: cIdx });
+        swapped = true;
       }
     }
-
-    if (bIdx < 0) break;
-    cSrc = bSrc; cIdx = bIdx;
-    frames.unshift({ src: cSrc, idx: cIdx });
   }
   return frames;
 }

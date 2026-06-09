@@ -19,7 +19,7 @@ import { getContextKs, walkBackward } from './trajectory-utils.js';
 //   trajDir                 — 'forward'|'backward'|'pingpong'
 //   showTrail               — bool
 //   canvasMode              — 'explore'|'draw'|'pins'
-//   ctxSwapRange            — UMAP-unit radius for context swap
+//   ctxSwap                 — { prob, range } for context swap (walkBackward)
 //   snapMode, snapKVal, snapDurVal, framesPerSec   — for snap trail getContextKs
 export function renderScatter(canvas, dpr, state) {
   const ctx = canvas.getContext('2d');
@@ -50,7 +50,7 @@ export function renderScatter(canvas, dpr, state) {
     pinPoints, highlightedPinIdx = -1, selectedPoint, waveHighlight, userTrajectory,
     drawSegments,
     pathMode, snapFrames, snapSegBoundaries, codePathFrames, trajAnchorPos,
-    snapPlayFrames, trajDir, showTrail, ctxSwapRange,
+    snapPlayFrames, trajDir, showTrail, ctxSwap = { prob: 0, range: 0 },
     snapMode, snapKVal, snapDurVal, framesPerSec, canvasMode,
     srcAEnabled = true, srcBEnabled = true,
   } = state;
@@ -217,7 +217,7 @@ export function renderScatter(canvas, dpr, state) {
 
         if (showTrail) {
           const ctxKs     = getContextKs(snapFrames, { snapMode, snapKVal, snapDurVal, framesPerSec, coordsA, coordsB });
-          const ctxFrames = walkBackward(wp.src, wp.idx, ctxKs[activeWi], ctxSwapRange, coordsA, coordsB);
+          const ctxFrames = walkBackward(wp.src, wp.idx, ctxKs[activeWi], ctxSwap, coordsA, coordsB);
 
           if (ctxFrames.length > 0) {
             const allCtx = [...ctxFrames, wp];

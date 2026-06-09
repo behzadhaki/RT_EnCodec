@@ -56,7 +56,8 @@ snapDurVal           // total duration in seconds (equal/prop mode)
 codeDurMode          // 'frames' | 'seconds'
 codeKVal             // total frames (code/frames mode)
 codeSecVal           // total seconds (code/seconds mode)
-ctxSwapRange         // UMAP-unit radius for context cross-source swap
+ctxSwapProb          // 0–1: probability of attempting a source/frame swap at each pre-roll step
+ctxSwapDist          // UMAP-unit radius for the nearby-frame candidate search
 
 // WAYPOINTS (sync, derived by computeWaypoints())
 snapFrames           // visual waypoint dots for snap mode
@@ -306,6 +307,57 @@ function snapWaypointArgs() {
 ```
 
 `pinCoords()` maps `pinPoints[{src,idx}]` to live UMAP coords. `enabledSrcs` filters which source frames are valid snap targets.
+
+---
+
+## Context swap — `walkBackward`
+
+Builds the pre-roll context (K frames) that leads into each snap waypoint. Two parameters control behavior:
+
+- **`ctxSwapProb`** (0–1 slider) — probability of attempting a swap at each step
+- **`ctxSwapDist`** (number input, UMAP units) — radius for the nearby-frame candidate search
+
+### Algorithm
+
+Each step has two phases:
+
+1. **Temporal step (always happens)** — move to `(cSrc, cIdx - 1)` and record it.
+
+2. **Post-step swap check (probabilistic)** — with probability `ctxSwapProb`, collect all frames from **both sources A and B** whose UMAP distance to the current position is `< ctxSwapDist` (excluding the exact current frame). If any exist, pick one **at random** and record it; subsequent steps continue from that frame.
+
+```js
+// Step 1 — temporal
+cIdx -= 1;
+frames.unshift({ src: cSrc, idx: cIdx });
+
+// Step 2 — probabilistic swap
+if (prob > 0 && range > 0 && Math.random() < prob) {
+  const [cx, cy] = (cSrc === 'A' ? coordsA : coordsB)[cIdx];
+  const candidates = [];
+  // collect from both sources within range (d > 0 excludes self)
+  for (let j = 0; j < coordsA.length; j++) {
+    const d = dist(coordsA[j], [cx, cy]);
+    if (d > 0 && d < range) candidates.push({ src: 'A', idx: j });
+  }
+  for (let j = 0; j < coordsB.length; j++) {
+    const d = dist(coordsB[j], [cx, cy]);
+    if (d > 0 && d < range) candidates.push({ src: 'B', idx: j });
+  }
+  if (candidates.length > 0) {
+    const chosen = candidates[Math.floor(Math.random() * candidates.length)];
+    cSrc = chosen.src; cIdx = chosen.idx;
+    frames.unshift({ src: cSrc, idx: cIdx }); // swap frame also recorded
+  }
+}
+```
+
+**Key properties:**
+- Temporal progress is guaranteed every step — the walk never stalls.
+- **Swap happens at most once per pre-roll walk** — a `swapped` flag is set on the first successful swap and blocks any further swap checks for the remaining steps. Each waypoint's context contains at most one branch point.
+- Swap includes same-source candidates (e.g. can jump to A@120 while in A@40).
+- At `ctxSwapProb = 0` or `ctxSwapDist = 0` the swap is fully disabled — pure temporal walk.
+
+`pingPongExtend` pads the result if the walk terminates early (cIdx reached 0), bouncing the short sequence to fill exactly K slots.
 
 ---
 
