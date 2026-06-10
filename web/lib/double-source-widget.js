@@ -1,21 +1,27 @@
 /**
- * createDoubleSourceWidget — two source panels (A + B) + duration section, bundled.
+ * createDoubleSourceWidget — two source panels (A + B) + optional duration section.
  *
  * Options:
- *   defaultDur   {number}   Initial duration (s).
+ *   defaultDur   {number}   Initial / fallback duration (s) for synth sources.
  *   minDur       {number}   Duration input min.
  *   maxDur       {number}   Duration input max (defaults to MAX_S).
  *   stepDur      {number}   Duration input step.
+ *   showDuration {boolean}  Show the Duration section (default true).
+ *                           When false, synth sources use defaultDur; the panel
+ *                           is not rendered.  buildAudio still works (uses
+ *                           getDuration() internally).
  *   defaultFreqA {number}   Initial frequency for panel A (Hz).
  *   defaultFreqB {number}   Initial frequency for panel B (Hz).
  *   onChange     {fn(delay)}  Forwarded from both panels and duration input.
  *
  * Returns:
- *   element                    — wrapper div (display:contents) to append to #controls
- *   panelA / panelB            — createSourcePanel return objects
- *   getDuration()              — current duration value, clamped to maxDur
- *   buildAudio(panel, len, sr) — async; loads/generates, trims/loops to len, applies vol + gate
- *   buildBothAudios(len, sr)   — async convenience; returns { audioA, audioB }
+ *   element                     — wrapper div (display:contents) to append to #controls
+ *   panelA / panelB             — createSourcePanel return objects
+ *   getDuration()               — current duration value, clamped to maxDur
+ *   buildAudio(panel, len, sr)  — async; loads/generates, trims/loops to len, applies vol + gate
+ *   buildAudioAuto(panel, sr)   — async; loads file at its natural length (capped at MAX_S);
+ *                                 for synth sources uses getDuration() / defaultDur.
+ *   buildBothAudios(len, sr)    — async convenience; returns { audioA, audioB }
  */
 import { createSourcePanel } from './source-panel.js';
 import { generateSource, applyPulseGate, loadFile, loopToLength, getAudioFileDuration, MAX_S } from './audio-utils.js';
@@ -25,6 +31,7 @@ export function createDoubleSourceWidget({
   minDur       = 0.5,
   maxDur       = MAX_S,
   stepDur      = 0.5,
+  showDuration = true,
   defaultFreqA = 440,
   defaultFreqB = 880,
   onChange     = () => {},
@@ -32,6 +39,8 @@ export function createDoubleSourceWidget({
   const el = document.createElement('div');
   el.style.display = 'contents';
 
+  // Duration section — always created so getDuration() works, but only appended
+  // to the DOM when showDuration is true.
   const durSection = document.createElement('div');
   durSection.className = 'section';
   durSection.innerHTML = `
@@ -45,6 +54,7 @@ export function createDoubleSourceWidget({
   const durInput = durSection.querySelector('input');
 
   async function onFilePicked(file) {
+    if (!showDuration) return;   // don't clobber a hidden input or confuse the user
     const fileDur = await getAudioFileDuration(file);
     durInput.value = Math.min(Math.max(fileDur, minDur), maxDur).toFixed(2);
   }
@@ -75,13 +85,18 @@ export function createDoubleSourceWidget({
   el.appendChild(swapSection);
   el.appendChild(panelB.element);
 
-  durInput.addEventListener('input', () => onChange(500));
-  el.appendChild(durSection);
+  if (showDuration) {
+    durInput.addEventListener('input', () => onChange(500));
+    el.appendChild(durSection);
+  }
 
   function getDuration() {
     return Math.min(parseFloat(durInput.value) || defaultDur, maxDur);
   }
 
+  // ── buildAudio ─────────────────────────────────────────────────────────────
+  // Classic API: loads/generates to an exact finalLen, trims or loops as needed.
+  // Used by experiments 1–5.
   async function buildAudio(panel, finalLen, sr) {
     const type = panel.getType();
     let audio;
@@ -101,11 +116,34 @@ export function createDoubleSourceWidget({
     return audio;
   }
 
+  // ── buildAudioAuto ─────────────────────────────────────────────────────────
+  // Loads each file at its natural length, capped at MAX_S (10 s).
+  // A and B are independent — they need not be the same length.
+  // Synth sources use getDuration() (or defaultDur when the panel is hidden).
+  async function buildAudioAuto(panel, sr) {
+    const type = panel.getType();
+    let audio;
+    if (type === 'file') {
+      const f = panel.getFile();
+      if (!f) throw new Error(`No file selected for "${panel.element.querySelector('.section-title').textContent}".`);
+      // loadFile already caps at MAX_S (10 s) by default.
+      audio = await loadFile(f, sr);
+    } else {
+      const len = Math.round(getDuration() * sr);
+      audio = generateSource(type, panel.getFreq(), len / sr, sr);
+    }
+    const vol = panel.getVolume();
+    if (vol !== 1) audio = audio.map(x => x * vol);
+    if (panel.isGateEnabled()) audio = applyPulseGate(audio, sr, panel.getGateFreq(), panel.getGateDecay());
+    return audio;
+  }
+
+  // ── buildBothAudios ────────────────────────────────────────────────────────
   async function buildBothAudios(finalLen, sr) {
     const audioA = await buildAudio(panelA, finalLen, sr);
     const audioB = await buildAudio(panelB, finalLen, sr);
     return { audioA, audioB };
   }
 
-  return { element: el, panelA, panelB, getDuration, buildAudio, buildBothAudios };
+  return { element: el, panelA, panelB, getDuration, buildAudio, buildAudioAuto, buildBothAudios };
 }

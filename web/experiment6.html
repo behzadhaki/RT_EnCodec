@@ -228,7 +228,8 @@ const MODELS_BASE = new URL('../serialization/encodec_onnx_exports', location.hr
 const controls = document.getElementById('controls');
 
 const srcWidget = createDoubleSourceWidget({
-  defaultDur: 4,
+  defaultDur:   4,
+  showDuration: false,   // each file loads at its own natural length (≤ 10 s)
   onChange: delay => scheduleEncode(delay),
 });
 controls.appendChild(srcWidget.element);
@@ -532,6 +533,8 @@ let notchFilters     = [];
 // Waveform display
 let rawAudioA    = null;
 let rawAudioB    = null;
+let durA         = null;   // actual loaded duration (s) for source A
+let durB         = null;   // actual loaded duration (s) for source B
 let waveHighlight = null;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -715,7 +718,7 @@ function buildDrawUserTrajectory() {
 }
 
 function renderScatter() {
-  const fps = coordsA ? coordsA.length / srcWidget.getDuration() : 1;
+  const fps = coordsA ? coordsA.length / srcDuration('A') : 1;
   // Build the visual segments array: completed segments + live stroke if any.
   const drawSegments = canvasMode === 'draw'
     ? (rawDrawPoints.length >= 1
@@ -1346,6 +1349,13 @@ function onWorkerMsg(e) {
 
 // ── Encode ────────────────────────────────────────────────────────────────────
 
+/** Returns the actual loaded duration (s) for the given source, or falls back to
+ *  the duration-input value if that source hasn't been loaded yet. */
+function srcDuration(src) {
+  if (src === 'A') return durA ?? srcWidget.getDuration();
+  return durB ?? srcWidget.getDuration();
+}
+
 function scheduleEncode(delay = 0) {
   clearTimeout(encodeTimer);
   encodeTimer = setTimeout(startEncode, delay);
@@ -1354,15 +1364,14 @@ function scheduleEncode(delay = 0) {
 async function startEncode() {
   if (!worker) initWorker();
 
-  const sr       = mp.getSampleRate();
-  const finalLen = Math.round(srcWidget.getDuration() * sr);
+  const sr = mp.getSampleRate();
 
   let audioA, audioB;
   try {
     setStatus('Loading A…');
-    audioA = await srcWidget.buildAudio(panelA, finalLen, sr);
+    audioA = await srcWidget.buildAudioAuto(panelA, sr);
     setStatus('Loading B…');
-    audioB = await srcWidget.buildAudio(panelB, finalLen, sr);
+    audioB = await srcWidget.buildAudioAuto(panelB, sr);
   } catch (err) { setStatus(err.message, true); return; }
 
   coordsA = coordsB = null;
@@ -1370,6 +1379,8 @@ async function startEncode() {
 
   rawAudioA = audioA;
   rawAudioB = audioB;
+  durA = audioA.length / sr;
+  durB = audioB.length / sr;
   playerA.setAudio(rawAudioA, sr);
   playerB.setAudio(rawAudioB, sr);
 
@@ -2469,7 +2480,7 @@ umapCanvas.addEventListener('click', async e => {
   scheduleRender();
 
   const T = bestSrc === 'A' ? currentEmbeds.codesDimsA[2] : currentEmbeds.codesDimsB[2];
-  const framesPerSec = (bestSrc === 'A' ? coordsA.length : coordsB.length) / srcWidget.getDuration();
+  const framesPerSec = (bestSrc === 'A' ? coordsA.length : coordsB.length) / srcDuration(bestSrc);
   const half       = Math.max(1, Math.round(framesPerSec * 0.5));
   const startFrame = Math.max(0, bestIdx - half);
   const endFrame   = Math.min(T, bestIdx + half);
@@ -2548,7 +2559,7 @@ function animateTrajAnchor() {
 function snapCtxArg() {
   return {
     snapMode, snapKVal, snapDurVal,
-    framesPerSec: coordsA ? coordsA.length / srcWidget.getDuration() : 1,
+    framesPerSec: coordsA ? coordsA.length / srcDuration('A') : 1,
     coordsA, coordsB,
   };
 }
@@ -2558,7 +2569,7 @@ function snapWaypointArgs() {
     canvasMode, pinPoints: pinCoords(), coordsA, coordsB,
     userTrajectory, pathMode, snapMode, snapDurVal, codeSecVal,
     trajDuration: parseFloat(trajDurationEl.value) || 4,
-    framesPerSec: coordsA ? coordsA.length / srcWidget.getDuration() : 1,
+    framesPerSec: coordsA ? coordsA.length / srcDuration('A') : 1,
     drawSegmentBoundaries,
     enabledSrcs: getEnabledSrcs(),
   };
@@ -2566,7 +2577,7 @@ function snapWaypointArgs() {
 
 function computeWaypoints() {
   if (!coordsA || !coordsB) return;
-  const fps = coordsA.length / srcWidget.getDuration();
+  const fps = coordsA.length / srcDuration('A');
 
   if (pathMode === 'code') {
     const N_total = codeDurMode === 'frames'
@@ -2679,7 +2690,7 @@ async function playTrajectory() {
 
   const [, D, T_A] = currentEmbeds.embQuantDimsA;
   const [, , T_B]  = currentEmbeds.embQuantDimsB;
-  const fps = coordsA.length / srcWidget.getDuration();
+  const fps = coordsA.length / srcDuration('A');
 
   // ── Code-path mode ────────────────────────────────────────────────────────
   if (pathMode === 'code') {

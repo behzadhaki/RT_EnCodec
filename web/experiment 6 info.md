@@ -22,6 +22,7 @@ VIEWPORT (pan/zoom) and PLAYBACK_TICK are orthogonal — they only affect render
 ```js
 // Sources
 rawAudioA, rawAudioB, modelHz
+durA, durB               // actual loaded duration (s) per source; null until first encode
 
 // EMBEDS (async)
 currentEmbeds        // {embQuantA, embQuantB, embQuantDimsA, embQuantDimsB, scalesA, scalesB}
@@ -423,6 +424,8 @@ The generated waveform is color-coded per pixel by the source of the correspondi
 SOURCE / MODEL CHANGE
   └─► scheduleEncode() [debounced]
         └─► startEncode()
+              ├─ buildAudioAuto(panelA/B, sr) — loads each file at natural length ≤ 10 s
+              │     sets durA / durB = audio.length / sr (A and B may differ)
               ├─ worker: encode A → encode B → embeddings
               └─► markDirty('COORDS', 'WAYPOINTS', 'AUDIO', 'RENDER')
                     └─► runEffects()
@@ -477,6 +480,7 @@ PAN / ZOOM / PLAYBACK TICK
 5. **One draw per frame** — `scheduleRender()` rAF guard prevents redundant redraws.
 6. **Pins survive UMAP/PCA changes** — `pinPoints` stores `{src, idx}` (frame identity). `pinCoords()` derives `[x,y]` live from `coordsA`/`coordsB`, so pins auto-remap when projection changes. Draw trajectories are cleared on projection result since they have no frame-index backing.
 7. **Pingpong same duration** — code mode: K auto-halves via 2× waypoint list. Snap k_frames: ceil/floor split. Snap equal/prop: half-duration `snapCtxArg` keeps all waypoints within each half.
+8. **Per-source durations** — `buildAudioAuto` loads each file at its own natural length (capped at MAX_S = 10 s); A and B need not be the same length. `durA` / `durB` track the actual loaded durations. All FPS calculations use `srcDuration(src)` which returns `durA`/`durB` with a `defaultDur` fallback before first encode. The Duration panel is not shown in experiment 6 (`showDuration: false` in `createDoubleSourceWidget`).
 8. **Multi-segment independence** — each draw stroke is sampled independently in `computeSnapWaypoints`; the renderer inserts `moveTo` gaps so no connecting line is drawn or traversed.
 9. **Source disable is non-destructive** — `pinPoints` is never modified; disabling a source re-snaps pins at `computeWaypoints()` time; re-enabling restores the original snapping automatically.
 10. **Fade is post-processing** — `lastRawPcm` stores the unmodified decoded audio. Changing fade values re-applies to the stored PCM instantly without touching the WAYPOINTS/AUDIO pipeline.
