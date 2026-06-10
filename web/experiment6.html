@@ -85,6 +85,46 @@
 #segCtxMenu .seg-ctx-item:hover { background: #2c2c2c; }
 #segCtxMenu .seg-ctx-item.danger { color: #e06060; }
 #segCtxMenu .seg-ctx-sep { height: 1px; background: #333; margin: 3px 0; }
+
+/* ── Cache manager modal ── */
+#cacheModal {
+  position: fixed; inset: 0; z-index: 200;
+  background: rgba(0,0,0,0.65);
+  display: flex; align-items: center; justify-content: center;
+}
+#cacheModal.hidden { display: none; }
+#cacheModalBox {
+  background: var(--surface); border: 1px solid var(--border2);
+  border-radius: 8px; padding: 16px 18px;
+  width: 520px; max-width: 95vw; max-height: 75vh;
+  display: flex; flex-direction: column; gap: 10px;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.6);
+}
+#cacheModalTitle {
+  font-size: 12px; font-weight: 700; letter-spacing: 0.08em;
+  text-transform: uppercase; color: var(--muted);
+  display: flex; align-items: center; justify-content: space-between;
+}
+#cacheModalList {
+  flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 4px;
+  min-height: 40px;
+}
+.cache-entry {
+  display: flex; align-items: center; gap: 6px;
+  background: var(--surface2); border: 1px solid var(--border);
+  border-radius: 4px; padding: 5px 8px; font-size: 11px;
+}
+.cache-entry-name { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--text); }
+.cache-entry-meta { color: var(--muted); white-space: nowrap; }
+.cache-entry-del {
+  background: none; border: 1px solid var(--border2); color: var(--muted);
+  border-radius: 3px; width: 18px; height: 18px; cursor: pointer;
+  font-size: 10px; display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+}
+.cache-entry-del:hover { border-color: var(--red); color: var(--red); }
+#cacheModalFooter { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+#cacheModalEmpty { font-size: 11px; color: var(--muted); text-align: center; padding: 10px 0; }
 </style>
 </head>
 <body>
@@ -204,6 +244,20 @@
   <div class="seg-ctx-item danger" id="segCtxDelete">Delete</div>
 </div>
 
+<div id="cacheModal" class="hidden">
+  <div id="cacheModalBox">
+    <div id="cacheModalTitle">
+      <span>💾 Cached analyses</span>
+      <button class="tog" id="cacheModalClose" style="font-size:9px;padding:2px 8px">✕ Close</button>
+    </div>
+    <div id="cacheModalList"></div>
+    <div id="cacheModalFooter">
+      <span id="cacheModalStats" style="font-size:11px;color:var(--muted)"></span>
+      <button class="tog danger" id="cacheModalClearAll" style="font-size:10px;padding:3px 10px;color:var(--red)">Clear all</button>
+    </div>
+  </div>
+</div>
+
 <script type="module">
 'use strict';
 
@@ -220,6 +274,16 @@ import {
   buildSnapSequenceFixed,
   makeFrameScales,
 } from './lib/trajectory-utils.js';
+import {
+  openEncodecDB,
+  crc32FromFile,
+  makeCacheKey,
+  cacheGet,
+  cachePut,
+  cacheList,
+  cacheDelete,
+  cacheClear,
+} from './lib/encodec-cache.js';
 
 const MODELS_BASE = new URL('../serialization/encodec_onnx_exports', location.href).href;
 
@@ -380,6 +444,149 @@ librarySection.innerHTML = `
 `.trim();
 controls.appendChild(librarySection);
 
+// ── Analysis cache prompt ─────────────────────────────────────────────────────
+// Shown once; preference persisted in localStorage.
+const CACHE_PREF_KEY = 'encodec_cache_enabled';
+
+const cacheSection = document.createElement('div');
+cacheSection.className = 'section';
+cacheSection.id = 'cacheSection';
+
+function renderCacheSection() {
+  const pref = localStorage.getItem(CACHE_PREF_KEY);
+  if (pref === null) {
+    // First visit — show prompt
+    cacheSection.innerHTML = `
+      <div class="section-title" style="color:var(--accent)">Analysis Cache</div>
+      <div style="font-size:11px;color:var(--muted);margin-bottom:6px;line-height:1.5">
+        Save analysis to browser storage?<br>Avoids re-encoding the same files.
+      </div>
+      <div style="display:flex;gap:4px">
+        <button class="tog" id="cacheYesBtn" style="flex:1">Enable</button>
+        <button class="tog" id="cacheNoBtn"  style="flex:1">Skip</button>
+      </div>
+    `.trim();
+    cacheSection.querySelector('#cacheYesBtn').addEventListener('click', () => {
+      localStorage.setItem(CACHE_PREF_KEY, '1');
+      initCache();
+      renderCacheSection();
+    });
+    cacheSection.querySelector('#cacheNoBtn').addEventListener('click', () => {
+      localStorage.setItem(CACHE_PREF_KEY, '0');
+      renderCacheSection();
+    });
+  } else {
+    const on = pref === '1';
+    cacheSection.innerHTML = `
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:4px">
+        <span style="font-size:11px;color:var(--muted)">
+          💾 Cache: <strong style="color:${on ? 'var(--accent)' : 'var(--muted)'}">${on ? 'on' : 'off'}</strong>
+        </span>
+        <div style="display:flex;gap:3px">
+          ${on ? '<button class="tog" id="cacheManageBtn" style="font-size:9px;padding:2px 6px">Manage</button>' : ''}
+          <button class="tog" id="cacheToggleBtn" style="font-size:9px;padding:2px 6px">
+            ${on ? 'Disable' : 'Enable'}
+          </button>
+        </div>
+      </div>
+    `.trim();
+    cacheSection.querySelector('#cacheToggleBtn').addEventListener('click', () => {
+      const newVal = on ? '0' : '1';
+      localStorage.setItem(CACHE_PREF_KEY, newVal);
+      if (newVal === '1') initCache(); else { cachingEnabled = false; }
+      renderCacheSection();
+    });
+    cacheSection.querySelector('#cacheManageBtn')?.addEventListener('click', openCacheModal);
+  }
+}
+
+async function initCache() {
+  try {
+    encCache       = await openEncodecDB();
+    cachingEnabled = true;
+  } catch (e) {
+    console.warn('Could not open encodec cache DB:', e);
+    cachingEnabled = false;
+  }
+}
+
+// ── Cache manager modal ───────────────────────────────────────────────────────
+
+function fmtBytes(n) {
+  if (n < 1024)        return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(0) + ' KB';
+  return (n / (1024 * 1024)).toFixed(1) + ' MB';
+}
+function fmtDate(ts) {
+  const d = new Date(ts);
+  return d.toLocaleDateString() + ' ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+async function openCacheModal() {
+  if (!encCache) return;
+  const modal   = document.getElementById('cacheModal');
+  const list    = document.getElementById('cacheModalList');
+  const stats   = document.getElementById('cacheModalStats');
+  const clearBtn = document.getElementById('cacheModalClearAll');
+
+  modal.classList.remove('hidden');
+
+  async function refresh() {
+    list.innerHTML = '';
+    const entries = await cacheList(encCache);
+    if (entries.length === 0) {
+      list.innerHTML = '<div id="cacheModalEmpty">No cached analyses.</div>';
+      stats.textContent = '';
+      clearBtn.disabled = true;
+      return;
+    }
+    clearBtn.disabled = false;
+    const totalBytes = entries.reduce((s, e) => s + e.approxBytes, 0);
+    stats.textContent = `${entries.length} entr${entries.length === 1 ? 'y' : 'ies'} · ~${fmtBytes(totalBytes)}`;
+
+    // Group by filename for readability
+    const byFile = {};
+    for (const e of entries) {
+      (byFile[e.filename] ??= []).push(e);
+    }
+    for (const [fname, group] of Object.entries(byFile)) {
+      for (const e of group) {
+        const durS = ((e.segEnd - e.segStart) / e.sampleRate).toFixed(1);
+        const row  = document.createElement('div');
+        row.className = 'cache-entry';
+        row.innerHTML = `
+          <span class="cache-entry-name" title="${fname}">${fname}</span>
+          <span class="cache-entry-meta">${e.modelHz} · ${e.bwKbps}k · ${durS}s · ${fmtBytes(e.approxBytes)}</span>
+          <span class="cache-entry-meta" style="min-width:90px;text-align:right">${fmtDate(e.timestamp)}</span>
+          <button class="cache-entry-del" title="Delete">✕</button>
+        `.trim();
+        row.querySelector('.cache-entry-del').addEventListener('click', async () => {
+          await cacheDelete(encCache, e.id);
+          refresh();
+        });
+        list.appendChild(row);
+      }
+    }
+  }
+
+  clearBtn.onclick = async () => {
+    if (!confirm('Delete all cached analyses?')) return;
+    await cacheClear(encCache);
+    refresh();
+  };
+
+  document.getElementById('cacheModalClose').onclick = () => modal.classList.add('hidden');
+  modal.onclick = e => { if (e.target === modal) modal.classList.add('hidden'); };
+
+  refresh();
+}
+
+renderCacheSection();
+controls.appendChild(cacheSection);
+
+// Auto-init cache if previously enabled
+if (localStorage.getItem(CACHE_PREF_KEY) === '1') initCache();
+
 // ── DOM refs ──────────────────────────────────────────────────────────────────
 
 const umapCanvas    = document.getElementById('umapCanvas');
@@ -535,6 +742,12 @@ let rawAudioA    = null;
 let rawAudioB    = null;
 let durA         = null;   // actual loaded duration (s) for source A
 let durB         = null;   // actual loaded duration (s) for source B
+
+// ── Analysis cache (IndexedDB) ────────────────────────────────────────────────
+let encCache         = null;   // IDBDatabase handle, or null if disabled / not yet open
+let cachingEnabled   = false;
+let pendingCacheKeyA = null;   // set before encoding; used to save result after
+let pendingCacheKeyB = null;
 let waveHighlight = null;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -1339,7 +1552,30 @@ function onWorkerMsg(e) {
   } else if (msg.type === 'embeddings_exp6') {
     currentEmbeds = msg;
     populateLevelSelect(msg.codesDimsA[1]);
+    progWrap.style.display = 'none';
     markDirty('COORDS', 'WAYPOINTS', 'AUDIO', 'RENDER');
+
+    // ── Save to cache if keys were prepared ────────────────────────────────────
+    if (cachingEnabled && encCache && pendingCacheKeyA && pendingCacheKeyB) {
+      const kA = pendingCacheKeyA, kB = pendingCacheKeyB;
+      pendingCacheKeyA = pendingCacheKeyB = null;
+      // Fire-and-forget; errors are non-fatal
+      Promise.all([
+        cachePut(encCache, kA, {
+          embEnc: msg.embEncA, embEncDims: msg.embEncDimsA,
+          embQuant: msg.embQuantA, embQuantDims: msg.embQuantDimsA,
+          codes: msg.codesA, codesDims: msg.codesDimsA,
+          scales: msg.scalesA ?? null,
+        }),
+        cachePut(encCache, kB, {
+          embEnc: msg.embEncB, embEncDims: msg.embEncDimsB,
+          embQuant: msg.embQuantB, embQuantDims: msg.embQuantDimsB,
+          codes: msg.codesB, codesDims: msg.codesDimsB,
+          scales: msg.scalesB ?? null,
+        }),
+      ]).then(() => setStatus('Analysis saved to cache ✓'))
+        .catch(e => console.warn('Cache save failed:', e));
+    }
 
   } else if (msg.type === 'error') {
     progWrap.style.display = 'none';
@@ -1361,11 +1597,32 @@ function scheduleEncode(delay = 0) {
   encodeTimer = setTimeout(startEncode, delay);
 }
 
+/** Cancel any in-flight UMAP / PCA work.
+ *  - Bumps umapSessionId so stale buildUMAPFeatureData() completions are ignored.
+ *  - Clears umapFeatureData so the slot-chain can't re-launch on old data.
+ *  - Terminates + recreates the projection worker so its CPU work stops immediately. */
+function cancelProjection() {
+  umapSessionId++;
+  umapFeatureData = null;
+  initUMAPWorker();
+}
+
 async function startEncode() {
   if (!worker) initWorker();
 
-  const sr = mp.getSampleRate();
+  // Kill any in-flight UMAP/PCA — the new encode will trigger a fresh projection.
+  cancelProjection();
 
+  const sr       = mp.getSampleRate();
+  const modelHz  = mp.getModelHz();
+  const bwKbps   = mp.getBwKbps();
+
+  // ── Pre-compute CRCs for file sources (cheap: WeakMap-cached after first call)
+  const fileA = panelA.getFile(), fileB = panelB.getFile();
+  const crcA  = (cachingEnabled && encCache && fileA) ? await crc32FromFile(fileA) : null;
+  const crcB  = (cachingEnabled && encCache && fileB) ? await crc32FromFile(fileB) : null;
+
+  // ── Load audio ────────────────────────────────────────────────────────────────
   let audioA, audioB;
   try {
     setStatus('Loading A…');
@@ -1374,16 +1631,55 @@ async function startEncode() {
     audioB = await srcWidget.buildAudioAuto(panelB, sr);
   } catch (err) { setStatus(err.message, true); return; }
 
+  // Waveform display — always set regardless of cache path
   coordsA = coordsB = null;
   scheduleRender();
-
-  rawAudioA = audioA;
-  rawAudioB = audioB;
-  durA = audioA.length / sr;
-  durB = audioB.length / sr;
+  rawAudioA = audioA; rawAudioB = audioB;
+  durA = audioA.length / sr; durB = audioB.length / sr;
   playerA.setAudio(rawAudioA, sr);
   playerB.setAudio(rawAudioB, sr);
 
+  // ── Cache lookup (only when both sources are files with valid CRCs) ───────────
+  const modelOpts = { modelHz, bwKbps, sampleRate: sr };
+  pendingCacheKeyA = null;
+  pendingCacheKeyB = null;
+
+  if (crcA && crcB) {
+    const keyA = makeCacheKey(fileA, crcA, modelOpts, audioA.length);
+    const keyB = makeCacheKey(fileB, crcB, modelOpts, audioB.length);
+
+    setStatus('Checking cache…');
+    const [hitA, hitB] = await Promise.all([
+      cacheGet(encCache, keyA),
+      cacheGet(encCache, keyB),
+    ]);
+
+    if (hitA && hitB) {
+      // ── Full cache hit — inject directly, skip worker ─────────────────────
+      currentEmbeds = {
+        type:        'embeddings_exp6',
+        embEncA:     hitA.embEnc,   embEncDimsA:  hitA.embEncDims,
+        embQuantA:   hitA.embQuant, embQuantDimsA: hitA.embQuantDims,
+        codesA:      hitA.codes,    codesDimsA:   hitA.codesDims,
+        scalesA:     hitA.scales,
+        embEncB:     hitB.embEnc,   embEncDimsB:  hitB.embEncDims,
+        embQuantB:   hitB.embQuant, embQuantDimsB: hitB.embQuantDims,
+        codesB:      hitB.codes,    codesDimsB:   hitB.codesDims,
+        scalesB:     hitB.scales,
+      };
+      populateLevelSelect(currentEmbeds.codesDimsA[1]);
+      progWrap.style.display = 'none';
+      setStatus('Loaded from cache ✓');
+      markDirty('COORDS', 'WAYPOINTS', 'AUDIO', 'RENDER');
+      return;
+    }
+
+    // Cache miss — store keys so we can save after encoding completes
+    pendingCacheKeyA = keyA;
+    pendingCacheKeyB = keyB;
+  }
+
+  // ── Encode via worker ─────────────────────────────────────────────────────────
   pendingAudioB = audioB;
   encodePhase   = 'A';
   activeJobId   = ++jobSeq;
@@ -1395,8 +1691,8 @@ async function startEncode() {
   worker.postMessage({
     type: 'encode', source: 'A', jobId: activeJobId,
     audio:     audioA.slice(),
-    modelHz:   mp.getModelHz(),
-    bwKbps:    mp.getBwKbps(),
+    modelHz,
+    bwKbps,
     streaming: mp.isStreaming(),
     frameSize: mp.getFrameSize(),
   });

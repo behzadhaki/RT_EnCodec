@@ -126,8 +126,10 @@ export function createDoubleSourceWidget({
     if (type === 'file') {
       const f = panel.getFile();
       if (!f) throw new Error(`No file selected for "${panel.element.querySelector('.section-title').textContent}".`);
-      // loadFile already caps at MAX_S (10 s) by default.
-      audio = await loadFile(f, sr);
+      // When "load full file" is checked, pass Infinity so loadFile uses the
+      // complete file duration.  Otherwise clamp to the panel's trim value.
+      const maxS = panel.getLoadFull() ? Infinity : panel.getTrimS();
+      audio = await loadFile(f, sr, maxS);
     } else {
       const len = Math.round(getDuration() * sr);
       audio = generateSource(type, panel.getFreq(), len / sr, sr);

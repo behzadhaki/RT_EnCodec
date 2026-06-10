@@ -64,6 +64,18 @@ export function createSourcePanel({
       <button class="file-btn src-file-btn">choose file…</button>
       <input type="file" class="src-file-input" accept="audio/*,audio/mp4,audio/x-m4a,.m4a,.m4b,.caf,.aiff,.aif" style="display:none">
     </div>
+    <div class="row src-load-row" style="display:none">
+      <span class="lbl">Load</span>
+      <label style="display:flex;align-items:center;gap:4px;font-size:11px;cursor:pointer;color:var(--muted)">
+        <input type="checkbox" class="src-load-full" checked>
+        full file
+      </label>
+    </div>
+    <div class="row src-trim-row" style="display:none">
+      <span class="lbl">Trim to</span>
+      <input type="number" class="src-trim-s" value="10" min="0.1" max="7200" step="0.5">
+      <span class="unit">s</span>
+    </div>
     ${showVol ? `
     <div class="row">
       <span class="lbl">Vol</span>
@@ -92,6 +104,10 @@ export function createSourcePanel({
   const fileRow     = section.querySelector('.src-file-row');
   const fileBtnEl   = section.querySelector('.src-file-btn');
   const fileInputEl = section.querySelector('.src-file-input');
+  const loadRow     = section.querySelector('.src-load-row');
+  const loadFullEl  = section.querySelector('.src-load-full');
+  const trimRow     = section.querySelector('.src-trim-row');
+  const trimSEl     = section.querySelector('.src-trim-s');
   const volEl       = section.querySelector('.src-vol');
   const gateTogEl   = section.querySelector('.src-gate-tog');
   const gateRateRow = section.querySelector('.src-gate-rate-row');
@@ -103,13 +119,19 @@ export function createSourcePanel({
   let currentFile = null;
 
   function updateVisibility() {
-    const v = typeEl.value;
-    fileRow.style.display = v === 'file' ? '' : 'none';
-    freqRow.style.display = (v === 'file' || v === 'sweep' || v === 'silence') ? 'none' : '';
+    const v        = typeEl.value;
+    const isFile   = v === 'file';
+    const loadFull = loadFullEl.checked;
+    fileRow.style.display = isFile ? '' : 'none';
+    loadRow.style.display = isFile ? '' : 'none';
+    trimRow.style.display = (isFile && !loadFull) ? '' : 'none';
+    freqRow.style.display = (isFile || v === 'sweep' || v === 'silence') ? 'none' : '';
   }
 
-  typeEl.addEventListener('change', () => { updateVisibility(); onChange(0); });
-  freqEl.addEventListener('input',  () => onChange(500));
+  typeEl.addEventListener('change',   () => { updateVisibility(); onChange(0); });
+  freqEl.addEventListener('input',    () => onChange(500));
+  loadFullEl.addEventListener('change', () => { updateVisibility(); onChange(0); });
+  trimSEl.addEventListener('input',   () => onChange(500));
 
   fileBtnEl.addEventListener('click', () => fileInputEl.click());
   fileInputEl.addEventListener('change', async () => {
@@ -142,6 +164,8 @@ export function createSourcePanel({
     getType:       () => typeEl.value,
     getFreq:       () => parseFloat(freqEl.value) || 440,
     getFile:       () => currentFile,
+    getLoadFull:   () => loadFullEl.checked,
+    getTrimS:      () => parseFloat(trimSEl.value) || 10,
     getVolume:     () => volEl ? parseFloat(volEl.value) : 1,
     isGateEnabled: () => gateEnabled,
     getGateFreq:   () => gateFreqEl ? (parseFloat(gateFreqEl.value) || 4)  : 4,
@@ -152,6 +176,8 @@ export function createSourcePanel({
         freq: parseFloat(freqEl.value) || 440,
         file: currentFile,
         fileName: currentFile ? fileBtnEl.textContent : null,
+        loadFull: loadFullEl.checked,
+        trimS:    parseFloat(trimSEl.value) || 10,
         volume: volEl ? parseFloat(volEl.value) : 1,
         gateEnabled,
         gateFreq: gateFreqEl ? (parseFloat(gateFreqEl.value) || 4) : 4,
@@ -163,6 +189,8 @@ export function createSourcePanel({
       freqEl.value = s.freq;
       currentFile = s.file;
       fileBtnEl.textContent = s.fileName || 'choose file…';
+      if (s.loadFull !== undefined) loadFullEl.checked = s.loadFull;
+      if (s.trimS   !== undefined) trimSEl.value = s.trimS;
       if (volEl) volEl.value = s.volume;
       if (gateTogEl) {
         gateEnabled = s.gateEnabled;
@@ -176,7 +204,7 @@ export function createSourcePanel({
       updateVisibility();
     },
     setEnabled(on) {
-      [typeEl, freqEl, fileInputEl, volEl, gateTogEl, gateFreqEl, gateDecEl]
+      [typeEl, freqEl, fileInputEl, loadFullEl, trimSEl, volEl, gateTogEl, gateFreqEl, gateDecEl]
         .filter(Boolean).forEach(el => { el.disabled = !on; });
       fileBtnEl.style.opacity = on ? '' : '0.4';
       fileBtnEl.style.pointerEvents = on ? '' : 'none';

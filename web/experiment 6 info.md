@@ -24,8 +24,16 @@ VIEWPORT (pan/zoom) and PLAYBACK_TICK are orthogonal — they only affect render
 rawAudioA, rawAudioB, modelHz
 durA, durB               // actual loaded duration (s) per source; null until first encode
 
+// Analysis cache (IndexedDB via encodec-cache.js)
+encCache             // IDBDatabase | null  — null if disabled or not yet opened
+cachingEnabled       // bool — true once DB is open and user opted in
+pendingCacheKeyA/B   // cache key objects held between startEncode and embeddings_exp6;
+                     // null means no save is pending (synth source or cache disabled)
+
 // EMBEDS (async)
-currentEmbeds        // {embQuantA, embQuantB, embQuantDimsA, embQuantDimsB, scalesA, scalesB}
+currentEmbeds        // {embEncA/B, embEncDimsA/B, embQuantA/B, embQuantDimsA/B,
+                     //  codesA/B, codesDimsA/B, scalesA/B}
+                     // populated either from worker (encode path) or from cache (cache hit)
 encodePhase          // 'A' | 'B' | null
 
 // COORDS inputs
@@ -424,9 +432,15 @@ The generated waveform is color-coded per pixel by the source of the correspondi
 SOURCE / MODEL CHANGE
   └─► scheduleEncode() [debounced]
         └─► startEncode()
-              ├─ buildAudioAuto(panelA/B, sr) — loads each file at natural length ≤ 10 s
+              ├─ crc32FromFile(fileA/B) — CRC-32 of raw file bytes (WeakMap-cached)
+              ├─ buildAudioAuto(panelA/B, sr) — loads per panel's "load full" / trim setting
               │     sets durA / durB = audio.length / sr (A and B may differ)
-              ├─ worker: encode A → encode B → embeddings
+              ├─ [if cachingEnabled && both files] cacheGet(keyA) + cacheGet(keyB)
+              │     CACHE HIT  → inject currentEmbeds directly, skip worker entirely
+              │                  → markDirty('COORDS','WAYPOINTS','AUDIO','RENDER')
+              │     CACHE MISS → store pendingCacheKeyA/B, fall through to worker
+              ├─ worker: encode A → encode B → get_embeddings_exp6
+              │     on embeddings_exp6: cachePut(A) + cachePut(B) [fire-and-forget]
               └─► markDirty('COORDS', 'WAYPOINTS', 'AUDIO', 'RENDER')
                     └─► runEffects()
                           └─► triggerProjection()
@@ -471,6 +485,38 @@ PAN / ZOOM / PLAYBACK TICK
 
 ---
 
+## Analysis cache — `lib/encodec-cache.js`
+
+Opt-in IndexedDB cache that stores per-source encoder outputs so repeated loads of the same file+model combination skip the worker entirely.
+
+### Cache key
+`(filename, fileSize, crc32, modelHz, bwKbps, sampleRate, segStart=0, segEnd)`
+
+`crc32` is computed over the raw file `ArrayBuffer` and WeakMap-cached per File object.
+`segEnd` is `audio.length` after resampling to `sampleRate`, so changing the trim setting produces a different key and correctly misses.
+
+### Stored per record
+| Field | Type | Description |
+|---|---|---|
+| `embEncData` | `ArrayBuffer` (Float32) | Pre-VQ encoder embeddings |
+| `embEncDims` | `number[]` | Shape of embEnc |
+| `embQuantData` | `ArrayBuffer` (Float32) | Post-VQ quantised embeddings |
+| `embQuantDims` | `number[]` | Shape of embQuant |
+| `codesData` | `ArrayBuffer` (Int32) | VQ codebook indices |
+| `codesDims` | `number[]` | Shape of codes |
+| `scalesData` | `ArrayBuffer` (Float32) \| `null` | Per-frame scales (24 kHz model) |
+| `timestamp` | `number` | `Date.now()` at save time |
+
+Storing `embQuant` + `codes` alongside `embEnc` means a cache hit requires **zero additional inference** — `currentEmbeds` is assembled directly from the stored buffers.
+
+### Preference
+Stored in `localStorage` under key `encodec_cache_enabled` (`'1'` / `'0'`). A first-visit prompt in the controls sidebar lets the user opt in or out; the toggle is always visible for later changes.
+
+### Partial hits
+If only one source is a file, or if one source misses, the full encode pipeline runs for **both** sources (no partial injection). This keeps the worker's internal capture state consistent.
+
+---
+
 ## Key design properties
 
 1. **Guards in one place** — `runEffects()` is the only location that checks `currentEmbeds`, `coordsA`, `hasWaypointSource()`, etc.
@@ -480,7 +526,8 @@ PAN / ZOOM / PLAYBACK TICK
 5. **One draw per frame** — `scheduleRender()` rAF guard prevents redundant redraws.
 6. **Pins survive UMAP/PCA changes** — `pinPoints` stores `{src, idx}` (frame identity). `pinCoords()` derives `[x,y]` live from `coordsA`/`coordsB`, so pins auto-remap when projection changes. Draw trajectories are cleared on projection result since they have no frame-index backing.
 7. **Pingpong same duration** — code mode: K auto-halves via 2× waypoint list. Snap k_frames: ceil/floor split. Snap equal/prop: half-duration `snapCtxArg` keeps all waypoints within each half.
-8. **Per-source durations** — `buildAudioAuto` loads each file at its own natural length (capped at MAX_S = 10 s); A and B need not be the same length. `durA` / `durB` track the actual loaded durations. All FPS calculations use `srcDuration(src)` which returns `durA`/`durB` with a `defaultDur` fallback before first encode. The Duration panel is not shown in experiment 6 (`showDuration: false` in `createDoubleSourceWidget`).
-8. **Multi-segment independence** — each draw stroke is sampled independently in `computeSnapWaypoints`; the renderer inserts `moveTo` gaps so no connecting line is drawn or traversed.
-9. **Source disable is non-destructive** — `pinPoints` is never modified; disabling a source re-snaps pins at `computeWaypoints()` time; re-enabling restores the original snapping automatically.
-10. **Fade is post-processing** — `lastRawPcm` stores the unmodified decoded audio. Changing fade values re-applies to the stored PCM instantly without touching the WAYPOINTS/AUDIO pipeline.
+8. **Per-source durations** — `buildAudioAuto` loads each file at its own natural length (or trimmed by panel setting); A and B need not be the same length. `durA` / `durB` track the actual loaded durations. All FPS calculations use `srcDuration(src)` which returns `durA`/`durB` with a `defaultDur` fallback before first encode. The Duration panel is not shown in experiment 6 (`showDuration: false` in `createDoubleSourceWidget`).
+9. **Analysis cache** — `encodec-cache.js` stores per-source embeddings in IndexedDB keyed by `(filename, fileSize, crc32, modelHz, bwKbps, sampleRate, segStart, segEnd)`. A full cache hit (both sources) skips the worker entirely and injects `currentEmbeds` directly. Cache is opt-in; preference stored in `localStorage`. CRC-32 is computed from raw file bytes and WeakMap-cached per File object so large files are only hashed once per session.
+10. **Multi-segment independence** — each draw stroke is sampled independently in `computeSnapWaypoints`; the renderer inserts `moveTo` gaps so no connecting line is drawn or traversed.
+11. **Source disable is non-destructive** — `pinPoints` is never modified; disabling a source re-snaps pins at `computeWaypoints()` time; re-enabling restores the original snapping automatically.
+12. **Fade is post-processing** — `lastRawPcm` stores the unmodified decoded audio. Changing fade values re-applies to the stored PCM instantly without touching the WAYPOINTS/AUDIO pipeline.
