@@ -630,6 +630,7 @@ const dpr = devicePixelRatio || 1;
 let worker        = null;
 let jobSeq        = 0;
 let activeJobId   = -1;
+let encodeRunSeq  = 0;   // bumped at the top of every startEncode; stale runs abort after awaits
 let encodePhase   = null;
 let pendingAudioB = null;
 let currentEmbeds = null;
@@ -640,7 +641,7 @@ let encodeTimer   = null;
 // UMAP
 let umapWorker      = null;
 let activeUMAPJobId = -1;
-let umapMode        = 'combined';
+let umapMode        = 'per_level'; // matches default embSpace='vq' (set by togVQMode.active)
 let umapLevels      = [];   // selected codebook levels (all by default)
 let embSpace        = 'vq';     // 'pre_vq' | 'vq' | 'post_vq'
 let embMode         = 'emb';    // 'emb' | 'emb+delta' | 'delta'
@@ -1610,6 +1611,11 @@ function cancelProjection() {
 async function startEncode() {
   if (!worker) initWorker();
 
+  // Claim this run. Any concurrent startEncode that started earlier will see
+  // myRun !== encodeRunSeq after their awaits and silently abort.
+  const myRun = ++encodeRunSeq;
+  const stale = () => myRun !== encodeRunSeq;
+
   // Kill any in-flight UMAP/PCA — the new encode will trigger a fresh projection.
   cancelProjection();
 
@@ -1621,14 +1627,17 @@ async function startEncode() {
   const fileA = panelA.getFile(), fileB = panelB.getFile();
   const crcA  = (cachingEnabled && encCache && fileA) ? await crc32FromFile(fileA) : null;
   const crcB  = (cachingEnabled && encCache && fileB) ? await crc32FromFile(fileB) : null;
+  if (stale()) return;
 
   // ── Load audio ────────────────────────────────────────────────────────────────
   let audioA, audioB;
   try {
     setStatus('Loading A…');
     audioA = await srcWidget.buildAudioAuto(panelA, sr);
+    if (stale()) return;
     setStatus('Loading B…');
     audioB = await srcWidget.buildAudioAuto(panelB, sr);
+    if (stale()) return;
   } catch (err) { setStatus(err.message, true); return; }
 
   // Waveform display — always set regardless of cache path
@@ -1653,6 +1662,7 @@ async function startEncode() {
       cacheGet(encCache, keyA),
       cacheGet(encCache, keyB),
     ]);
+    if (stale()) return;
 
     if (hitA && hitB) {
       // ── Full cache hit — inject directly, skip worker ─────────────────────
