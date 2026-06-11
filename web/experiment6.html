@@ -125,6 +125,12 @@
 .cache-entry-del:hover { border-color: var(--red); color: var(--red); }
 #cacheModalFooter { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
 #cacheModalEmpty { font-size: 11px; color: var(--muted); text-align: center; padding: 10px 0; }
+.src-cache-row select {
+  flex: 1; font-size: 10px;
+  background: var(--bg); color: var(--text);
+  border: 1px solid var(--border); border-radius: 3px;
+  padding: 1px 2px; cursor: pointer;
+}
 </style>
 </head>
 <body>
@@ -279,6 +285,7 @@ import {
   crc32FromFile,
   makeCacheKey,
   cacheGet,
+
   cachePut,
   cacheList,
   cacheDelete,
@@ -294,15 +301,52 @@ const controls = document.getElementById('controls');
 const srcWidget = createDoubleSourceWidget({
   defaultDur:   4,
   showDuration: false,   // each file loads at its own natural length (≤ 10 s)
-  onChange: delay => scheduleEncode(delay),
+  onChange: delay => { saveAllPanelSettings(); refreshDropdowns(); scheduleEncode(delay); },
 });
 controls.appendChild(srcWidget.element);
 const { panelA, panelB } = srcWidget;
 
+// Declared here (before use) — the `let` declarations in the state-vars section
+// below would be in the temporal dead zone at this point in execution.
+let cacheDropRowA, cacheDropSelA, cacheDropRowB, cacheDropSelB;
+
+// Inject per-panel cache dropdowns (hidden until matching entries exist).
+({ rowEl: cacheDropRowA, selEl: cacheDropSelA } = injectCacheDropdown(panelA));
+({ rowEl: cacheDropRowB, selEl: cacheDropSelB } = injectCacheDropdown(panelB));
+
+// Selecting a cached version: apply its model/trim settings and trigger encode.
+// Only acts when the correct file is already loaded in the panel.
+function wireCacheDropdown(selEl, panel) {
+  selEl.addEventListener('change', () => {
+    if (!selEl.value) return;
+    const { segEnd, sampleRate, modelHz, bwKbps, filename } = JSON.parse(selEl.value);
+    selEl.value = '';   // reset — not sticky
+
+    const currentFile = panel.getFile();
+    if (!currentFile || currentFile.name !== filename) {
+      setStatus(`Load "${filename}" to use this cached version`, true);
+      return;
+    }
+
+    // Correct file loaded — apply model settings, set trim, trigger encode.
+    mp.setModelHz(modelHz);
+    mp.setBwKbps(bwKbps);
+    const trimS = parseFloat((segEnd / sampleRate).toFixed(3));
+    panel.setState({ ...panel.getState(), loadFull: false, trimS });
+    scheduleEncode(0);
+  });
+}
+wireCacheDropdown(cacheDropSelA, panelA);
+wireCacheDropdown(cacheDropSelB, panelB);
+
+// Restore settings + files from the previous session (async; fires after all
+// sync setup so workers, mp, etc. are already initialised).
+restoreSession();
+
 const mp = createModelPanel({
   defaultModel: '48k',
   defaultBw:    24,
-  onChange: () => { currentEmbeds = null; scheduleEncode(0); },
+  onChange: () => { currentEmbeds = null; refreshDropdowns(); scheduleEncode(0); },
 });
 controls.appendChild(mp.modelSection);
 controls.appendChild(mp.modeSection);
@@ -504,6 +548,7 @@ async function initCache() {
   try {
     encCache       = await openEncodecDB();
     cachingEnabled = true;
+    refreshDropdowns();   // show dropdowns for any already-selected files
   } catch (e) {
     console.warn('Could not open encodec cache DB:', e);
     cachingEnabled = false;
@@ -522,63 +567,68 @@ function fmtDate(ts) {
   return d.toLocaleDateString() + ' ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
 
+/** Rebuild the cache modal list. No-op if the modal is closed or cache is off. */
+async function refreshCacheModal() {
+  const modal    = document.getElementById('cacheModal');
+  if (!encCache || !modal || modal.classList.contains('hidden')) return;
+
+  const list     = document.getElementById('cacheModalList');
+  const stats    = document.getElementById('cacheModalStats');
+  const clearBtn = document.getElementById('cacheModalClearAll');
+
+  list.innerHTML = '';
+  const entries = await cacheList(encCache);
+  if (entries.length === 0) {
+    list.innerHTML = '<div id="cacheModalEmpty">No cached analyses.</div>';
+    stats.textContent = '';
+    clearBtn.disabled = true;
+    return;
+  }
+  clearBtn.disabled = false;
+  const totalBytes = entries.reduce((s, e) => s + e.approxBytes, 0);
+  stats.textContent = `${entries.length} entr${entries.length === 1 ? 'y' : 'ies'} · ~${fmtBytes(totalBytes)}`;
+
+  const byFile = {};
+  for (const e of entries) (byFile[e.filename] ??= []).push(e);
+  for (const [fname, group] of Object.entries(byFile)) {
+    for (const e of group) {
+      const durS = ((e.segEnd - e.segStart) / e.sampleRate).toFixed(1);
+      const row  = document.createElement('div');
+      row.className = 'cache-entry';
+      row.innerHTML = `
+        <span class="cache-entry-name" title="${fname}">${fname}</span>
+        <span class="cache-entry-meta">${e.modelHz} · ${e.bwKbps}k · ${durS}s · ${fmtBytes(e.approxBytes)}</span>
+        <span class="cache-entry-meta" style="min-width:90px;text-align:right">${fmtDate(e.timestamp)}</span>
+        <button class="cache-entry-del" title="Delete">✕</button>
+      `.trim();
+      row.querySelector('.cache-entry-del').addEventListener('click', async () => {
+        await cacheDelete(encCache, e.id);
+        refreshCacheModal();
+        refreshDropdowns();
+      });
+      list.appendChild(row);
+    }
+  }
+}
+
 async function openCacheModal() {
   if (!encCache) return;
-  const modal   = document.getElementById('cacheModal');
-  const list    = document.getElementById('cacheModalList');
-  const stats   = document.getElementById('cacheModalStats');
+  const modal    = document.getElementById('cacheModal');
   const clearBtn = document.getElementById('cacheModalClearAll');
 
   modal.classList.remove('hidden');
 
-  async function refresh() {
-    list.innerHTML = '';
-    const entries = await cacheList(encCache);
-    if (entries.length === 0) {
-      list.innerHTML = '<div id="cacheModalEmpty">No cached analyses.</div>';
-      stats.textContent = '';
-      clearBtn.disabled = true;
-      return;
-    }
-    clearBtn.disabled = false;
-    const totalBytes = entries.reduce((s, e) => s + e.approxBytes, 0);
-    stats.textContent = `${entries.length} entr${entries.length === 1 ? 'y' : 'ies'} · ~${fmtBytes(totalBytes)}`;
-
-    // Group by filename for readability
-    const byFile = {};
-    for (const e of entries) {
-      (byFile[e.filename] ??= []).push(e);
-    }
-    for (const [fname, group] of Object.entries(byFile)) {
-      for (const e of group) {
-        const durS = ((e.segEnd - e.segStart) / e.sampleRate).toFixed(1);
-        const row  = document.createElement('div');
-        row.className = 'cache-entry';
-        row.innerHTML = `
-          <span class="cache-entry-name" title="${fname}">${fname}</span>
-          <span class="cache-entry-meta">${e.modelHz} · ${e.bwKbps}k · ${durS}s · ${fmtBytes(e.approxBytes)}</span>
-          <span class="cache-entry-meta" style="min-width:90px;text-align:right">${fmtDate(e.timestamp)}</span>
-          <button class="cache-entry-del" title="Delete">✕</button>
-        `.trim();
-        row.querySelector('.cache-entry-del').addEventListener('click', async () => {
-          await cacheDelete(encCache, e.id);
-          refresh();
-        });
-        list.appendChild(row);
-      }
-    }
-  }
-
   clearBtn.onclick = async () => {
     if (!confirm('Delete all cached analyses?')) return;
     await cacheClear(encCache);
-    refresh();
+    refreshCacheModal();
+    refreshDropdowns();
   };
 
   document.getElementById('cacheModalClose').onclick = () => modal.classList.add('hidden');
   modal.onclick = e => { if (e.target === modal) modal.classList.add('hidden'); };
 
-  refresh();
+  refreshCacheModal();
 }
 
 renderCacheSection();
@@ -633,6 +683,7 @@ let activeJobId   = -1;
 let encodeRunSeq  = 0;   // bumped at the top of every startEncode; stale runs abort after awaits
 let encodePhase   = null;
 let pendingAudioB = null;
+let preVQPending  = false;   // true while re-encoding just to fetch embEnc for Pre-VQ tab
 let currentEmbeds = null;
 let codebooks     = null;
 let codebooksFor  = null;
@@ -749,9 +800,258 @@ let encCache         = null;   // IDBDatabase handle, or null if disabled / not 
 let cachingEnabled   = false;
 let pendingCacheKeyA = null;   // set before encoding; used to save result after
 let pendingCacheKeyB = null;
+
+
+// ── Panel state persistence ────────────────────────────────────────────────────
+// Settings (type, freq, vol, gate, loadFull, trimS) → localStorage (instant restore).
+// File selections → FileSystemFileHandle in a tiny IndexedDB (Chrome/Brave only;
+// auto-restores on revisit once permission is granted; Firefox gracefully skipped).
+const PS_LS_A    = 'exp6_panelA';       // localStorage keys
+const PS_LS_B    = 'exp6_panelB';
+const PS_DB_NAME = 'exp6-panel-state';  // IndexedDB for file handles only
+const PS_DB_VER  = 1;
+const PS_STORE   = 'handles';
+let panelStateDB = null;                // opened once at startup
 let waveHighlight = null;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+// ── Panel-state persistence helpers ───────────────────────────────────────────
+
+function openPanelStateDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(PS_DB_NAME, PS_DB_VER);
+    req.onupgradeneeded = e => e.target.result.createObjectStore(PS_STORE);
+    req.onsuccess       = e => resolve(e.target.result);
+    req.onerror         = e => reject(e.target.error);
+  });
+}
+
+/** Save non-file settings for one panel to localStorage. */
+function savePanelSettings(lsKey, panel) {
+  try {
+    const s = panel.getState();
+    localStorage.setItem(lsKey, JSON.stringify({
+      type: s.type, freq: s.freq, loadFull: s.loadFull, trimS: s.trimS,
+      volume: s.volume, gateEnabled: s.gateEnabled, gateFreq: s.gateFreq,
+      gateDecay: s.gateDecay,
+    }));
+  } catch { /* storage full / private mode — silently skip */ }
+}
+
+/** Restore non-file settings from localStorage. Returns saved type, or null. */
+function restorePanelSettings(lsKey, panel) {
+  try {
+    const raw = localStorage.getItem(lsKey);
+    if (!raw) return null;
+    const s = JSON.parse(raw);
+    panel.setState(s);   // sets type, freq, vol, gate, loadFull, trimS
+    return s.type ?? null;
+  } catch { return null; }
+}
+
+/** Persist a FileSystemFileHandle (or null to clear). */
+function saveFileHandle(storeKey, handle) {
+  if (!panelStateDB) return;
+  const tx  = panelStateDB.transaction(PS_STORE, 'readwrite');
+  const store = tx.objectStore(PS_STORE);
+  if (handle) {
+    store.put(handle, storeKey);
+  } else {
+    store.delete(storeKey);
+  }
+}
+
+/** Retrieve a stored FileSystemFileHandle, or null. */
+function loadFileHandle(storeKey) {
+  return new Promise((resolve, reject) => {
+    const tx  = panelStateDB.transaction(PS_STORE, 'readonly');
+    const req = tx.objectStore(PS_STORE).get(storeKey);
+    req.onsuccess = e => resolve(e.target.result ?? null);
+    req.onerror   = e => reject(e.target.error);
+  });
+}
+
+/** Save settings + handles for both panels (called from onChange). */
+function saveAllPanelSettings() {
+  savePanelSettings(PS_LS_A, panelA);
+  savePanelSettings(PS_LS_B, panelB);
+  if (panelStateDB) {
+    // Save handles when file is selected; clear when type switches away from file.
+    saveFileHandle(PS_LS_A, panelA.getType() === 'file' ? panelA.getFileHandle() : null);
+    saveFileHandle(PS_LS_B, panelB.getType() === 'file' ? panelB.getFileHandle() : null);
+  }
+}
+
+// ── Session restore on page load ───────────────────────────────────────────────
+
+let _restoreNotice = null;
+
+function showRestoreNotice(onRestore) {
+  if (_restoreNotice) return;
+  _restoreNotice = document.createElement('div');
+  _restoreNotice.className = 'section';
+  _restoreNotice.style.cssText = 'border-color:var(--accent);background:color-mix(in srgb,var(--accent) 8%,var(--panel))';
+  _restoreNotice.innerHTML = `
+    <div class="row" style="gap:6px;align-items:center">
+      <span style="font-size:11px;color:var(--muted);flex:1">Previous files need permission to restore</span>
+      <button class="tog" id="restoreFilesBtn" style="font-size:10px;padding:3px 8px">📂 Restore</button>
+      <button class="tog" id="restoreDismissBtn" style="font-size:10px;padding:3px 8px">✕</button>
+    </div>
+  `.trim();
+  _restoreNotice.querySelector('#restoreFilesBtn').addEventListener('click', async () => {
+    _restoreNotice.querySelector('#restoreFilesBtn').textContent = 'Restoring…';
+    await onRestore();
+    _restoreNotice.remove();
+    _restoreNotice = null;
+  });
+  _restoreNotice.querySelector('#restoreDismissBtn').addEventListener('click', () => {
+    _restoreNotice.remove();
+    _restoreNotice = null;
+  });
+  // Insert at the very top of controls
+  controls.insertBefore(_restoreNotice, controls.firstChild);
+}
+
+async function restoreSession() {
+  // ── 1. Restore non-file settings immediately (no async needed) ───────────
+  const typeA = restorePanelSettings(PS_LS_A, panelA);
+  const typeB = restorePanelSettings(PS_LS_B, panelB);
+
+  // ── 2. Open the handle DB ─────────────────────────────────────────────────
+  try {
+    panelStateDB = await openPanelStateDB();
+  } catch (e) {
+    console.warn('Panel state DB unavailable:', e);
+    return;
+  }
+
+  // File handle restoration only if File System Access API is available
+  if (!('showOpenFilePicker' in window)) return;
+
+  const needA = typeA === 'file';
+  const needB = typeB === 'file';
+  if (!needA && !needB) return;
+
+  // ── 3. Load stored handles ────────────────────────────────────────────────
+  const [handleA, handleB] = await Promise.all([
+    needA ? loadFileHandle(PS_LS_A) : null,
+    needB ? loadFileHandle(PS_LS_B) : null,
+  ]);
+
+  if (!handleA && !handleB) return;
+
+  // ── 4. Check permissions (no user gesture required for queryPermission) ───
+  const permA = handleA ? await handleA.queryPermission({ mode: 'read' }) : null;
+  const permB = handleB ? await handleB.queryPermission({ mode: 'read' }) : null;
+
+  const needsGesture = (permA === 'prompt') || (permB === 'prompt');
+
+  async function applyHandles() {
+    let anyRestored = false;
+    for (const [handle, perm, panel] of [[handleA, permA, panelA], [handleB, permB, panelB]]) {
+      if (!handle) continue;
+      let granted = perm === 'granted';
+      if (perm === 'prompt') {
+        try {
+          granted = (await handle.requestPermission({ mode: 'read' })) === 'granted';
+        } catch { granted = false; }
+      }
+      if (!granted) continue;
+      try {
+        const file = await handle.getFile();
+        panel.setFile(file, handle);
+        anyRestored = true;
+      } catch (e) {
+        console.warn('Could not restore file from handle:', e);
+      }
+    }
+    if (anyRestored) { refreshDropdowns(); scheduleEncode(0); }
+  }
+
+  if (!needsGesture) {
+    await applyHandles();  // already granted — restore silently
+  } else {
+    showRestoreNotice(applyHandles);
+  }
+}
+
+// ── Cache-source dropdown helpers ─────────────────────────────────────────────
+
+/** Inject a hidden "↳ cached" row directly after the file-button row in a panel. */
+function injectCacheDropdown(panel) {
+  const fileRow = panel.element.querySelector('.src-file-row');
+  const rowEl   = document.createElement('div');
+  rowEl.className = 'row src-cache-row';
+  rowEl.style.display = 'none';
+  rowEl.innerHTML = `
+    <span class="lbl" style="color:var(--muted);font-style:italic">cached</span>
+    <select><option value="">— versions —</option></select>
+  `.trim();
+  fileRow.insertAdjacentElement('afterend', rowEl);
+  return { rowEl, selEl: rowEl.querySelector('select') };
+}
+
+/** Repopulate the cache dropdown for one panel.
+ *  Visible whenever caching is enabled and there are ANY cached entries, even
+ *  before a file is selected — so users can discover what's in the cache and
+ *  trigger a file-picker for the right file in one step.
+ *
+ *  • No file loaded → show all entries; label includes filename.
+ *  • File loaded    → filter to that file; label is model/bw/dur only.
+ */
+async function updateCacheDropdown(panel, rowEl, selEl) {
+  if (!rowEl) return;
+  if (!cachingEnabled || !encCache || panel.getType() !== 'file' || !panel.getFile()) {
+    rowEl.style.display = 'none'; return;
+  }
+
+  const all = await cacheList(encCache);
+  if (all.length === 0) { rowEl.style.display = 'none'; return; }
+
+  const file = panel.getFile();
+  let matching;
+  if (file) {
+    const crc = await crc32FromFile(file);
+    matching = all.filter(e =>
+      e.filename === file.name &&
+      e.fileSize === file.size &&
+      e.crc32    === crc
+    );
+    // Fall back to full list when the loaded file has no entries yet.
+    if (matching.length === 0) matching = all;
+  } else {
+    matching = all;
+  }
+
+  // Preserve current selection across refreshes
+  const prevVal = selEl.value;
+  selEl.innerHTML = '<option value="">— cached —</option>';
+  for (const e of matching) {
+    const durS  = (e.segEnd / e.sampleRate).toFixed(2);
+    const srLbl = e.sampleRate === 24000 ? '24kHz' : '48kHz';
+    const opt   = document.createElement('option');
+    opt.value = JSON.stringify({
+      id: e.id, segEnd: e.segEnd, sampleRate: e.sampleRate,
+      modelHz: e.modelHz, bwKbps: e.bwKbps, filename: e.filename,
+    });
+    // When the loaded file already matches, omit filename to keep it compact.
+    const showName = !file || file.name !== e.filename;
+    opt.textContent = showName
+      ? `${e.filename} · ${srLbl} · ${e.bwKbps}kbps · ${durS}s`
+      : `${srLbl} · ${e.bwKbps}kbps · ${durS}s`;
+    selEl.appendChild(opt);
+  }
+  selEl.value = prevVal; // restore if still present
+  rowEl.style.display = '';
+}
+
+/** Refresh both dropdowns (no-op if not yet initialised). */
+function refreshDropdowns() {
+  updateCacheDropdown(panelA, cacheDropRowA, cacheDropSelA).catch(() => {});
+  updateCacheDropdown(panelB, cacheDropRowB, cacheDropSelB).catch(() => {});
+}
+
 
 function pinCoords() {
   if (!coordsA || !coordsB) return [];
@@ -1122,10 +1422,12 @@ function onUMAPWorkerMsg({ data: msg }) {
 
   // ── UMAP progress / result / error ─────────────────────────────────────────
   if (msg.type === 'umap_progress') {
-    const pct   = Math.round(msg.epoch / msg.nEpochs * 100);
-    const label = `Layout ${(msg.slotIdx ?? 0) + 1}/${UMAP_N_SLOTS}`;
-    progBar.style.width = pct + '%';
-    setStatus(`UMAP ${label} — epoch ${msg.epoch} / ${msg.nEpochs}`);
+    // Only update the progress bar for slot 0; background slots are silent.
+    if ((msg.slotIdx ?? 0) === 0) {
+      const pct = Math.round(msg.epoch / msg.nEpochs * 100);
+      progBar.style.width = pct + '%';
+      setStatus(`UMAP — epoch ${msg.epoch} / ${msg.nEpochs}`);
+    }
 
   } else if (msg.type === 'umap_result') {
     const { slotIdx, result, T_A, T_B } = msg;
@@ -1164,6 +1466,8 @@ function onUMAPWorkerMsg({ data: msg }) {
     const next = slotIdx + 1;
     if (next < UMAP_N_SLOTS && umapFeatureData && projectionMode === 'umap') {
       launchUMAPSlot(next);
+      // Slot 0 just finished and the remaining slots run silently — hide the bar now.
+      if (slotIdx === 0) progWrap.style.display = 'none';
     } else {
       progWrap.style.display = 'none';
       if (projectionMode === 'umap' && slotIdx === UMAP_N_SLOTS - 1)
@@ -1551,6 +1855,22 @@ function onWorkerMsg(e) {
     }
 
   } else if (msg.type === 'embeddings_exp6') {
+    if (preVQPending) {
+      // ── Pre-VQ re-encode complete — patch embEnc into existing currentEmbeds ──
+      // Codes, embQuant, scales stay as-is (from cache); only embEnc was missing.
+      preVQPending = false;
+      currentEmbeds.embEncA    = msg.embEncA;
+      currentEmbeds.embEncDimsA = msg.embEncDimsA;
+      currentEmbeds.embEncB    = msg.embEncB;
+      currentEmbeds.embEncDimsB = msg.embEncDimsB;
+      progWrap.style.display = 'none';
+      setStatus('Pre-VQ embeddings ready');
+      // Now complete the tab switch — embEncA is populated so setUmapSpace won't
+      // loop back into the confirmation dialog.
+      setUmapSpace('pre_vq');
+      return;
+    }
+
     currentEmbeds = msg;
     populateLevelSelect(msg.codesDimsA[1]);
     progWrap.style.display = 'none';
@@ -1563,18 +1883,14 @@ function onWorkerMsg(e) {
       // Fire-and-forget; errors are non-fatal
       Promise.all([
         cachePut(encCache, kA, {
-          embEnc: msg.embEncA, embEncDims: msg.embEncDimsA,
-          embQuant: msg.embQuantA, embQuantDims: msg.embQuantDimsA,
           codes: msg.codesA, codesDims: msg.codesDimsA,
           scales: msg.scalesA ?? null,
         }),
         cachePut(encCache, kB, {
-          embEnc: msg.embEncB, embEncDims: msg.embEncDimsB,
-          embQuant: msg.embQuantB, embQuantDims: msg.embQuantDimsB,
           codes: msg.codesB, codesDims: msg.codesDimsB,
           scales: msg.scalesB ?? null,
         }),
-      ]).then(() => setStatus('Analysis saved to cache ✓'))
+      ]).then(() => { setStatus('Analysis saved to cache ✓'); refreshCacheModal(); refreshDropdowns(); })
         .catch(e => console.warn('Cache save failed:', e));
     }
 
@@ -1665,17 +1981,31 @@ async function startEncode() {
     if (stale()) return;
 
     if (hitA && hitB) {
-      // ── Full cache hit — inject directly, skip worker ─────────────────────
+      // ── Full cache hit — reconstruct embQuant then inject, skip worker ────
+      setStatus('Loading codebooks…');
+      const cb = await ensureCodebooks();
+      if (stale()) return;
+
+      // embQuant = sum of codebook vectors across all quantiser levels.
+      // Layout: [dim × T], dims stored as [1, dim, T].
+      const T_A = hitA.codesDims[hitA.codesDims.length - 1];
+      const T_B = hitB.codesDims[hitB.codesDims.length - 1];
+      const embQuantA    = reconstructEmbQuant(cb, hitA.codes, hitA.codesDims);
+      const embQuantB    = reconstructEmbQuant(cb, hitB.codes, hitB.codesDims);
+      const embQuantDimsA = [1, cb.dim, T_A];
+      const embQuantDimsB = [1, cb.dim, T_B];
+
       currentEmbeds = {
-        type:        'embeddings_exp6',
-        embEncA:     hitA.embEnc,   embEncDimsA:  hitA.embEncDims,
-        embQuantA:   hitA.embQuant, embQuantDimsA: hitA.embQuantDims,
-        codesA:      hitA.codes,    codesDimsA:   hitA.codesDims,
-        scalesA:     hitA.scales,
-        embEncB:     hitB.embEnc,   embEncDimsB:  hitB.embEncDims,
-        embQuantB:   hitB.embQuant, embQuantDimsB: hitB.embQuantDims,
-        codesB:      hitB.codes,    codesDimsB:   hitB.codesDims,
-        scalesB:     hitB.scales,
+        type:         'embeddings_exp6',
+        // embEncA/B intentionally absent — re-computed on demand when Pre-VQ tab is used
+        embEncA:      null, embEncDimsA:   null,
+        embEncB:      null, embEncDimsB:   null,
+        embQuantA,          embQuantDimsA,
+        codesA:       hitA.codes,    codesDimsA:    hitA.codesDims,
+        scalesA:      hitA.scales,
+        embQuantB,          embQuantDimsB,
+        codesB:       hitB.codes,    codesDimsB:    hitB.codesDims,
+        scalesB:      hitB.scales,
       };
       populateLevelSelect(currentEmbeds.codesDimsA[1]);
       progWrap.style.display = 'none';
@@ -1720,6 +2050,36 @@ function startEncodeB() {
     frameSize: mp.getFrameSize(),
   });
   pendingAudioB = null;
+}
+
+/** Re-encode both sources to obtain embEnc for the Pre-VQ tab.
+ *  Uses rawAudioA/B already in memory — no file reload needed.
+ *  Sets preVQPending=true so the embeddings_exp6 handler only patches embEnc. */
+function startPreVQEncode() {
+  if (!rawAudioA || !rawAudioB) {
+    setStatus('Encode both sources first.', true);
+    return;
+  }
+  if (!worker) initWorker();
+  preVQPending  = true;
+  pendingAudioB = rawAudioB;
+  encodePhase   = 'A';
+  activeJobId   = ++jobSeq;
+
+  const modelHz = mp.getModelHz();
+  const bwKbps  = mp.getBwKbps();
+
+  progWrap.style.display = 'block';
+  progBar.style.width    = '0%';
+  setStatus('Encoding for pre-VQ…');
+
+  worker.postMessage({
+    type: 'encode', source: 'A', jobId: activeJobId,
+    audio:     rawAudioA.slice(),
+    modelHz, bwKbps,
+    streaming: mp.isStreaming(),
+    frameSize: mp.getFrameSize(),
+  });
 }
 
 // ── Level selector ────────────────────────────────────────────────────────────
@@ -1774,6 +2134,19 @@ document.addEventListener('click', e => {
 // ── UMAP space toggles (Pre-VQ | VQ | Post-VQ) ───────────────────────────────
 
 function setUmapSpace(space) {
+  // If pre-VQ is requested but embEnc was never computed (cache-loaded session),
+  // ask the user before kicking off a full re-encode.
+  if (space === 'pre_vq' && currentEmbeds && !currentEmbeds.embEncA) {
+    const totalS = ((durA ?? 0) + (durB ?? 0)).toFixed(1);
+    const msg = `The Pre-VQ view requires re-encoding both sources to extract `
+      + `pre-quantisation embeddings.\n\n`
+      + `Total audio: ${totalS} s — this may take a while for longer files.\n\n`
+      + `Continue?`;
+    if (!confirm(msg)) return;
+    startPreVQEncode();
+    return;   // tab switch completes inside the embeddings_exp6 handler
+  }
+
   // space: 'pre_vq' | 'vq' | 'post_vq'
   togPreVQMode .classList.toggle('active', space === 'pre_vq');
   togVQMode    .classList.toggle('active', space === 'vq');
@@ -2014,6 +2387,35 @@ async function ensureCodebooks() {
   return codebooks;
 }
 
+/**
+ * Reconstruct embQuant from VQ codes + loaded codebooks.
+ *
+ * The quantised embedding for frame t is the sum of the codebook vectors
+ * selected by each quantiser level: embQuant[d, t] = Σ_q cb[q, codes[q,t], d].
+ * This is the exact inverse of the quantisation step (same arithmetic the
+ * ONNX model uses), so the result is bit-for-bit identical to what the worker
+ * would produce.
+ *
+ * @param  {object}     cb        — codebooks object: { data, n_q, vocab_size, dim }
+ * @param  {Int32Array} codes     — flat layout [n_q × T]: codes[q * T + t]
+ * @param  {number[]}   codesDims — [1, n_q, T]
+ * @returns {Float32Array}         flat layout [dim × T]: result[d * T + t]
+ */
+function reconstructEmbQuant(cb, codes, codesDims) {
+  const T   = codesDims[codesDims.length - 1];
+  const n_q = codesDims[codesDims.length - 2];
+  const { data, vocab_size, dim } = cb;
+  const result = new Float32Array(dim * T);
+  for (let q = 0; q < n_q; q++) {
+    for (let t = 0; t < T; t++) {
+      const codeIdx = codes[q * T + t];
+      const cbOff   = q * vocab_size * dim + codeIdx * dim;
+      for (let d = 0; d < dim; d++) result[d * T + t] += data[cbOff + d];
+    }
+  }
+  return result;
+}
+
 // ── Frame extraction ──────────────────────────────────────────────────────────
 
 function applyWindowWithAnchor(rawFrames, featFrames, K) {
@@ -2210,9 +2612,12 @@ function launchUMAPSlot(slotIdx) {
   initUMAPWorker();
   activeUMAPJobId = ++jobSeq;
 
-  progWrap.style.display = 'block';
-  progBar.style.width = '0%';
-  if (slotIdx === 0) setStatus(`UMAP — starting… (${T_A + T_B} frames, ${UMAP_N_SLOTS} layouts)`);
+  // Only show the progress bar for slot 0; slots 1–N compute silently.
+  if (slotIdx === 0) {
+    progWrap.style.display = 'block';
+    progBar.style.width = '0%';
+    setStatus(`UMAP — starting… (${T_A + T_B} frames, ${UMAP_N_SLOTS} layouts)`);
+  }
 
   // No transferable — flat stays alive for subsequent slot sends.
   umapWorker.postMessage({

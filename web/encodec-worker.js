@@ -2039,7 +2039,7 @@ async function runDecodeTrajectoryExp6(msg) {
                     : caps.mode === 'ola24'  ? caps.chunks[0].cap
                     :                          caps.segments[0].cap;
       const fallbackScale     = refCap?.scale     ? refCap.scale.slice()            : new Float32Array([1.0]);
-      const fallbackScaleDims = refCap?.scaleDims ? [...refCap.scaleDims].map(Number) : [1, 1, 1];
+      const fallbackScaleDims = refCap?.scaleDims ? [...refCap.scaleDims].map(Number) : [1, 1];
 
       const CHUNK_F  = SEG_48 / HOP_48;    // 150 frames per chunk
       const STRIDE_F = STRIDE_48 / HOP_48; // 135 frames per stride (10% overlap)

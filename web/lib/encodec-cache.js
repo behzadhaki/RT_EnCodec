@@ -6,20 +6,43 @@
  * Model params  = modelHz + bwKbps + sampleRate.
  * Segment       = segStart (always 0) + segEnd (number of resampled samples loaded).
  *
- * Stored arrays per record:
- *   embEnc   (Float32Array) — pre-VQ encoder embeddings
- *   embQuant (Float32Array) — post-VQ quantised embeddings
- *   codes    (Int32Array)   — VQ codebook indices
- *   scales   (Float32Array | null) — per-frame scales (24 kHz model)
+ * Stored arrays per record (v2 format — all buffers gzip-compressed):
+ *   codes   (Int16Array,  gzip'd)         — VQ codebook indices (max 1023 → fits Int16)
+ *   scales  (Float32Array, gzip'd | null) — per-frame scales (24 kHz model)
  *
- * Storing embQuant + codes alongside embEnc means cache hits require zero
- * additional inference — the full `currentEmbeds` object can be assembled
- * directly from cached data for both sources.
+ * embEnc (pre-VQ) is NOT stored — it is only needed for the Pre-VQ UMAP tab and
+ * can be re-computed on demand from rawAudioA/B when the user requests that view.
+ *
+ * embQuant is NOT stored.  At cache-load time the caller reconstructs it by
+ * summing codebook vectors: embQuant[d,t] = Σ_q codebook[q, codes[q,t], d].
+ * This is exact (same arithmetic as the quantiser) and fast (~2 ms for 10 s).
+ *
+ * DB_VERSION 2 — v1 store is dropped on upgrade (clean-slate migration).
  */
 
 const DB_NAME    = 'encodec-cache';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 const STORE      = 'analyses';
+
+// ── Compression helpers ────────────────────────────────────────────────────────
+
+/** Gzip-compress an ArrayBuffer; returns a new ArrayBuffer. */
+async function compress(arrayBuffer) {
+  const cs     = new CompressionStream('gzip');
+  const writer = cs.writable.getWriter();
+  writer.write(new Uint8Array(arrayBuffer));
+  writer.close();
+  return new Response(cs.readable).arrayBuffer();
+}
+
+/** Gzip-decompress an ArrayBuffer; returns a new ArrayBuffer. */
+async function decompress(arrayBuffer) {
+  const ds     = new DecompressionStream('gzip');
+  const writer = ds.writable.getWriter();
+  writer.write(new Uint8Array(arrayBuffer));
+  writer.close();
+  return new Response(ds.readable).arrayBuffer();
+}
 
 // ── CRC-32 ────────────────────────────────────────────────────────────────────
 
@@ -58,7 +81,12 @@ export function openEncodecDB() {
     const req = indexedDB.open(DB_NAME, DB_VERSION);
 
     req.onupgradeneeded = e => {
-      const db    = e.target.result;
+      const db = e.target.result;
+      // v1 → v2: format changed (gzip + Int16 codes + embQuant dropped).
+      // Existing entries are incompatible — drop the old store for a clean slate.
+      if (e.oldVersion < 2 && db.objectStoreNames.contains(STORE)) {
+        db.deleteObjectStore(STORE);
+      }
       const store = db.createObjectStore(STORE, { autoIncrement: true });
       // Compound unique index — the natural lookup key.
       store.createIndex(
@@ -96,11 +124,13 @@ export function makeCacheKey(file, crc, { modelHz, bwKbps, sampleRate }, segEnd)
 /**
  * Look up a cached entry by key.
  * Returns the stored embeddings object or null if not found.
+ *
+ * NOTE: embEnc / embEncDims are intentionally absent — re-computed on demand.
+ * NOTE: embQuant / embQuantDims are intentionally absent — reconstruct from codes.
+ *
  * {
- *   embEnc   (Float32Array), embEncDims  (number[]),
- *   embQuant (Float32Array), embQuantDims (number[]),
- *   codes    (Int32Array),   codesDims   (number[]),
- *   scales   (Float32Array | null),
+ *   codes   (Int32Array),   codesDims  (number[]),
+ *   scales  (Float32Array | null),
  * }
  */
 export function cacheGet(db, key) {
@@ -112,18 +142,27 @@ export function cacheGet(db, key) {
       key.modelHz, key.bwKbps, key.sampleRate,
       key.segStart, key.segEnd,
     ]);
-    req.onsuccess = e => {
+    req.onsuccess = async e => {
       const rec = e.target.result;
       if (!rec) { resolve(null); return; }
-      resolve({
-        embEnc:    new Float32Array(rec.embEncData),
-        embEncDims: rec.embEncDims,
-        embQuant:  new Float32Array(rec.embQuantData),
-        embQuantDims: rec.embQuantDims,
-        codes:     new Int32Array(rec.codesData),
-        codesDims: rec.codesDims,
-        scales:    rec.scalesData ? new Float32Array(rec.scalesData) : null,
-      });
+      try {
+        // Decompress all stored buffers in parallel.
+        const [codesBuf, scalesBuf] = await Promise.all([
+          decompress(rec.codesData),
+          rec.scalesData ? decompress(rec.scalesData) : Promise.resolve(null),
+        ]);
+        // Codes were stored as Int16 (values 0–1023) — upcast to Int32 for use.
+        const codesI16 = new Int16Array(codesBuf);
+        const codes    = new Int32Array(codesI16.length);
+        for (let i = 0; i < codesI16.length; i++) codes[i] = codesI16[i];
+        resolve({
+          codes,
+          codesDims: rec.codesDims,
+          scales:    scalesBuf ? new Float32Array(scalesBuf) : null,
+        });
+      } catch (err) {
+        reject(err);
+      }
     };
     req.onerror = e => reject(e.target.error);
   });
@@ -144,20 +183,52 @@ export function cacheList(db) {
       const cursor = e.target.result;
       if (!cursor) { resolve(items); return; }
       const r = cursor.value;
+      // approxBytes = compressed storage footprint (codes + scales only in v2).
       const approxBytes =
-        (r.embEncData?.byteLength   ?? 0) +
-        (r.embQuantData?.byteLength ?? 0) +
-        (r.codesData?.byteLength    ?? 0) +
-        (r.scalesData?.byteLength   ?? 0);
+        (r.codesData?.byteLength  ?? 0) +
+        (r.scalesData?.byteLength ?? 0);
       items.push({
         id: cursor.primaryKey,
-        filename: r.filename, fileSize: r.fileSize,
+        filename: r.filename, fileSize: r.fileSize, crc32: r.crc32,
         modelHz: r.modelHz, bwKbps: r.bwKbps, sampleRate: r.sampleRate,
         segStart: r.segStart, segEnd: r.segEnd,
         timestamp: r.timestamp,
         approxBytes,
       });
       cursor.continue();
+    };
+    req.onerror = e => reject(e.target.error);
+  });
+}
+
+/**
+ * Retrieve a cache entry directly by its auto-increment primary key.
+ * Identical decompression / Int16→Int32 upcast as cacheGet.
+ * Returns { codes, codesDims, scales } or null if not found.
+ */
+export function cacheGetById(db, id) {
+  return new Promise((resolve, reject) => {
+    const tx  = db.transaction(STORE, 'readonly');
+    const req = tx.objectStore(STORE).get(id);
+    req.onsuccess = async e => {
+      const rec = e.target.result;
+      if (!rec) { resolve(null); return; }
+      try {
+        const [codesBuf, scalesBuf] = await Promise.all([
+          decompress(rec.codesData),
+          rec.scalesData ? decompress(rec.scalesData) : Promise.resolve(null),
+        ]);
+        const codesI16 = new Int16Array(codesBuf);
+        const codes    = new Int32Array(codesI16.length);
+        for (let i = 0; i < codesI16.length; i++) codes[i] = codesI16[i];
+        resolve({
+          codes,
+          codesDims: rec.codesDims,
+          scales:    scalesBuf ? new Float32Array(scalesBuf) : null,
+        });
+      } catch (err) {
+        reject(err);
+      }
     };
     req.onerror = e => reject(e.target.error);
   });
@@ -189,23 +260,39 @@ export function cacheClear(db) {
 
 /**
  * Save or overwrite a cache entry.
+ *
+ * Compression and Int16 downcast happen before opening the IDB transaction so
+ * no async work stalls mid-transaction (which would cause auto-commit before
+ * the write lands).
+ *
  * @param {IDBDatabase} db
  * @param {object}      key  — from makeCacheKey
  * @param {object}      emb  — {
- *   embEnc (Float32Array), embEncDims,
- *   embQuant (Float32Array), embQuantDims,
- *   codes (Int32Array), codesDims,
+ *   codes  (Int32Array), codesDims,
  *   scales (Float32Array | null),
  * }
+ * NOTE: embEnc  is not stored — re-computed on demand for the pre-VQ tab.
+ * NOTE: embQuant is not stored — reconstructed from codes + codebooks on load.
  */
-export function cachePut(db, key, emb) {
+export async function cachePut(db, key, emb) {
+  // ── Step 1: downcast codes Int32 → Int16 ──────────────────────────────────
+  // All codebook indices are 0–1023 (vocab_size 1024), safely fitting Int16.
+  const codesI16 = new Int16Array(emb.codes.length);
+  for (let i = 0; i < emb.codes.length; i++) codesI16[i] = emb.codes[i];
+
+  // ── Step 2: gzip-compress buffers in parallel ─────────────────────────────
+  const [codesComp, scalesComp] = await Promise.all([
+    compress(codesI16.buffer),
+    emb.scales ? compress(emb.scales.buffer) : Promise.resolve(null),
+  ]);
+
+  // ── Step 3: write to IDB — no async after transaction open ────────────────
   return new Promise((resolve, reject) => {
     const tx    = db.transaction(STORE, 'readwrite');
     const store = tx.objectStore(STORE);
 
-    // Delete any existing record with same compound key first (put via index
-    // isn't supported directly — use the index to find the auto-increment key
-    // then delete + add).
+    // Delete any existing record with the same compound key first (put via
+    // index isn't directly supported — find the auto-increment key then delete + add).
     const idx     = store.index('lookup');
     const findReq = idx.getKey([
       key.filename, key.fileSize, key.crc32,
@@ -218,14 +305,12 @@ export function cachePut(db, key, emb) {
 
       const record = {
         ...key,
-        embEncData:   emb.embEnc.buffer.slice(0),
-        embEncDims:   emb.embEncDims,
-        embQuantData: emb.embQuant.buffer.slice(0),
-        embQuantDims: emb.embQuantDims,
-        codesData:    emb.codes.buffer.slice(0),
-        codesDims:    emb.codesDims,
-        scalesData:   emb.scales ? emb.scales.buffer.slice(0) : null,
-        timestamp:    Date.now(),
+        // embEnc omitted — re-computed on demand for pre-VQ tab
+        // embQuant omitted — reconstructed from codes + codebooks on load
+        codesData:  codesComp,
+        codesDims:  emb.codesDims,
+        scalesData: scalesComp,
+        timestamp:  Date.now(),
       };
 
       const addReq = store.add(record);

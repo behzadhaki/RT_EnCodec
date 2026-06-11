@@ -115,8 +115,9 @@ export function createSourcePanel({
   const gateFreqEl  = section.querySelector('.src-gate-freq');
   const gateDecEl   = section.querySelector('.src-gate-decay');
 
-  let gateEnabled = false;
-  let currentFile = null;
+  let gateEnabled       = false;
+  let currentFile       = null;
+  let currentFileHandle = null;   // FileSystemFileHandle when available (null on Firefox)
 
   function updateVisibility() {
     const v        = typeEl.value;
@@ -133,9 +134,49 @@ export function createSourcePanel({
   loadFullEl.addEventListener('change', () => { updateVisibility(); onChange(0); });
   trimSEl.addEventListener('input',   () => onChange(500));
 
-  fileBtnEl.addEventListener('click', () => fileInputEl.click());
+  // File button — prefer showOpenFilePicker (gives a handle for cross-session
+  // persistence); fall back to the hidden <input type="file"> on Firefox.
+  fileBtnEl.addEventListener('click', async () => {
+    if ('showOpenFilePicker' in window) {
+      let handle;
+      try {
+        [handle] = await window.showOpenFilePicker({
+          types: [{
+            description: 'Audio files',
+            accept: {
+              'audio/mpeg': ['.mp3'],
+              'audio/wav':  ['.wav', '.wave'],
+              'audio/flac': ['.flac'],
+              'audio/ogg':  ['.ogg', '.oga', '.opus'],
+              'audio/mp4':  ['.m4a', '.m4b', '.mp4', '.aac'],
+              'audio/aiff': ['.aiff', '.aif'],
+              'audio/x-caf': ['.caf'],
+              'audio/webm': ['.webm'],
+            },
+          }],
+          excludeAcceptAllOption: false,
+          multiple: false,
+        });
+      } catch (err) {
+        if (err.name !== 'AbortError') throw err;
+        return; // user cancelled
+      }
+      currentFileHandle = handle;
+      currentFile = await handle.getFile();
+    } else {
+      // Firefox fallback — input change handler takes over
+      fileInputEl.click();
+      return;
+    }
+    fileBtnEl.textContent = currentFile.name;
+    if (onFilePicked) await onFilePicked(currentFile);
+    onChange(0);
+  });
+
+  // Firefox fallback: fired when user picks via the hidden input
   fileInputEl.addEventListener('change', async () => {
     if (!fileInputEl.files[0]) return;
+    currentFileHandle = null;
     currentFile = fileInputEl.files[0];
     fileBtnEl.textContent = currentFile.name;
     if (onFilePicked) await onFilePicked(currentFile);
@@ -160,10 +201,19 @@ export function createSourcePanel({
   updateVisibility();
 
   return {
-    element:       section,
-    getType:       () => typeEl.value,
-    getFreq:       () => parseFloat(freqEl.value) || 440,
-    getFile:       () => currentFile,
+    element:         section,
+    getType:         () => typeEl.value,
+    getFreq:         () => parseFloat(freqEl.value) || 440,
+    getFile:         () => currentFile,
+    getFileHandle:   () => currentFileHandle,
+    /** Silently restore a file (+ optional handle) without firing callbacks.
+     *  Call onFilePicked / onChange separately if needed. */
+    setFile(file, handle = null) {
+      currentFile       = file;
+      currentFileHandle = handle ?? null;
+      fileBtnEl.textContent = file.name;
+      updateVisibility();
+    },
     getLoadFull:   () => loadFullEl.checked,
     getTrimS:      () => parseFloat(trimSEl.value) || 10,
     getVolume:     () => volEl ? parseFloat(volEl.value) : 1,
@@ -175,6 +225,7 @@ export function createSourcePanel({
         type: typeEl.value,
         freq: parseFloat(freqEl.value) || 440,
         file: currentFile,
+        handle: currentFileHandle,
         fileName: currentFile ? fileBtnEl.textContent : null,
         loadFull: loadFullEl.checked,
         trimS:    parseFloat(trimSEl.value) || 10,
@@ -187,7 +238,8 @@ export function createSourcePanel({
     setState(s) {
       typeEl.value = s.type;
       freqEl.value = s.freq;
-      currentFile = s.file;
+      currentFile       = s.file   ?? null;
+      currentFileHandle = s.handle ?? null;   // null if not in saved state (e.g. localStorage restore)
       fileBtnEl.textContent = s.fileName || 'choose file…';
       if (s.loadFull !== undefined) loadFullEl.checked = s.loadFull;
       if (s.trimS   !== undefined) trimSEl.value = s.trimS;

@@ -118,5 +118,14 @@ export function createModelPanel({
     isStreaming:  () => streaming,
     getFrameSize: () => parseInt(frameEl.value),
     getSampleRate:() => modelEl.value === '24k' ? 24000 : 48000,
+    /** Programmatically switch model (rebuilds BW options). Does NOT fire onChange. */
+    setModelHz(hz) {
+      modelEl.value = hz;
+      populateBW();
+    },
+    /** Programmatically select a bandwidth. Call after setModelHz. Does NOT fire onChange. */
+    setBwKbps(kbps) {
+      bwEl.value = kbps;
+    },
   };
 }
