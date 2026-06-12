@@ -105,10 +105,14 @@ export function openEncodecDB() {
  * Build a cache key object.
  * @param {File}   file       — source File object
  * @param {number} crc        — CRC-32 of file bytes (from crc32FromFile)
- * @param {object} modelOpts  — { modelHz, bwKbps, sampleRate }
- * @param {number} segEnd     — number of samples actually loaded (at sampleRate)
+ * @param {object} modelOpts  — { modelHz, bwKbps, sampleRate, channels }
+ * @param {number} segEnd     — planar array length actually loaded (frames × channels)
+ *
+ * channels is NOT part of the compound lookup index, but segEnd is the planar
+ * length so a stereo load (2T) never collides with a mono load (T) of the same
+ * trim. channels is stored in the record for display purposes.
  */
-export function makeCacheKey(file, crc, { modelHz, bwKbps, sampleRate }, segEnd) {
+export function makeCacheKey(file, crc, { modelHz, bwKbps, sampleRate, channels = 1 }, segEnd) {
   return {
     filename:   file.name,
     fileSize:   file.size,
@@ -116,6 +120,7 @@ export function makeCacheKey(file, crc, { modelHz, bwKbps, sampleRate }, segEnd)
     modelHz,
     bwKbps,
     sampleRate,
+    channels,
     segStart:   0,
     segEnd,
   };
@@ -191,6 +196,7 @@ export function cacheList(db) {
         id: cursor.primaryKey,
         filename: r.filename, fileSize: r.fileSize, crc32: r.crc32,
         modelHz: r.modelHz, bwKbps: r.bwKbps, sampleRate: r.sampleRate,
+        channels: r.channels ?? 1,
         segStart: r.segStart, segEnd: r.segEnd,
         timestamp: r.timestamp,
         approxBytes,

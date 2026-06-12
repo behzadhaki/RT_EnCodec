@@ -468,14 +468,22 @@ function mixCodesIntLerpByLevel(codes_a, codes_b, dims, levelAlphas) {
 
 // Run stages 1–3 and return all intermediate tensors needed for any
 // interpolation point, plus the updated encoder LSTM state.
-async function encodeCapture(chunk, modelHz, hEnc, cEnc, leftGuardFrames = 0) {
-  const T = chunk.length;
+// channels = 2: chunk is already planar stereo [2*T] (L plane, R plane) and is
+// fed to the 48k encoder as real L/R. channels = 1 on 48k: dual-mono duplicate.
+async function encodeCapture(chunk, modelHz, hEnc, cEnc, leftGuardFrames = 0, channels = 1) {
   let audioTensor;
   if (modelHz === '48k') {
-    const stereo = new Float32Array(2 * T);
-    stereo.set(chunk, 0); stereo.set(chunk, T);
-    audioTensor = new ort.Tensor('float32', stereo, [1, 2, T]);
+    if (channels === 2) {
+      const T = chunk.length / 2;
+      audioTensor = new ort.Tensor('float32', chunk.slice(), [1, 2, T]);
+    } else {
+      const T = chunk.length;
+      const stereo = new Float32Array(2 * T);
+      stereo.set(chunk, 0); stereo.set(chunk, T);
+      audioTensor = new ort.Tensor('float32', stereo, [1, 2, T]);
+    }
   } else {
+    const T = chunk.length;
     audioTensor = new ort.Tensor('float32', chunk.slice(), [1, 1, T]);
   }
 
@@ -520,7 +528,9 @@ async function encodeCapture(chunk, modelHz, hEnc, cEnc, leftGuardFrames = 0) {
 }
 
 // Run stage 4 (decode_audio) from a continuous embedding tensor.
-async function decodeFromLatents(emb, embDims, scale, scaleDims, modelHz, hDec, cDec) {
+// stereoOut (48k only): return the decoder's planar stereo output [2*T]
+// (L plane, R plane) instead of averaging the channels to mono.
+async function decodeFromLatents(emb, embDims, scale, scaleDims, modelHz, hDec, cDec, stereoOut = false) {
   const inputs = {
     emb:  new ort.Tensor('float32', emb, embDims),
     h_in: stateTensor(hDec, 1),
@@ -533,10 +543,14 @@ async function decodeFromLatents(emb, embDims, scale, scaleDims, modelHz, hDec, 
 
   let outAudio;
   if (modelHz === '48k') {
-    const raw  = decOut.audio.data;
-    const tOut = raw.length >> 1;
-    outAudio   = new Float32Array(tOut);
-    for (let i = 0; i < tOut; i++) outAudio[i] = (raw[i] + raw[tOut + i]) * 0.5;
+    const raw = decOut.audio.data;
+    if (stereoOut) {
+      outAudio = new Float32Array(raw); // already planar [2*T]
+    } else {
+      const tOut = raw.length >> 1;
+      outAudio   = new Float32Array(tOut);
+      for (let i = 0; i < tOut; i++) outAudio[i] = (raw[i] + raw[tOut + i]) * 0.5;
+    }
   } else {
     outAudio = new Float32Array(decOut.audio.data);
   }
@@ -627,7 +641,7 @@ const captureCache = { A: null, B: null };
 
 // Encode one source, store captures, and return the decoded audio for display.
 async function runEncode(msg) {
-  const { jobId, source, audio, modelHz, bwKbps, streaming, frameSize } = msg;
+  const { jobId, source, audio, modelHz, bwKbps, streaming, frameSize, channels = 1 } = msg;
 
   try {
     self.postMessage({ type: 'progress', jobId, value: 0, status: 'Loading models…' });
@@ -636,7 +650,7 @@ async function runEncode(msg) {
 
     let decoded, captures;
     if (modelHz === '48k') {
-      [decoded, captures] = await encodeAndCapture48k(audio, jobId);
+      [decoded, captures] = await encodeAndCapture48k(audio, jobId, channels);
     } else {
       [decoded, captures] = await encodeAndCapture24k(audio, streaming, frameSize, jobId);
     }
@@ -730,8 +744,11 @@ async function encodeAndCapture24k(audio, streaming, frameSize, jobId) {
 
 // 48k uses stateful encoder and decoder so that LSTM context is continuous across
 // segment boundaries, eliminating embedding jumps at every STRIDE_48 boundary.
-async function encodeAndCapture48k(audio, jobId) {
-  const totalLen = audio.length;
+// channels = 2: audio is planar stereo [2*totalLen] (L plane, R plane) and each
+// segment chunk is sliced per plane so the encoder sees real L/R. The decoded
+// preview (outBuf) stays mono either way — it's display-only.
+async function encodeAndCapture48k(audio, jobId, channels = 1) {
+  const totalLen = audio.length / channels;
   const outBuf   = new Float32Array(totalLen);
   const wgtBuf   = new Float32Array(totalLen);
   const numSegs  = Math.ceil(totalLen / STRIDE_48);
@@ -748,10 +765,14 @@ async function encodeAndCapture48k(audio, jobId) {
     const leftGuardFrames = leftGuard / HOP_48;
 
     const extLen = leftGuard + SEG_48;
-    const chunk  = new Float32Array(extLen);
-    chunk.set(audio.subarray(offset - leftGuard, Math.min(offset - leftGuard + extLen, totalLen)));
+    const chunk  = new Float32Array(channels * extLen);
+    for (let ch = 0; ch < channels; ch++) {
+      const srcOff = ch * totalLen + offset - leftGuard;
+      const n      = Math.min(extLen, totalLen - (offset - leftGuard));
+      chunk.set(audio.subarray(srcOff, srcOff + n), ch * extLen);
+    }
 
-    const cap = await encodeCapture(chunk, '48k', hEnc, cEnc, leftGuardFrames);
+    const cap = await encodeCapture(chunk, '48k', hEnc, cEnc, leftGuardFrames, channels);
     hEnc = cap.hEncNew; cEnc = cap.cEncNew;
 
     const dec = await decodeFromLatents(
@@ -2008,9 +2029,10 @@ async function runPlayFrameExp6(msg) {
       scaleDims = segCap.scaleDims ? [...segCap.scaleDims].map(Number) : null;
     }
 
-    const result  = await decodeFromLatents(emb, dims, scale, scaleDims, modelHz, zeroState(1), zeroState(1));
+    const stereoOut = modelHz === '48k';
+    const result  = await decodeFromLatents(emb, dims, scale, scaleDims, modelHz, zeroState(1), zeroState(1), stereoOut);
     const decoded = result.outAudio;
-    self.postMessage({ type: 'frame_audio_exp6', jobId, decoded }, [decoded.buffer]);
+    self.postMessage({ type: 'frame_audio_exp6', jobId, decoded, channels: stereoOut ? 2 : 1 }, [decoded.buffer]);
   } catch (err) {
     self.postMessage({ type: 'error', jobId, message: 'Frame decode: ' + err.message });
   }
@@ -2047,8 +2069,10 @@ async function runDecodeTrajectoryExp6(msg) {
       const CHUNK_F  = SEG_48 / HOP_48;    // 150 frames per chunk
       const STRIDE_F = STRIDE_48 / HOP_48; // 135 frames per stride (10% overlap)
 
+      // Stereo OLA: planar [2*totalSamples] (L plane, R plane); the triangular
+      // weights are channel-independent so wgtBuf stays mono.
       const totalSamples = N * HOP_48;
-      const outBuf = new Float32Array(totalSamples);
+      const outBuf = new Float32Array(2 * totalSamples);
       const wgtBuf = new Float32Array(totalSamples);
       let hDec = zeroState(1), cDec = zeroState(1);
 
@@ -2070,29 +2094,38 @@ async function runDecodeTrajectoryExp6(msg) {
           ? new Float32Array(fallbackScale.length).fill(1.0)
           : fallbackScale;
 
-        const res = await decodeFromLatents(chunkEmb, [1, D, chunk_T], scale, fallbackScaleDims, modelHz, hDec, cDec);
+        const res = await decodeFromLatents(chunkEmb, [1, D, chunk_T], scale, fallbackScaleDims, modelHz, hDec, cDec, true);
         hDec = res.hDecNew; cDec = res.cDecNew;
 
         const sampleOffset = tStart * HOP_48;
         const numSamples   = chunk_T * HOP_48;
+        // res.outAudio is planar [2*numSamples]
         for (let i = 0; i < numSamples; i++) {
-          outBuf[sampleOffset + i] += TRI_WIN_48[i] * res.outAudio[i];
-          wgtBuf[sampleOffset + i] += TRI_WIN_48[i];
+          const w = TRI_WIN_48[i];
+          outBuf[sampleOffset + i]                += w * res.outAudio[i];
+          outBuf[totalSamples + sampleOffset + i] += w * res.outAudio[numSamples + i];
+          wgtBuf[sampleOffset + i]                += w;
         }
       }
 
       for (let i = 0; i < totalSamples; i++) {
-        if (wgtBuf[i] > 0) outBuf[i] /= wgtBuf[i];
+        if (wgtBuf[i] > 0) {
+          outBuf[i]                /= wgtBuf[i];
+          outBuf[totalSamples + i] /= wgtBuf[i];
+        }
       }
 
-      // Per-sample gain envelope from the per-frame scales (linear interp).
+      // Per-sample gain envelope from the per-frame scales (linear interp),
+      // applied identically to both planes.
       if (frameScales) {
         for (let s = 0; s < totalSamples; s++) {
           const t  = s / HOP_48;
           const t0 = Math.min(N - 1, Math.floor(t));
           const t1 = Math.min(N - 1, t0 + 1);
           const fr = t - t0;
-          outBuf[s] *= frameScales[t0] * (1 - fr) + frameScales[t1] * fr;
+          const g  = frameScales[t0] * (1 - fr) + frameScales[t1] * fr;
+          outBuf[s]                *= g;
+          outBuf[totalSamples + s] *= g;
         }
       }
       decoded = outBuf;
@@ -2101,7 +2134,8 @@ async function runDecodeTrajectoryExp6(msg) {
       decoded = new Float32Array(res.outAudio);
     }
 
-    self.postMessage({ type: 'trajectory_audio_exp6', jobId, decoded }, [decoded.buffer]);
+    const outChannels = modelHz === '48k' ? 2 : 1;
+    self.postMessage({ type: 'trajectory_audio_exp6', jobId, decoded, channels: outChannels }, [decoded.buffer]);
   } catch (err) {
     self.postMessage({ type: 'error', jobId, message: 'Trajectory decode: ' + err.message });
   }

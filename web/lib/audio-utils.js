@@ -34,29 +34,38 @@ export function generateSource(type, freq, dur, sr) {
 }
 
 // Applies a repeating exponential-decay amplitude gate.
-export function applyPulseGate(audio, sr, freq, decayMs) {
+// Planar multi-channel aware: the gate phase restarts per channel plane so
+// L and R stay sample-aligned.
+export function applyPulseGate(audio, sr, freq, decayMs, channels = 1) {
+  const T      = audio.length / channels;
   const period = Math.max(1, Math.round(sr / Math.max(0.01, freq)));
   const out    = new Float32Array(audio.length);
-  if (decayMs <= 0) {
-    for (let i = 0; i < audio.length; i++)
-      out[i] = (i % period === 0) ? audio[i] : 0;
-  } else {
-    const tau = (decayMs / 1000) * sr / 5;
-    for (let i = 0; i < audio.length; i++)
-      out[i] = audio[i] * Math.exp(-(i % period) / tau);
+  for (let ch = 0; ch < channels; ch++) {
+    const off = ch * T;
+    if (decayMs <= 0) {
+      for (let i = 0; i < T; i++)
+        out[off + i] = (i % period === 0) ? audio[off + i] : 0;
+    } else {
+      const tau = (decayMs / 1000) * sr / 5;
+      for (let i = 0; i < T; i++)
+        out[off + i] = audio[off + i] * Math.exp(-(i % period) / tau);
+    }
   }
   return out;
 }
 
-// Decodes and resamples an audio File to mono Float32Array at the given sr.
+// Decodes and resamples an audio File at the given sr.
 // Trims to maxS seconds at the source sample rate before resampling.
-export async function loadFile(file, sr, maxS = MAX_S) {
+// channels = 1 → mono Float32Array (all source channels averaged).
+// channels = 2 → planar stereo Float32Array(2*T), L plane then R plane
+//                (mono sources are upmixed to both planes by Web Audio).
+export async function loadFile(file, sr, maxS = MAX_S, channels = 1) {
   const arrBuf  = await file.arrayBuffer();
   const tmpCtx  = new OfflineAudioContext(1, 1, sr);
   const decoded = await tmpCtx.decodeAudioData(arrBuf);
   const trimLen = Math.min(decoded.length, Math.round(maxS * decoded.sampleRate));
   const outLen  = Math.round(trimLen / decoded.sampleRate * sr);
-  const offCtx  = new OfflineAudioContext(1, outLen, sr);
+  const offCtx  = new OfflineAudioContext(channels, outLen, sr);
   const trimBuf = new AudioBuffer({
     numberOfChannels: decoded.numberOfChannels,
     length: trimLen, sampleRate: decoded.sampleRate,
@@ -68,6 +77,15 @@ export async function loadFile(file, sr, maxS = MAX_S) {
   src.connect(offCtx.destination);
   src.start(0);
   const rendered = await offCtx.startRendering();
+
+  if (channels === 2) {
+    const T   = rendered.length;
+    const out = new Float32Array(2 * T);
+    out.set(rendered.getChannelData(0), 0);
+    out.set(rendered.getChannelData(Math.min(1, rendered.numberOfChannels - 1)), T);
+    return out;
+  }
+
   const mono = new Float32Array(rendered.length);
   for (let ch = 0; ch < rendered.numberOfChannels; ch++) {
     const d = rendered.getChannelData(ch);

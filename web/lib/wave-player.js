@@ -8,7 +8,8 @@ export function makeWavePlayer(canvasId, waveColor, { getAudioCtx, getMasterDest
   const pdpr = devicePixelRatio || 1;
   const XFADE_S = 0.04;
 
-  let audio   = null;   // Float32Array
+  let audio   = null;   // Float32Array — mono, or planar stereo (L plane, R plane)
+  let ch      = 1;      // channel count; planar layout when 2
   let sr      = 44100;
   let peaks   = null;   // [min,max] per pixel col
   let looping = false;
@@ -27,20 +28,23 @@ export function makeWavePlayer(canvasId, waveColor, { getAudioCtx, getMasterDest
   let colorFn     = null;
   let pixelColors = null;
 
-  const dur      = () => audio ? audio.length / sr : 0;
+  const dur      = () => audio ? audio.length / ch / sr : 0;
   const elapsed  = () => playing ? playOffset + (getAudioCtx().currentTime - playStart) : playOffset;
   const position = () => dur() > 0 ? Math.min(1, elapsed() / dur()) : 0;
 
   function buildPeaks() {
     if (!audio || !cvs.width) { peaks = null; pixelColors = null; return; }
     const W = cvs.width;
+    const T = audio.length / ch;
     peaks = new Float32Array(W * 2);
     for (let px = 0; px < W; px++) {
-      const s0 = Math.floor(px / W * audio.length);
-      const s1 = Math.max(s0 + 1, Math.floor((px + 1) / W * audio.length));
+      const s0 = Math.floor(px / W * T);
+      const s1 = Math.max(s0 + 1, Math.floor((px + 1) / W * T));
       let mn = 0, mx = 0;
-      for (let s = s0; s < s1 && s < audio.length; s++) {
-        const v = audio[s]; if (v < mn) mn = v; if (v > mx) mx = v;
+      for (let s = s0; s < s1 && s < T; s++) {
+        for (let c = 0; c < ch; c++) {
+          const v = audio[c * T + s]; if (v < mn) mn = v; if (v > mx) mx = v;
+        }
       }
       peaks[px * 2] = mn; peaks[px * 2 + 1] = mx;
     }
@@ -136,8 +140,9 @@ export function makeWavePlayer(canvasId, waveColor, { getAudioCtx, getMasterDest
     const newGain = ctx.createGain();
     newGain.connect(getMasterDest());
 
-    const buf = ctx.createBuffer(1, audio.length, sr);
-    buf.copyToChannel(audio, 0);
+    const T   = audio.length / ch;
+    const buf = ctx.createBuffer(ch, T, sr);
+    for (let c = 0; c < ch; c++) buf.copyToChannel(audio.subarray(c * T, (c + 1) * T), c);
     const newSrc = ctx.createBufferSource();
     newSrc.buffer = buf;
     newSrc.connect(newGain);
@@ -194,11 +199,12 @@ export function makeWavePlayer(canvasId, waveColor, { getAudioCtx, getMasterDest
   return {
     // colorFn: optional (pos: 0..1) => CSS color string.
     // Pass null to revert to the player's default waveColor.
-    setAudio(f32, sampleRate, newColorFn = null) {
+    // channels = 2: f32 is planar stereo (L plane, R plane).
+    setAudio(f32, sampleRate, newColorFn = null, channels = 1) {
       colorFn = newColorFn;
       const wasPlaying = playing;
       const wasOffset  = playing ? elapsed() : 0;
-      audio = f32; sr = sampleRate;
+      audio = f32; sr = sampleRate; ch = channels;
       buildPeaks();
       if (wasPlaying) {
         doPlay(wasOffset, true);

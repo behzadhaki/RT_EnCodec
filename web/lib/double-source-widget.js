@@ -120,7 +120,9 @@ export function createDoubleSourceWidget({
   // Loads each file at its natural length, capped at MAX_S (10 s).
   // A and B are independent — they need not be the same length.
   // Synth sources use getDuration() (or defaultDur when the panel is hidden).
-  async function buildAudioAuto(panel, sr) {
+  // channels = 2 → planar stereo Float32Array(2*T), L plane then R plane.
+  // Files keep their real channels; synth sources are duplicated to both planes.
+  async function buildAudioAuto(panel, sr, channels = 1) {
     const type = panel.getType();
     let audio;
     if (type === 'file') {
@@ -129,14 +131,20 @@ export function createDoubleSourceWidget({
       // When "load full file" is checked, pass Infinity so loadFile uses the
       // complete file duration.  Otherwise clamp to the panel's trim value.
       const maxS = panel.getLoadFull() ? Infinity : panel.getTrimS();
-      audio = await loadFile(f, sr, maxS);
+      audio = await loadFile(f, sr, maxS, channels);
     } else {
       const len = Math.round(getDuration() * sr);
       audio = generateSource(type, panel.getFreq(), len / sr, sr);
+      if (channels === 2) {
+        const st = new Float32Array(2 * audio.length);
+        st.set(audio, 0);
+        st.set(audio, audio.length);
+        audio = st;
+      }
     }
     const vol = panel.getVolume();
     if (vol !== 1) audio = audio.map(x => x * vol);
-    if (panel.isGateEnabled()) audio = applyPulseGate(audio, sr, panel.getGateFreq(), panel.getGateDecay());
+    if (panel.isGateEnabled()) audio = applyPulseGate(audio, sr, panel.getGateFreq(), panel.getGateDecay(), channels);
     return audio;
   }
 

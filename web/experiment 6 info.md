@@ -462,6 +462,19 @@ The code/snap branches read `genPlaySeq` (already set by `computeWaypoints()`), 
 
 **48k loudness (worker, `runDecodeTrajectoryExp6`)**: when `frameScales` are supplied, every chunk decodes at scale = 1 and a per-SAMPLE gain envelope (linear interp between per-frame scales) is applied after OLA. Scale is a linear post-multiply in the decoder graph, so this is exact — and it removes the loudness steps the old per-chunk mean scale produced when loud and quiet grains mixed within one 150-frame chunk. Without `frameScales` the old per-segment fallback scale applies.
 
+## Channels — 48k stereo, 24k mono
+
+The 48k model is natively stereo (C=2, joint embedding for the pair); the 24k model is mono. `startEncode` sets `srcCh = modelHz === '48k' ? 2 : 1` and the whole audio path is channel-aware with **planar layout** (`Float32Array(ch*T)`, L plane then R plane):
+
+- **Load** (`loadFile` / `buildAudioAuto` with `channels`): files keep real L/R (mono files upmix to both planes); synth sources duplicate to both planes. Per-channel volume/gate (`applyPulseGate` restarts its phase per plane).
+- **Encode** (`encodeAndCapture48k` / `encodeCapture` with `channels`): segment chunks are sliced per plane and fed as real `[1, 2, T]` — no more dual-mono duplication. One embedding per frame still describes both channels (incl. the stereo image), so the map / grains / UMAP pipeline are untouched.
+- **Decode** (`decodeFromLatents(..., stereoOut)` / `runDecodeTrajectoryExp6`): stereo OLA with planar accumulators (mono weight buffer — the triangular window is channel-independent); the loudness envelope applies to both planes. `trajectory_audio_exp6` / `frame_audio_exp6` messages carry `channels`.
+- **Playback & post**: `wave-player.setAudio(..., channels)` (peaks span both planes, real stereo `AudioBuffer`), `applyFade` / `applyNotchOffline` / `encodeWav` are planar-aware; bookmarks store `ch` and download as stereo WAVs.
+- **Cache**: `segEnd` is the planar length, so stereo entries (2T) never collide with legacy dual-mono entries (T); `channels` is stored per record and duration displays divide by it.
+- **Consequence**: grain concatenation splices stereo images too — two timbrally similar grains with opposite panning are *different* latents and may sit apart on the map. Panning is part of the granular texture now.
+
+`durA`/`durB` and all FPS math use frames (`audio.length / srcCh / sr`). The 24k path is byte-identical to before (channels = 1 defaults everywhere).
+
 ---
 
 ## autoRegenerate()

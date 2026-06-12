@@ -631,7 +631,7 @@ async function refreshCacheModal() {
   for (const e of entries) (byFile[e.filename] ??= []).push(e);
   for (const [fname, group] of Object.entries(byFile)) {
     for (const e of group) {
-      const durS = ((e.segEnd - e.segStart) / e.sampleRate).toFixed(1);
+      const durS = ((e.segEnd - e.segStart) / (e.channels ?? 1) / e.sampleRate).toFixed(1);
       const row  = document.createElement('div');
       row.className = 'cache-entry';
       row.innerHTML = `
@@ -804,6 +804,7 @@ let snapPlayFrames  = null;
 let genPlaySeq      = null;
 let lastRawPcm      = null;   // unfaded decoded PCM, kept so fade edits apply instantly
 let lastRawPcmSr    = 44100;
+let lastRawPcmCh    = 1;      // 2 = planar stereo (L plane, R plane) — 48k output
 let codeDurMode     = 'frames';    // 'frames' | 'seconds'
 let codeKVal        = 100;
 let codeSecVal      = 4;
@@ -839,6 +840,7 @@ let notchFilters     = [];
 // Waveform display
 let rawAudioA    = null;
 let rawAudioB    = null;
+let rawAudioCh   = 1;     // 2 when sources were loaded as planar stereo (48k model)
 let durA         = null;   // actual loaded duration (s) for source A
 let durB         = null;   // actual loaded duration (s) for source B
 
@@ -1075,7 +1077,7 @@ async function updateCacheDropdown(panel, rowEl, selEl) {
   const prevVal = selEl.value;
   selEl.innerHTML = '<option value="">— cached —</option>';
   for (const e of matching) {
-    const durS  = (e.segEnd / e.sampleRate).toFixed(2);
+    const durS  = (e.segEnd / (e.channels ?? 1) / e.sampleRate).toFixed(2);
     const srLbl = e.sampleRate === 24000 ? '24kHz' : '48kHz';
     const opt   = document.createElement('option');
     opt.value = JSON.stringify({
@@ -1646,19 +1648,24 @@ function setProjectionMode(mode) {
   }
 }
 
-function applyFade(pcm, sr, fadeInMs, fadeOutMs) {
+// channels = 2: pcm is planar stereo — fades apply per plane.
+function applyFade(pcm, sr, fadeInMs, fadeOutMs, channels = 1) {
   const out     = pcm.slice();
+  const T       = out.length / channels;
   const fadeIn  = Math.round(fadeInMs  / 1000 * sr);
   const fadeOut = Math.round(fadeOutMs / 1000 * sr);
-  for (let i = 0; i < Math.min(fadeIn,  out.length); i++) out[i]                  *= i / fadeIn;
-  for (let i = 0; i < Math.min(fadeOut, out.length); i++) out[out.length - 1 - i] *= i / fadeOut;
+  for (let c = 0; c < channels; c++) {
+    const off = c * T;
+    for (let i = 0; i < Math.min(fadeIn,  T); i++) out[off + i]         *= i / fadeIn;
+    for (let i = 0; i < Math.min(fadeOut, T); i++) out[off + T - 1 - i] *= i / fadeOut;
+  }
   return out;
 }
 
-function applyGenFade(pcm, sr) {
+function applyGenFade(pcm, sr, channels = lastRawPcmCh) {
   const fadeIn  = parseFloat(document.getElementById('fadeInMs').value)  || 0;
   const fadeOut = parseFloat(document.getElementById('fadeOutMs').value) || 0;
-  return (fadeIn > 0 || fadeOut > 0) ? applyFade(pcm, sr, fadeIn, fadeOut) : pcm;
+  return (fadeIn > 0 || fadeOut > 0) ? applyFade(pcm, sr, fadeIn, fadeOut, channels) : pcm;
 }
 
 // ── Bookmark utilities ────────────────────────────────────────────────────────
@@ -1754,27 +1761,32 @@ function buildZip(files) {
   return out;
 }
 
-// Encode Float32Array mono PCM → 16-bit WAV ArrayBuffer.
-function encodeWav(f32, sr) {
-  const N   = f32.length;
-  const buf = new ArrayBuffer(44 + N * 2);
+// Encode Float32Array PCM → 16-bit WAV ArrayBuffer.
+// channels = 2: f32 is planar stereo (L plane, R plane) — interleaved on write.
+function encodeWav(f32, sr, channels = 1) {
+  const T       = f32.length / channels;
+  const dataLen = T * channels * 2;
+  const buf = new ArrayBuffer(44 + dataLen);
   const v   = new DataView(buf);
   const u32 = (o, n) => v.setUint32(o, n, true);
   const u16 = (o, n) => v.setUint16(o, n, true);
   const str = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
-  str(0, 'RIFF'); u32(4, 36 + N * 2); str(8, 'WAVE');
-  str(12, 'fmt '); u32(16, 16); u16(20, 1); u16(22, 1);
-  u32(24, sr); u32(28, sr * 2); u16(32, 2); u16(34, 16);
-  str(36, 'data'); u32(40, N * 2);
-  for (let i = 0; i < N; i++) {
-    const s = Math.max(-1, Math.min(1, f32[i]));
-    v.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
-  }
+  str(0, 'RIFF'); u32(4, 36 + dataLen); str(8, 'WAVE');
+  str(12, 'fmt '); u32(16, 16); u16(20, 1); u16(22, channels);
+  u32(24, sr); u32(28, sr * channels * 2); u16(32, channels * 2); u16(34, 16);
+  str(36, 'data'); u32(40, dataLen);
+  let o = 44;
+  for (let i = 0; i < T; i++)
+    for (let c = 0; c < channels; c++) {
+      const s = Math.max(-1, Math.min(1, f32[c * T + i]));
+      v.setInt16(o, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+      o += 2;
+    }
   return buf;
 }
 
-function downloadWav(pcm, sr, filename) {
-  const blob = new Blob([encodeWav(pcm, sr)], { type: 'audio/wav' });
+function downloadWav(pcm, sr, filename, channels = 1) {
+  const blob = new Blob([encodeWav(pcm, sr, channels)], { type: 'audio/wav' });
   const url  = URL.createObjectURL(blob);
   const a    = document.createElement('a');
   a.href = url; a.download = filename + '.wav'; a.click();
@@ -1834,7 +1846,7 @@ function renderBookmarkList() {
     dlBtn.className = 'lib-btn';
     dlBtn.title = 'Download';
     dlBtn.textContent = '↓';
-    dlBtn.addEventListener('click', () => downloadWav(bm.pcm, bm.sr, bm.name));
+    dlBtn.addEventListener('click', () => downloadWav(bm.pcm, bm.sr, bm.name, bm.ch ?? 1));
 
     const delBtn = document.createElement('button');
     delBtn.className = 'lib-btn lib-del';
@@ -1854,16 +1866,18 @@ function renderBookmarkList() {
 
 // Render PCM through the notch filter chain offline (mirrors the live audio graph).
 // Returns a new Float32Array with the filter applied, or the original if disabled.
-async function applyNotchOffline(pcm, sr) {
+// channels = 2: pcm is planar stereo — filtered as a real stereo buffer.
+async function applyNotchOffline(pcm, sr, channels = 1) {
   if (!postProcEnabled) return pcm;
   const maxFreq = sr / 2 - 1;
   const freqs = [];
   for (let h = 1; h * notchFundamental <= maxFreq; h++) freqs.push(h * notchFundamental);
   if (freqs.length === 0) return pcm;
 
-  const offCtx = new OfflineAudioContext(1, pcm.length, sr);
-  const buf    = offCtx.createBuffer(1, pcm.length, sr);
-  buf.copyToChannel(pcm, 0);
+  const T      = pcm.length / channels;
+  const offCtx = new OfflineAudioContext(channels, T, sr);
+  const buf    = offCtx.createBuffer(channels, T, sr);
+  for (let c = 0; c < channels; c++) buf.copyToChannel(pcm.subarray(c * T, (c + 1) * T), c);
   const src = offCtx.createBufferSource();
   src.buffer = buf;
 
@@ -1880,7 +1894,10 @@ async function applyNotchOffline(pcm, sr) {
   src.start(0);
 
   const rendered = await offCtx.startRendering();
-  return rendered.getChannelData(0);
+  if (channels === 1) return rendered.getChannelData(0);
+  const out = new Float32Array(channels * T);
+  for (let c = 0; c < channels; c++) out.set(rendered.getChannelData(c), c * T);
+  return out;
 }
 
 async function addBookmark() {
@@ -1890,11 +1907,11 @@ async function addBookmark() {
   btn.style.opacity = '0.5';
   btn.style.cursor  = 'default';
 
-  let pcm = applyGenFade(lastRawPcm, lastRawPcmSr);
-  pcm = await applyNotchOffline(pcm, lastRawPcmSr);
+  let pcm = applyGenFade(lastRawPcm, lastRawPcmSr, lastRawPcmCh);
+  pcm = await applyNotchOffline(pcm, lastRawPcmSr, lastRawPcmCh);
 
   const name = makeBookmarkName();
-  bookmarks.push({ id: bookmarkSeq, name, pcm, sr: lastRawPcmSr });
+  bookmarks.push({ id: bookmarkSeq, name, pcm, sr: lastRawPcmSr, ch: lastRawPcmCh });
   renderBookmarkList();
   // Brief visual flash on the button to confirm
   btn.style.color = 'var(--accent)';
@@ -1914,8 +1931,10 @@ function onWorkerMsg(e) {
 
   if (msg.type === 'frame_audio_exp6') {
     if (msg.jobId === playJobId && audioCtx) {
-      const buf = audioCtx.createBuffer(1, msg.decoded.length, mp.getSampleRate());
-      buf.copyToChannel(msg.decoded, 0);
+      const ch  = msg.channels ?? 1;
+      const T   = msg.decoded.length / ch;
+      const buf = audioCtx.createBuffer(ch, T, mp.getSampleRate());
+      for (let c = 0; c < ch; c++) buf.copyToChannel(msg.decoded.subarray(c * T, (c + 1) * T), c);
       const src = audioCtx.createBufferSource();
       src.buffer = buf;
       src.connect(getMasterDest());
@@ -1930,8 +1949,9 @@ function onWorkerMsg(e) {
       const sr = mp.getSampleRate();
       lastRawPcm   = msg.decoded;
       lastRawPcmSr = sr;
+      lastRawPcmCh = msg.channels ?? 1;
       stopTrajPlayback();
-      playerG.setAudio(applyGenFade(msg.decoded, sr), sr, makeGenColorFn());
+      playerG.setAudio(applyGenFade(msg.decoded, sr, lastRawPcmCh), sr, makeGenColorFn(), lastRawPcmCh);
       updateBookmarkBtn();
       setStatus('');
     }
@@ -2046,26 +2066,31 @@ async function startEncode() {
   if (stale()) return;
 
   // ── Load audio ────────────────────────────────────────────────────────────────
+  // 48k model is natively stereo — load files as planar stereo (L plane, R plane)
+  // so the encoder sees real L/R. 24k stays mono.
+  const srcCh = modelHz === '48k' ? 2 : 1;
   let audioA, audioB;
   try {
     setStatus('Loading A…');
-    audioA = await srcWidget.buildAudioAuto(panelA, sr);
+    audioA = await srcWidget.buildAudioAuto(panelA, sr, srcCh);
     if (stale()) return;
     setStatus('Loading B…');
-    audioB = await srcWidget.buildAudioAuto(panelB, sr);
+    audioB = await srcWidget.buildAudioAuto(panelB, sr, srcCh);
     if (stale()) return;
   } catch (err) { setStatus(err.message, true); return; }
 
   // Waveform display — always set regardless of cache path
   coordsA = coordsB = null;
   scheduleRender();
-  rawAudioA = audioA; rawAudioB = audioB;
-  durA = audioA.length / sr; durB = audioB.length / sr;
-  playerA.setAudio(rawAudioA, sr);
-  playerB.setAudio(rawAudioB, sr);
+  rawAudioA = audioA; rawAudioB = audioB; rawAudioCh = srcCh;
+  durA = audioA.length / srcCh / sr; durB = audioB.length / srcCh / sr;
+  playerA.setAudio(rawAudioA, sr, null, srcCh);
+  playerB.setAudio(rawAudioB, sr, null, srcCh);
 
   // ── Cache lookup (only when both sources are files with valid CRCs) ───────────
-  const modelOpts = { modelHz, bwKbps, sampleRate: sr };
+  // segEnd is the planar array length, so stereo entries never collide with
+  // legacy dual-mono ones (2T vs T); channels is stored for display.
+  const modelOpts = { modelHz, bwKbps, sampleRate: sr, channels: srcCh };
   pendingCacheKeyA = null;
   pendingCacheKeyB = null;
 
@@ -2131,6 +2156,7 @@ async function startEncode() {
   worker.postMessage({
     type: 'encode', source: 'A', jobId: activeJobId,
     audio:     audioA.slice(),
+    channels:  srcCh,
     modelHz,
     bwKbps,
     streaming: mp.isStreaming(),
@@ -2144,6 +2170,7 @@ function startEncodeB() {
   worker.postMessage({
     type: 'encode', source: 'B', jobId: activeJobId,
     audio:     pendingAudioB.slice(),
+    channels:  rawAudioCh,
     modelHz:   mp.getModelHz(),
     bwKbps:    mp.getBwKbps(),
     streaming: mp.isStreaming(),
@@ -2176,6 +2203,7 @@ function startPreVQEncode() {
   worker.postMessage({
     type: 'encode', source: 'A', jobId: activeJobId,
     audio:     rawAudioA.slice(),
+    channels:  rawAudioCh,
     modelHz, bwKbps,
     streaming: mp.isStreaming(),
     frameSize: mp.getFrameSize(),
@@ -2448,7 +2476,7 @@ trajDurationEl.addEventListener('change', () => autoRegenerate());
 ['fadeInMs', 'fadeOutMs'].forEach(id => {
   document.getElementById(id).addEventListener('input', () => {
     if (!lastRawPcm) return;
-    playerG.setAudio(applyGenFade(lastRawPcm, lastRawPcmSr), lastRawPcmSr, makeGenColorFn());
+    playerG.setAudio(applyGenFade(lastRawPcm, lastRawPcmSr, lastRawPcmCh), lastRawPcmSr, makeGenColorFn(), lastRawPcmCh);
   });
 });
 
@@ -2462,7 +2490,7 @@ document.getElementById('libDownloadAll').addEventListener('click', () => {
   if (!bookmarks.length) return;
   const files = bookmarks.map(bm => ({
     name: bm.name + '.wav',
-    data: new Uint8Array(encodeWav(bm.pcm, bm.sr)),
+    data: new Uint8Array(encodeWav(bm.pcm, bm.sr, bm.ch ?? 1)),
   }));
   const zip  = buildZip(files);
   const blob = new Blob([zip], { type: 'application/zip' });
