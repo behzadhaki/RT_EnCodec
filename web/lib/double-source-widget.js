@@ -73,7 +73,7 @@ export function createDoubleSourceWidget({
 
   const swapSection = document.createElement('div');
   swapSection.className = 'section';
-  swapSection.innerHTML = `<button class="tog" style="width:100%">⇅ Swap A / B</button>`;
+  swapSection.innerHTML = `<button class="tog dsw-swap" style="width:100%">⇅ Swap A / B</button>`;
   swapSection.querySelector('button').addEventListener('click', () => {
     const stateA = panelA.getState();
     panelA.setState(panelB.getState());

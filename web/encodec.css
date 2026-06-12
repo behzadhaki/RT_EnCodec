@@ -313,3 +313,23 @@ input[type=range] { min-width: 0; }
 .waveBtn:hover { color: var(--text); border-color: var(--accent); }
 .waveBtn.active { background: var(--accent-lo); border-color: var(--accent); color: var(--text); }
 .waveCanvas { flex: 1; width: 100%; display: block; cursor: crosshair; min-height: 0; }
+
+/* ── Hover help tooltip (lib/help-tip.js) ─────────────────────────────────── */
+#helpTip {
+  position: fixed;
+  z-index: 10000;
+  max-width: 280px;
+  background: #242424;
+  color: var(--text);
+  border: 1px solid var(--border2);
+  border-left: 2px solid var(--accent-lo);
+  border-radius: 3px;
+  padding: 6px 9px;
+  font-size: 11px;
+  line-height: 1.5;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.45);
+}
+#helpTip.visible { opacity: 1; }
