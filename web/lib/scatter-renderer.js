@@ -1,4 +1,4 @@
-import { getContextKs, walkBackward } from './trajectory-utils.js';
+import { getContextKs, walkBackward, walkForward } from './trajectory-utils.js';
 
 // Render the UMAP scatter plot onto `canvas`.
 // Returns the lastTransform object (needed by coordinate helpers in the main file),
@@ -19,7 +19,8 @@ import { getContextKs, walkBackward } from './trajectory-utils.js';
 //   trajDir                 — 'forward'|'backward'|'pingpong'
 //   showTrail               — bool
 //   canvasMode              — 'explore'|'draw'|'pins'
-//   ctxSwap                 — { prob, range } for context swap (walkBackward)
+//   ctxSwap                 — { prob, range } for context swap (walkBackward/walkForward)
+//   ctxMode                 — 'pre' | 'sym' — grain context shape (matches sequence builders)
 //   snapMode, snapKVal, snapDurVal, framesPerSec   — for snap trail getContextKs
 export function renderScatter(canvas, dpr, state) {
   const ctx = canvas.getContext('2d');
@@ -50,7 +51,7 @@ export function renderScatter(canvas, dpr, state) {
     pinPoints, highlightedPinIdx = -1, selectedPoint, waveHighlight, userTrajectory,
     drawSegments,
     pathMode, snapFrames, snapSegBoundaries, codePathFrames, trajAnchorPos,
-    snapPlayFrames, trajDir, showTrail, ctxSwap = { prob: 0, range: 0 },
+    snapPlayFrames, trajDir, showTrail, ctxSwap = { prob: 0, range: 0 }, ctxMode = 'pre',
     snapMode, snapKVal, snapDurVal, framesPerSec, canvasMode,
     srcAEnabled = true, srcBEnabled = true,
   } = state;
@@ -216,11 +217,16 @@ export function renderScatter(canvas, dpr, state) {
         const wp = snapFrames[activeWi];
 
         if (showTrail) {
-          const ctxKs     = getContextKs(snapFrames, { snapMode, snapKVal, snapDurVal, framesPerSec, coordsA, coordsB });
-          const ctxFrames = walkBackward(wp.src, wp.idx, ctxKs[activeWi], ctxSwap, coordsA, coordsB);
+          const ctxKs = getContextKs(snapFrames, { snapMode, snapKVal, snapDurVal, framesPerSec, coordsA, coordsB });
+          const K     = ctxKs[activeWi];
+          // Mirror the sequence builders: sym splits K into pre + post around the waypoint.
+          const kP = ctxMode === 'sym' ? Math.ceil(K / 2)  : K;
+          const kF = ctxMode === 'sym' ? Math.floor(K / 2) : 0;
+          const preFrames  = walkBackward(wp.src, wp.idx, kP, ctxSwap, coordsA, coordsB);
+          const postFrames = kF > 0 ? walkForward(wp.src, wp.idx, kF, ctxSwap, coordsA, coordsB) : [];
 
-          if (ctxFrames.length > 0) {
-            const allCtx = [...ctxFrames, wp];
+          if (preFrames.length + postFrames.length > 0) {
+            const allCtx = [...preFrames, wp, ...postFrames];
             let contextStart = fi;
             while (contextStart > 0 && snapPlayFrames[contextStart - 1]?._wp === activeWi) contextStart--;
             const elapsed_  = fi - contextStart;

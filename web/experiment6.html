@@ -368,9 +368,48 @@ umapSection.innerHTML = `
     </div>
   </div>
   <div class="row">
-    <span class="lbl">History</span>
+    <span class="lbl">Context</span>
     <input type="number" id="umapWindow" value="1" min="1" max="16" step="1">
     <span style="font-size:11px;color:var(--muted);margin-left:2px">frames</span>
+  </div>
+  <div class="row">
+    <span class="lbl">Direction</span>
+    <div style="display:flex;gap:3px">
+      <button class="tog"        id="togCtxPast">Past</button>
+      <button class="tog active" id="togCtxCentered">Centered</button>
+      <button class="tog"        id="togCtxFuture">Future</button>
+    </div>
+  </div>
+  <div class="row">
+    <span class="lbl">Weighting</span>
+    <div style="display:flex;gap:3px">
+      <button class="tog"        id="togWinFlat">Flat</button>
+      <button class="tog"        id="togWinTri">Tri</button>
+      <button class="tog active" id="togWinGauss">Gauss</button>
+    </div>
+  </div>
+  <div class="row" id="preReduceRow">
+    <span class="lbl">Pre-PCA</span>
+    <button class="tog active" id="togPreReduce">On</button>
+    <span id="preReduceInfo" style="font-size:11px;color:var(--muted);margin-left:4px"></span>
+  </div>
+  <div class="row" id="metricRow">
+    <span class="lbl">Metric</span>
+    <div style="display:flex;gap:3px">
+      <button class="tog active" id="togMetricEuc">Euclid</button>
+      <button class="tog"        id="togMetricCos">Cosine</button>
+    </div>
+  </div>
+  <div class="row" id="scaleFeatRow">
+    <span class="lbl">Loudness</span>
+    <button class="tog" id="togScaleFeat">Off</button>
+    <span style="font-size:11px;color:var(--muted);margin-left:4px">log(scale) · 48k</span>
+  </div>
+  <div class="row" id="dedupRow">
+    <span class="lbl">Dedup</span>
+    <button class="tog" id="togDedup">Off</button>
+    <input type="number" id="dedupThresh" value="0.05" min="0" max="1" step="0.01" style="width:48px">
+    <span id="dedupInfo" style="font-size:11px;color:var(--muted);margin-left:4px"></span>
   </div>
   <div class="row" id="neighborRow">
     <span class="lbl">Neighbors</span>
@@ -696,6 +735,14 @@ let umapMode        = 'per_level'; // matches default embSpace='vq' (set by togV
 let umapLevels      = [];   // selected codebook levels (all by default)
 let embSpace        = 'vq';     // 'pre_vq' | 'vq' | 'post_vq'
 let embMode         = 'emb';    // 'emb' | 'emb+delta' | 'delta'
+let ctxDirection    = 'centered';  // 'past' | 'centered' | 'future' — window placement + delta type
+let ctxShape        = 'gaussian';  // 'flat' | 'triangular' | 'gaussian' — context slot weighting
+let preReduceEnabled = true;        // PCA pre-reduction of UMAP features (worker-side)
+let umapMetric       = 'euclidean'; // 'euclidean' | 'cosine' — UMAP distance
+let scaleFeatEnabled = false;       // append log(scale) feature dim (48k only — no-op without scales)
+let dedupEnabled     = false;       // collapse consecutive near-duplicate frames before the UMAP fit
+const PRE_REDUCE_KMAX = 32;    // max kept components
+const PRE_REDUCE_VAR  = 0.95;  // target cumulative explained variance
 let coordsA         = null;
 let coordsB         = null;
 
@@ -1146,8 +1193,8 @@ function setSnapSeqInfo(snapFrames, snapPlayFrames) {
   for (let i = 1; i <= snapPlayFrames.length; i++) {
     if (i === snapPlayFrames.length || snapPlayFrames[i]._wp !== snapPlayFrames[i - 1]._wp) {
       // Use the actual snap waypoint (from snapFrames) as the segment endpoint,
-      // not the last frame in the group — which may be a K_post frame (idx > waypoint idx)
-      // for the last segment on 48k models.
+      // not the last frame in the group — which may be a post-roll frame
+      // (idx > waypoint idx): every segment on 48k (symmetric context).
       const end    = snapFrames[segs.length] ?? snapPlayFrames[i - 1];
       let   minIdx = end.idx;
       for (let j = s; j < i; j++) {
@@ -1250,6 +1297,7 @@ function renderScatter() {
     pathMode, snapFrames, snapSegBoundaries, codePathFrames, trajAnchorPos,
     snapPlayFrames, trajDir, showTrail: chkTrail.checked, canvasMode,
     ctxSwap: { prob: ctxSwapProb, range: ctxSwapDist },
+    ctxMode: mp.getModelHz() === '48k' ? 'sym' : 'pre',
     snapMode, snapKVal, snapDurVal, framesPerSec: fps,
     srcAEnabled, srcBEnabled,
   });
@@ -1341,7 +1389,7 @@ function initWorker() {
 
 function initUMAPWorker() {
   if (umapWorker) umapWorker.terminate();
-  umapWorker = new Worker(new URL('./umap-worker.js?v=4', import.meta.url), { type: 'module' });
+  umapWorker = new Worker(new URL('./umap-worker.js?v=5', import.meta.url), { type: 'module' });
   umapWorker.onmessage = onUMAPWorkerMsg;
 }
 
@@ -1391,6 +1439,37 @@ function setUMAPSlotIdx(idx) {
 function onUMAPWorkerMsg({ data: msg }) {
   if (msg.jobId !== activeUMAPJobId) return;
 
+  // ── Pre-PCA reduction result ───────────────────────────────────────────────
+  if (msg.type === 'reduce_result') {
+    const info = document.getElementById('preReduceInfo');
+    const fd = umapFeatureData;
+    fd.reduced = true;
+    if (msg.reduced) {
+      fd.umapFlat = msg.reduced;
+      fd.umapD    = msg.m;
+      // Columns are PCA scores ordered by variance — the first two double as
+      // a 2-D PCA layout used to seed every slot's UMAP init.
+      const N  = fd.umapTA + fd.umapTB;
+      const ic = new Float32Array(N * 2);
+      for (let i = 0; i < N; i++) {
+        ic[i * 2]     = fd.umapFlat[i * fd.umapD];
+        ic[i * 2 + 1] = fd.umapFlat[i * fd.umapD + 1];
+      }
+      fd.initCoords = ic;
+      info.textContent = `${fd.D}→${fd.umapD} dims · ${(msg.explained * 100).toFixed(0)}% var`;
+    } else {
+      info.textContent = ''; // worker skipped (D already small / degenerate)
+    }
+    launchUMAPSlot(0);
+    return;
+
+  } else if (msg.type === 'reduce_error') {
+    document.getElementById('preReduceInfo').textContent = '';
+    setStatus(msg.message + ' — using full features', true);
+    launchUMAPSlot(0);
+    return;
+  }
+
   // ── PCA result ─────────────────────────────────────────────────────────────
   if (msg.type === 'pca_result') {
     const { result, T_A, T_B } = msg;
@@ -1432,10 +1511,24 @@ function onUMAPWorkerMsg({ data: msg }) {
   } else if (msg.type === 'umap_result') {
     const { slotIdx, result, T_A, T_B } = msg;
 
-    // Decode and store this slot.
+    // Decode and store this slot. With dedup, the worker fitted only the
+    // representative frames — expand back to full length via repMapA/B so
+    // every frame gets its representative's coords (skipped frames overlap).
     const slot = { coordsA: [], coordsB: [] };
-    for (let i = 0; i < T_A; i++) slot.coordsA.push([result[i * 2], result[i * 2 + 1]]);
-    for (let i = 0; i < T_B; i++) slot.coordsB.push([result[(T_A + i) * 2], result[(T_A + i) * 2 + 1]]);
+    const { repMapA, repMapB } = umapFeatureData ?? {};
+    if (repMapA && repMapB) {
+      for (let i = 0; i < repMapA.length; i++) {
+        const r = repMapA[i];
+        slot.coordsA.push([result[r * 2], result[r * 2 + 1]]);
+      }
+      for (let i = 0; i < repMapB.length; i++) {
+        const r = repMapB[i];
+        slot.coordsB.push([result[r * 2], result[r * 2 + 1]]);
+      }
+    } else {
+      for (let i = 0; i < T_A; i++) slot.coordsA.push([result[i * 2], result[i * 2 + 1]]);
+      for (let i = 0; i < T_B; i++) slot.coordsB.push([result[(T_A + i) * 2], result[(T_A + i) * 2 + 1]]);
+    }
     umapSlots[slotIdx] = slot;
     updateSlotDots();
 
@@ -1450,7 +1543,9 @@ function onUMAPWorkerMsg({ data: msg }) {
       if (hadDrawTraj && pinPoints.length < 2) {
         setStatus('UMAP updated — draw trajectory cleared. Redraw to regenerate.');
       } else {
-        setStatus(`Done — ${T_A} frames (A) · ${T_B} frames (B). Computing more layouts…`);
+        // slot.coords lengths are the full frame counts (T_A/T_B from the
+        // worker are rep counts when dedup is on).
+        setStatus(`Done — ${slot.coordsA.length} frames (A) · ${slot.coordsB.length} frames (B). Computing more layouts…`);
       }
     }
 
@@ -1502,8 +1597,11 @@ function setProjectionMode(mode) {
   projectionMode = mode;
   document.getElementById('togUMAPMode').classList.toggle('active', mode === 'umap');
   document.getElementById('togPCAMode') .classList.toggle('active', mode === 'pca');
-  document.getElementById('neighborRow').style.display = mode === 'umap' ? '' : 'none';
-  document.getElementById('minDistRow') .style.display = mode === 'umap' ? '' : 'none';
+  document.getElementById('neighborRow') .style.display = mode === 'umap' ? '' : 'none';
+  document.getElementById('minDistRow')  .style.display = mode === 'umap' ? '' : 'none';
+  document.getElementById('preReduceRow').style.display = mode === 'umap' ? '' : 'none';
+  document.getElementById('metricRow')   .style.display = mode === 'umap' ? '' : 'none';
+  document.getElementById('dedupRow')    .style.display = mode === 'umap' ? '' : 'none';
   slotWrap.classList.toggle('visible', mode === 'umap' && umapSlots.some(s => s));
 
   if (!umapFeatureData) return; // nothing computed yet — triggerProjection() will dispatch when ready
@@ -1540,9 +1638,11 @@ function setProjectionMode(mode) {
         updateSlotDots();
       }
     }
-    // Resume slot computation from the first uncomputed slot.
+    // Resume slot computation from the first uncomputed slot. A fresh session
+    // (no slots yet) goes through pre-PCA reduction first if enabled.
     const nextMissing = umapSlots.findIndex(s => !s);
-    if (nextMissing >= 0) launchUMAPSlot(nextMissing);
+    if (nextMissing === 0)     startUMAPReduction();
+    else if (nextMissing > 0)  launchUMAPSlot(nextMissing);
   }
 }
 
@@ -2171,6 +2271,53 @@ createToggleGroup([
   { el: document.getElementById('togDeltaOnly'), value: 'delta' },
 ], v => { embMode = v; markDirty('COORDS', 'WAYPOINTS', 'AUDIO', 'RENDER'); });
 
+createToggleGroup([
+  { el: document.getElementById('togCtxPast'),     value: 'past' },
+  { el: document.getElementById('togCtxCentered'), value: 'centered' },
+  { el: document.getElementById('togCtxFuture'),   value: 'future' },
+], v => { ctxDirection = v; markDirty('COORDS', 'WAYPOINTS', 'AUDIO', 'RENDER'); });
+
+createToggleGroup([
+  { el: document.getElementById('togWinFlat'),  value: 'flat' },
+  { el: document.getElementById('togWinTri'),   value: 'triangular' },
+  { el: document.getElementById('togWinGauss'), value: 'gaussian' },
+], v => { ctxShape = v; markDirty('COORDS', 'WAYPOINTS', 'AUDIO', 'RENDER'); });
+
+// Pre-PCA reduction and metric only affect UMAP — skip recompute in PCA mode.
+const togPreReduce = document.getElementById('togPreReduce');
+togPreReduce.addEventListener('click', () => {
+  preReduceEnabled = !preReduceEnabled;
+  togPreReduce.classList.toggle('active', preReduceEnabled);
+  togPreReduce.textContent = preReduceEnabled ? 'On' : 'Off';
+  if (projectionMode === 'umap') markDirty('COORDS', 'WAYPOINTS', 'AUDIO', 'RENDER');
+});
+
+createToggleGroup([
+  { el: document.getElementById('togMetricEuc'), value: 'euclidean' },
+  { el: document.getElementById('togMetricCos'), value: 'cosine' },
+], v => { umapMetric = v; if (projectionMode === 'umap') markDirty('COORDS', 'WAYPOINTS', 'AUDIO', 'RENDER'); });
+
+// Dedup only affects the UMAP fit (PCA always uses the full matrix).
+const togDedup = document.getElementById('togDedup');
+togDedup.addEventListener('click', () => {
+  dedupEnabled = !dedupEnabled;
+  togDedup.classList.toggle('active', dedupEnabled);
+  togDedup.textContent = dedupEnabled ? 'On' : 'Off';
+  if (projectionMode === 'umap') markDirty('COORDS', 'WAYPOINTS', 'AUDIO', 'RENDER');
+});
+document.getElementById('dedupThresh').addEventListener('change', () => {
+  if (dedupEnabled && projectionMode === 'umap') markDirty('COORDS', 'WAYPOINTS', 'AUDIO', 'RENDER');
+});
+
+// Loudness feature changes the feature matrix → affects both UMAP and PCA.
+const togScaleFeat = document.getElementById('togScaleFeat');
+togScaleFeat.addEventListener('click', () => {
+  scaleFeatEnabled = !scaleFeatEnabled;
+  togScaleFeat.classList.toggle('active', scaleFeatEnabled);
+  togScaleFeat.textContent = scaleFeatEnabled ? 'On' : 'Off';
+  markDirty('COORDS', 'WAYPOINTS', 'AUDIO', 'RENDER');
+});
+
 document.getElementById('togUMAPMode').addEventListener('click', () => setProjectionMode('umap'));
 document.getElementById('togPCAMode') .addEventListener('click', () => setProjectionMode('pca'));
 
@@ -2418,52 +2565,89 @@ function reconstructEmbQuant(cb, codes, codesDims) {
 
 // ── Frame extraction ──────────────────────────────────────────────────────────
 
-function applyWindowWithAnchor(rawFrames, featFrames, K) {
-  if (K <= 1) return featFrames;
-  const D_raw  = rawFrames[0].length;
-  const D_feat = featFrames[0].length;
-  return rawFrames.map((raw, t) => {
-    const vec = new Float32Array(D_raw + K * D_feat);
-    vec.set(raw, 0);
+// Per-slot weights for a K-frame context window with the anchor at anchorPos.
+// 'flat' weights every slot equally; 'triangular' and 'gaussian' decay with
+// distance from the anchor so context disambiguates without swamping the
+// anchor frame's own content in pairwise distances.
+function windowWeights(K, anchorPos, shape) {
+  const w = new Float32Array(K).fill(1);
+  if (shape === 'flat') return w;
+  const span  = Math.max(1, Math.max(anchorPos, K - 1 - anchorPos));
+  const sigma = K / 3;
+  for (let k = 0; k < K; k++) {
+    const d = Math.abs(k - anchorPos);
+    w[k] = shape === 'triangular'
+      ? 1 - d / (span + 1)
+      : Math.exp(-(d * d) / (2 * sigma * sigma));
+  }
+  return w;
+}
+
+// Build K-slot windowed feature vectors around each frame's anchor.
+//   direction 'past'     → slots [t-K+1 … t]          (anchor last)
+//   direction 'centered' → slots [t-⌊K/2⌋ … t+⌈K/2⌉-1] (anchor middle)
+//   direction 'future'   → slots [t … t+K-1]          (anchor first)
+// The anchor frame appears exactly once. Edges clamp (repeat first/last frame).
+// IMPORTANT: frames must already be normalised — weights are baked in here
+// because z-scoring after windowing would cancel any constant per-slot weight.
+function applyContextWindow(frames, K, direction, shape) {
+  if (K <= 1) return frames;
+  const D = frames[0].length;
+  const T = frames.length;
+  const anchorPos = direction === 'past'   ? K - 1
+                  : direction === 'future' ? 0
+                  : Math.floor(K / 2);
+  const w = windowWeights(K, anchorPos, shape);
+  return frames.map((_, t) => {
+    const vec = new Float32Array(K * D);
     for (let k = 0; k < K; k++) {
-      const srcT = Math.max(0, t - (K - 1 - k));
-      vec.set(featFrames[srcT], D_raw + k * D_feat);
+      const srcT = Math.min(T - 1, Math.max(0, t + k - anchorPos));
+      const f = frames[srcT], wk = w[k], off = k * D;
+      for (let d = 0; d < D; d++) vec[off + d] = wk * f[d];
     }
     return vec;
   });
 }
 
-function computeDeltas(frames) {
+// direction 'past' → backward difference, 'centered' → centered difference
+// (less noisy, matches non-causal embeddings), 'future' → forward difference.
+function computeDeltas(frames, direction) {
   const D = frames[0].length;
+  const T = frames.length;
   return frames.map((f, t) => {
-    if (t === 0) return new Float32Array(D);
     const delta = new Float32Array(D);
-    const prev  = frames[t - 1];
-    for (let d = 0; d < D; d++) delta[d] = f[d] - prev[d];
+    if (direction === 'centered') {
+      const prev = frames[Math.max(0, t - 1)];
+      const next = frames[Math.min(T - 1, t + 1)];
+      for (let d = 0; d < D; d++) delta[d] = (next[d] - prev[d]) / 2;
+    } else if (direction === 'future') {
+      if (t < T - 1) { const next = frames[t + 1]; for (let d = 0; d < D; d++) delta[d] = next[d] - f[d]; }
+    } else {
+      if (t > 0)     { const prev = frames[t - 1]; for (let d = 0; d < D; d++) delta[d] = f[d] - prev[d]; }
+    }
     return delta;
   });
 }
 
-function appendDeltas(frames) {
-  const D   = frames[0].length;
-  const out = [];
-  for (let t = 0; t < frames.length; t++) {
-    const f   = frames[t];
+function appendDeltas(frames, direction) {
+  const D      = frames[0].length;
+  const deltas = computeDeltas(frames, direction);
+  return frames.map((f, t) => {
     const vec = new Float32Array(2 * D);
     vec.set(f, 0);
-    if (t > 0) { const p = frames[t - 1]; for (let d = 0; d < D; d++) vec[D + d] = f[d] - p[d]; }
-    out.push(vec);
-  }
-  return out;
+    vec.set(deltas[t], D);
+    return vec;
+  });
 }
 
 // Per-dimension z-score normalisation across all frames from both sources.
 // Computed jointly so A and B frames are in the same coordinate space.
 // Why: in Emb+Δ mode the embedding dims (e.g. ±2–5) dwarf the delta dims
 // (e.g. ±0.02–0.1) so UMAP distances are dominated by the emb half.
-// Same issue with multi-level VQ concatenation or history window mixing.
+// Same issue with multi-level VQ concatenation.
 // Normalising each dimension to zero mean / unit variance gives every
 // feature equal influence on pairwise distances.
+// Runs BEFORE applyContextWindow so the per-slot window weights survive.
 // Dimensions with zero variance (constant across all frames, e.g. a dead
 // codebook entry) get std=1 so they contribute nothing — correct behaviour.
 function zscoreFrames(framesA, framesB) {
@@ -2488,6 +2672,17 @@ function zscoreFrames(framesA, framesB) {
     return out;
   });
   return [apply(framesA), apply(framesB)];
+}
+
+// Append one log(scale) dim per frame (48k per-frame loudness scalars).
+function appendScaleDim(frames, scales) {
+  const D = frames[0].length;
+  return frames.map((f, t) => {
+    const vec = new Float32Array(D + 1);
+    vec.set(f, 0);
+    vec[D] = Math.log(Math.max(scales[t] || 0, 1e-6));
+    return vec;
+  });
 }
 
 function embQuantToFrames(embQuant, dims) {
@@ -2534,6 +2729,8 @@ function triggerProjection() {
   updateSlotDots();
   slotWrap.classList.toggle('visible', projectionMode === 'umap');
 
+  document.getElementById('preReduceInfo').textContent = '';
+  document.getElementById('dedupInfo').textContent = '';
   buildUMAPFeatureData()
     .then(fd => {
       if (umapSessionId !== sid) return; // superseded by a newer call
@@ -2542,47 +2739,147 @@ function triggerProjection() {
         launchPCA();
       } else {
         slotWrap.classList.add('visible');
-        launchUMAPSlot(0);
+        startUMAPReduction();
       }
     })
     .catch(err => setStatus(err.message, true));
+}
+
+// Collapse runs of consecutive near-duplicate frames (cosine distance to the
+// previous KEPT frame below thresh), per source — a B frame never collapses
+// into an A run. Returns the representative matrix plus full→rep index maps
+// (global rep row indices, A reps first). Why: adjacent frames of one source
+// are nearly identical, so UMAP's KNN graph fills up with trivial temporal
+// neighbours and clusters form by source-and-time rather than by content.
+function dedupFeatures(fd, thresh) {
+  const { flat, T_A, T_B, D } = fd;
+  const cosDist = (a, b) => {
+    let dot = 0, na = 0, nb = 0;
+    for (let d = 0; d < D; d++) {
+      const x = flat[a * D + d], y = flat[b * D + d];
+      dot += x * y; na += x * x; nb += y * y;
+    }
+    const denom = Math.sqrt(na * nb);
+    return denom > 1e-12 ? 1 - dot / denom : 0;
+  };
+
+  const repRows = [];
+  const runSource = (start, T, map) => {
+    let last = -1;
+    for (let t = 0; t < T; t++) {
+      const row = start + t;
+      if (last < 0 || cosDist(row, last) >= thresh) { last = row; repRows.push(row); }
+      map[t] = repRows.length - 1;
+    }
+  };
+  const repMapA = new Int32Array(T_A);
+  const repMapB = new Int32Array(T_B);
+  runSource(0,   T_A, repMapA);
+  runSource(T_A, T_B, repMapB);
+
+  const M = repRows.length;
+  const repFlat = new Float32Array(M * D);
+  repRows.forEach((row, m) => repFlat.set(flat.subarray(row * D, (row + 1) * D), m * D));
+  const repTA = repMapA[T_A - 1] + 1;
+  return { repFlat, repTA, repTB: M - repTA, repMapA, repMapB };
+}
+
+// Prepare the UMAP-side matrix (optional dedup, then optional PCA reduction)
+// and launch slot 0. fd.flat stays untouched — PCA mode always projects the
+// full matrix, so dedup/reduction never leak into it.
+function startUMAPReduction() {
+  const fd = umapFeatureData;
+  const dedupInfo = document.getElementById('dedupInfo');
+
+  if (!fd.umapFlat) {
+    if (dedupEnabled) {
+      const thresh = Math.max(0, parseFloat(document.getElementById('dedupThresh').value) || 0.05);
+      const { repFlat, repTA, repTB, repMapA, repMapB } = dedupFeatures(fd, thresh);
+      fd.umapFlat = repFlat; fd.umapTA = repTA; fd.umapTB = repTB;
+      fd.repMapA  = repMapA; fd.repMapB = repMapB;
+      dedupInfo.textContent = `${fd.T_A + fd.T_B}→${repTA + repTB} pts`;
+    } else {
+      fd.umapFlat = fd.flat; fd.umapTA = fd.T_A; fd.umapTB = fd.T_B;
+      fd.repMapA  = null;    fd.repMapB = null;
+      dedupInfo.textContent = '';
+    }
+    fd.umapD = fd.D;
+  }
+
+  if (!(preReduceEnabled && !fd.reduced && fd.umapD > PRE_REDUCE_KMAX)) {
+    launchUMAPSlot(0);
+    return;
+  }
+
+  initUMAPWorker();
+  activeUMAPJobId = ++jobSeq;
+
+  progWrap.style.display = 'block';
+  progBar.style.width = '10%';
+  setStatus(`Pre-PCA — reducing ${fd.umapD} dims… (${fd.umapTA + fd.umapTB} frames)`);
+
+  // Sent as a copy (no transfer) — still needed if reduction fails/skips.
+  umapWorker.postMessage({
+    type: 'reduce_features', jobId: activeUMAPJobId,
+    flat: fd.umapFlat, N: fd.umapTA + fd.umapTB, D: fd.umapD,
+    kMax: PRE_REDUCE_KMAX, varTarget: PRE_REDUCE_VAR,
+  });
 }
 
 // Build the shared feature matrix (expensive; run once per session).
 // Returns {flat, T_A, T_B, D, nNeighbors, minDist} — flat is NOT transferred
 // so it can be reused across all slot sends.
 async function buildUMAPFeatureData() {
-  let framesA, framesB, rawA, rawB;
+  let framesA, framesB;
 
   if (umapMode === 'combined') {
     if (embSpace === 'pre_vq') {
-      rawA = embQuantToFrames(currentEmbeds.embEncA,   currentEmbeds.embEncDimsA);
-      rawB = embQuantToFrames(currentEmbeds.embEncB,   currentEmbeds.embEncDimsB);
+      framesA = embQuantToFrames(currentEmbeds.embEncA,   currentEmbeds.embEncDimsA);
+      framesB = embQuantToFrames(currentEmbeds.embEncB,   currentEmbeds.embEncDimsB);
     } else {
-      rawA = embQuantToFrames(currentEmbeds.embQuantA, currentEmbeds.embQuantDimsA);
-      rawB = embQuantToFrames(currentEmbeds.embQuantB, currentEmbeds.embQuantDimsB);
+      framesA = embQuantToFrames(currentEmbeds.embQuantA, currentEmbeds.embQuantDimsA);
+      framesB = embQuantToFrames(currentEmbeds.embQuantB, currentEmbeds.embQuantDimsB);
     }
-    framesA = rawA; framesB = rawB;
-    if      (embMode === 'emb+delta') { framesA = appendDeltas(framesA);  framesB = appendDeltas(framesB); }
-    else if (embMode === 'delta')     { framesA = computeDeltas(framesA); framesB = computeDeltas(framesB); }
   } else {
     const cb = await ensureCodebooks();
     const levels = umapLevels.length ? umapLevels : [0];
-    rawA = codebookLookupFrames(cb, currentEmbeds.codesA, currentEmbeds.codesDimsA, levels);
-    rawB = codebookLookupFrames(cb, currentEmbeds.codesB, currentEmbeds.codesDimsB, levels);
-    framesA = rawA; framesB = rawB;
-    if      (embMode === 'emb+delta') { framesA = appendDeltas(framesA);  framesB = appendDeltas(framesB); }
-    else if (embMode === 'delta')     { framesA = computeDeltas(framesA); framesB = computeDeltas(framesB); }
+    framesA = codebookLookupFrames(cb, currentEmbeds.codesA, currentEmbeds.codesDimsA, levels);
+    framesB = codebookLookupFrames(cb, currentEmbeds.codesB, currentEmbeds.codesDimsB, levels);
+  }
+
+  if      (embMode === 'emb+delta') { framesA = appendDeltas(framesA, ctxDirection);  framesB = appendDeltas(framesB, ctxDirection); }
+  else if (embMode === 'delta')     { framesA = computeDeltas(framesA, ctxDirection); framesB = computeDeltas(framesB, ctxDirection); }
+
+  // Optional loudness dim: 48k embeddings are per-segment loudness-normalised,
+  // so the map is loudness-blind by default. Appending log(scale) makes
+  // loudness an organising axis. No-op on 24k (no scales).
+  let scaleDimIdx = -1;
+  if (scaleFeatEnabled && currentEmbeds.scalesA && currentEmbeds.scalesB) {
+    framesA = appendScaleDim(framesA, currentEmbeds.scalesA);
+    framesB = appendScaleDim(framesB, currentEmbeds.scalesB);
+    scaleDimIdx = framesA[0].length - 1;
+  }
+
+  // Normalise BEFORE windowing: every base dimension contributes equally
+  // regardless of raw magnitude, and the per-slot window weights survive
+  // (z-scoring after windowing would cancel them).
+  [framesA, framesB] = zscoreFrames(framesA, framesB);
+
+  // Weight the loudness dim AFTER z-scoring (same trap as the window weights —
+  // z-scoring first would cancel it). One unit-variance dim among D would be
+  // negligible in distances; weight it to carry ~10% of total feature variance
+  // so loudness reads as an axis without dominating timbre.
+  if (scaleDimIdx >= 0) {
+    const w = Math.sqrt(0.1 * scaleDimIdx); // scaleDimIdx === D_base
+    for (const fr of [framesA, framesB])
+      for (const f of fr) f[scaleDimIdx] *= w;
   }
 
   const K = Math.max(1, parseInt(umapWindowEl.value) || 1);
   if (K > 1) {
-    framesA = applyWindowWithAnchor(rawA, framesA, K);
-    framesB = applyWindowWithAnchor(rawB, framesB, K);
+    framesA = applyContextWindow(framesA, K, ctxDirection, ctxShape);
+    framesB = applyContextWindow(framesB, K, ctxDirection, ctxShape);
   }
-
-  // Normalise: every dimension contributes equally regardless of raw magnitude.
-  [framesA, framesB] = zscoreFrames(framesA, framesB);
 
   const T_A = framesA.length;
   const T_B = framesB.length;
@@ -2607,7 +2904,15 @@ async function buildUMAPFeatureData() {
 // flat is sent as a copy (no transfer) so buildUMAPFeatureData only runs once.
 function launchUMAPSlot(slotIdx) {
   if (slotIdx >= UMAP_N_SLOTS || !umapFeatureData) return;
-  const { flat, T_A, T_B, D, nNeighbors, minDist } = umapFeatureData;
+  const fd = umapFeatureData;
+  // UMAP-side matrix (post dedup/reduction); falls back to the full matrix.
+  const flat = fd.umapFlat ?? fd.flat;
+  const T_A  = fd.umapTA   ?? fd.T_A;
+  const T_B  = fd.umapTB   ?? fd.T_B;
+  const D    = fd.umapD    ?? fd.D;
+  const minDist = fd.minDist;
+  // Re-clamp for the (possibly deduped) point count.
+  const nNeighbors = Math.min(fd.nNeighbors, Math.max(2, Math.floor((T_A + T_B) / 3)));
 
   initUMAPWorker();
   activeUMAPJobId = ++jobSeq;
@@ -2626,6 +2931,8 @@ function launchUMAPSlot(slotIdx) {
     slotIdx,
     seed: slotIdx + 1,
     flat, T_A, T_B, D, nNeighbors, minDist,
+    metric: umapMetric,
+    initCoords: fd.initCoords || null,
   });
 }
 
@@ -3332,7 +3639,11 @@ function computeWaypoints() {
       snapSegBoundaries = fwdSegBounds;
     }
 
+    // 48k decodes non-causally within each chunk — grains get symmetric context
+    // (⌈K/2⌉ pre + ⌊K/2⌋ post per waypoint; the tail-only K_post folds into the
+    // last waypoint's post-roll). 24k stays pure pre-roll (causal decoder warm-up).
     const is48k   = mp.getModelHz() === '48k';
+    const ctxMode = is48k ? 'sym' : 'pre';
     const K_post  = is48k ? Math.max(2, Math.round(fps * 0.03)) : 0;
     const N_total = Math.max(2, Math.round(snapDurVal * fps));
 
@@ -3340,8 +3651,8 @@ function computeWaypoints() {
     // ctxArg defaults to snapCtxArg() — pingpong halves pass a half-duration arg so all waypoints fit.
     const ctxSwap = { prob: ctxSwapProb, range: ctxSwapDist };
     const buildSeq = (wps, N_target = N_total, kOverride = snapKVal, ctxArg = null) => snapMode === 'k_frames'
-      ? buildSnapSequence(wps, kOverride, K_post, ctxSwap, coordsA, coordsB, currentEmbeds)
-      : buildSnapSequenceFixed(wps, Math.max(wps.length, N_target), K_post, ctxSwap, coordsA, coordsB, currentEmbeds, ctxArg ?? snapCtxArg());
+      ? buildSnapSequence(wps, kOverride, K_post, ctxSwap, coordsA, coordsB, currentEmbeds, ctxMode)
+      : buildSnapSequenceFixed(wps, Math.max(wps.length, N_target), K_post, ctxSwap, coordsA, coordsB, currentEmbeds, ctxArg ?? snapCtxArg(), ctxMode);
 
     let seq;
     if (trajDir === 'forward')       seq = buildSeq(fwdWPs);

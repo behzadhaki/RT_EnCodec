@@ -16,6 +16,13 @@ export function pingPongExtend(frames, K) {
   });
 }
 
+// pingPongExtend pads at the START (anchored to the walk's end, which abuts the
+// waypoint). For forward walks the first frame abuts the waypoint instead, so
+// pad at the END by reversing around pingPongExtend.
+export function pingPongExtendFwd(frames, K) {
+  return pingPongExtend([...frames].reverse(), K).reverse();
+}
+
 // Walk backward K steps through the latent graph.
 //
 // Base walk: always pure temporal (cIdx - 1, K steps), oldest-first.
@@ -71,6 +78,63 @@ export function walkBackward(src, idx, K, { prob = 0, range = 0 }, coordsA, coor
 
   // 6. Reassemble: chosen pre-roll + chosen frame + original newer frames.
   return [...newOld, { src: chosen.src, idx: chosen.idx }, ...frames.slice(swapPos + 1)];
+}
+
+// Walk forward K steps through the latent graph — mirror of walkBackward, for
+// the post-roll context of non-causal (48k) grains. coordsA/coordsB lengths
+// double as the per-source frame counts for end-of-source clamping.
+//
+// Context swap mirrors walkBackward: one roll per walk; if it fires, a random
+// branch point in the post-roll is replaced by a nearby frame and everything
+// NEWER than the branch is refilled with the chosen frame's temporal post-roll
+// (a swap here morphs the grain's release rather than its attack).
+//
+// Returns [{src,idx}] in forward (oldest-first) order starting at idx+1, length ≤ K.
+export function walkForward(src, idx, K, { prob = 0, range = 0 }, coordsA, coordsB) {
+  const T = s => (s === 'A' ? coordsA : coordsB).length;
+
+  // 1. Pure temporal walk.
+  const frames = [];
+  let cSrc = src, cIdx = idx;
+  for (let step = 0; step < K; step++) {
+    if (cIdx >= T(cSrc) - 1) break;
+    cIdx += 1;
+    frames.push({ src: cSrc, idx: cIdx });
+  }
+
+  // 2. Per-waypoint swap decision.
+  if (frames.length === 0 || prob <= 0 || range <= 0 || Math.random() >= prob) return frames;
+
+  // 3. Random branch point within the post-roll.
+  const swapPos     = Math.floor(Math.random() * frames.length);
+  const branchFrame = frames[swapPos];
+  const [bx, by]    = (branchFrame.src === 'A' ? coordsA : coordsB)[branchFrame.idx];
+
+  // 4. Collect nearby frames from both sources (excluding the branch frame itself).
+  const candidates = [];
+  for (let j = 0; j < coordsA.length; j++) {
+    const d = Math.sqrt((coordsA[j][0] - bx) ** 2 + (coordsA[j][1] - by) ** 2);
+    if (d > 0 && d < range) candidates.push({ src: 'A', idx: j });
+  }
+  for (let j = 0; j < coordsB.length; j++) {
+    const d = Math.sqrt((coordsB[j][0] - bx) ** 2 + (coordsB[j][1] - by) ** 2);
+    if (d > 0 && d < range) candidates.push({ src: 'B', idx: j });
+  }
+  if (candidates.length === 0) return frames; // no nearby frame — keep pure temporal walk
+
+  // 5. Chosen frame's temporal post-roll fills the newer portion (after swapPos).
+  const chosen = candidates[Math.floor(Math.random() * candidates.length)];
+  const newLen = frames.length - swapPos - 1; // how many frames to replace
+  const newNew = [];
+  let rSrc = chosen.src, rIdx = chosen.idx;
+  for (let step = 0; step < newLen; step++) {
+    if (rIdx >= T(rSrc) - 1) break;
+    rIdx += 1;
+    newNew.push({ src: rSrc, idx: rIdx });
+  }
+
+  // 6. Reassemble: original older frames + chosen frame + chosen post-roll.
+  return [...frames.slice(0, swapPos), { src: chosen.src, idx: chosen.idx }, ...newNew];
 }
 
 export function buildCodePathGraph(coordsA, coordsB, nNeighbors) {
@@ -299,32 +363,50 @@ export function getContextKs(waypoints, { snapMode, snapKVal, snapDurVal, frames
   return K_each;
 }
 
-export function buildSnapSequence(waypoints, K_pre, K_post, ctxSwap, coordsA, coordsB, currentEmbeds) {
+// ctxMode: 'pre' (causal 24k — pure pre-roll, K_post tail at sequence end) or
+// 'sym' (non-causal 48k — each waypoint gets ⌈K/2⌉ pre + ⌊K/2⌋ post frames; the
+// last waypoint's post-roll replaces the old tail-only K_post, which is ignored).
+// Per-waypoint frame count is K + 1 in both modes, so duration budgets are unchanged.
+export function buildSnapSequence(waypoints, K_pre, K_post, ctxSwap, coordsA, coordsB, currentEmbeds, ctxMode = 'pre') {
   const T_A = currentEmbeds.embQuantDimsA[2];
   const T_B = currentEmbeds.embQuantDimsB[2];
   const getT = src => src === 'A' ? T_A : T_B;
   const seq  = [];
 
-  const addPreroll = (src, idx, K, wi) => {
-    const frames = pingPongExtend(walkBackward(src, idx, K, ctxSwap, coordsA, coordsB), K);
+  const sym = ctxMode === 'sym';
+  const kP  = sym ? Math.ceil(K_pre / 2)  : K_pre; // pre frames per waypoint
+  const kF  = sym ? Math.floor(K_pre / 2) : 0;     // post frames per waypoint
+
+  const addPost = (src, idx, wi) => {
+    if (kF <= 0) return;
+    const frames = pingPongExtendFwd(walkForward(src, idx, kF, ctxSwap, coordsA, coordsB), kF);
+    for (const f of frames) seq.push({ ...f, _wp: wi });
+  };
+  const addCtx = (src, idx, wi) => {
+    const frames = pingPongExtend(walkBackward(src, idx, kP, ctxSwap, coordsA, coordsB), kP);
     for (const f of frames) seq.push({ ...f, _wp: wi });
     seq.push({ src, idx, _wp: wi });
+    addPost(src, idx, wi);
   };
 
-  addPreroll(waypoints[0].src, waypoints[0].idx, K_pre, 0);
+  addCtx(waypoints[0].src, waypoints[0].idx, 0);
 
   for (let w = 1; w < waypoints.length; w++) {
     const { src, idx } = waypoints[w];
     const prev = waypoints[w - 1];
-    if (prev.src === src && idx > prev.idx && (idx - prev.idx) <= K_pre) {
-      for (let i = prev.idx + 1; i <= idx; i++) seq.push({ src, idx: i, _wp: w });
+    // Continuity shortcut: the previous waypoint's emission (incl. its post-roll
+    // in sym mode) ended at prev.idx + kF — walk straight there when close.
+    const lastEmitted = prev.idx + kF;
+    if (prev.src === src && idx > lastEmitted && (idx - lastEmitted) <= kP) {
+      for (let i = lastEmitted + 1; i <= idx; i++) seq.push({ src, idx: i, _wp: w });
+      addPost(src, idx, w);
     } else {
-      addPreroll(src, idx, K_pre, w);
+      addCtx(src, idx, w);
     }
   }
 
   const lastWi = waypoints.length - 1;
-  if (K_post > 0) {
+  if (!sym && K_post > 0) {
     const { src: sL, idx: iL } = waypoints[lastWi];
     const T = getT(sL);
     for (let i = iL + 1; i <= Math.min(T - 1, iL + K_post); i++) seq.push({ src: sL, idx: i, _wp: lastWi });
@@ -339,24 +421,31 @@ export function buildSnapSequence(waypoints, K_pre, K_post, ctxSwap, coordsA, co
   return out;
 }
 
-export function buildSnapSequenceFixed(waypoints, N_target, K_post, ctxSwap, coordsA, coordsB, currentEmbeds, snapCtx) {
+export function buildSnapSequenceFixed(waypoints, N_target, K_post, ctxSwap, coordsA, coordsB, currentEmbeds, snapCtx, ctxMode = 'pre') {
   const N_wp   = waypoints.length;
   const K_each = getContextKs(waypoints, snapCtx);
+  const sym    = ctxMode === 'sym';
 
   const seq = [];
   for (let w = 0; w < N_wp; w++) {
     const { src, idx } = waypoints[w];
     const K_this = K_each[w];
-    if (K_this > 0) {
-      const frames = pingPongExtend(walkBackward(src, idx, K_this, ctxSwap, coordsA, coordsB), K_this);
+    const kP = sym ? Math.ceil(K_this / 2)  : K_this;
+    const kF = sym ? Math.floor(K_this / 2) : 0;
+    if (kP > 0) {
+      const frames = pingPongExtend(walkBackward(src, idx, kP, ctxSwap, coordsA, coordsB), kP);
       for (const f of frames) seq.push({ ...f, _wp: w });
     }
     seq.push({ src, idx, _wp: w });
+    if (kF > 0) {
+      const frames = pingPongExtendFwd(walkForward(src, idx, kF, ctxSwap, coordsA, coordsB), kF);
+      for (const f of frames) seq.push({ ...f, _wp: w });
+    }
   }
 
   if (seq.length > N_target) seq.length = N_target;
 
-  if (K_post > 0) {
+  if (!sym && K_post > 0) {
     const { src: sL, idx: iL } = waypoints[N_wp - 1];
     const T_L = sL === 'A' ? currentEmbeds.embQuantDimsA[2] : currentEmbeds.embQuantDimsB[2];
     for (let i = iL + 1; i <= Math.min(T_L - 1, iL + K_post); i++) seq.push({ src: sL, idx: i, _wp: N_wp - 1 });

@@ -9,9 +9,15 @@ Browser-based demos using the exported ONNX models via `onnxruntime-web`.
 Serve from the **repo root** (so the ONNX model paths resolve correctly):
 
 ```bash
-python -m http.server 8000
+python devserver.py 8000
 # then open http://localhost:8000/web/experiment1.html
 ```
+
+`devserver.py` is a plain static server that sends `Cache-Control: no-store`.
+Prefer it over `python -m http.server`, which sends no cache headers — browsers
+then heuristically cache the ES modules in `web/lib/` and keep serving stale
+code after edits (only a hard reload picks up changes; the workers are
+cache-busted with `?v=` query strings, the lib modules are not).
 
 The models are loaded from `serialization/encodec_onnx_exports/`. Run
 `python serialization/export_onnx.py` first if they don't exist yet.

@@ -40,6 +40,13 @@ encodePhase          // 'A' | 'B' | null
 projectionMode       // 'umap' | 'pca'
 umapMode, umapLevel, embSpace, embMode
 nNeighbors, minDist, umapWindow
+ctxDirection         // 'past' | 'centered' | 'future' — context window placement + delta type
+ctxShape             // 'flat' | 'triangular' | 'gaussian' — context slot weighting
+                     // (z-score runs before windowing so slot weights survive)
+preReduceEnabled     // bool — PCA pre-reduction of UMAP features (≤32 dims, 95% var)
+umapMetric           // 'euclidean' | 'cosine' — UMAP distance function
+scaleFeatEnabled     // bool — append log(scale) loudness dim (48k only; no-op without scales)
+dedupEnabled         // bool — collapse consecutive near-duplicate frames before the UMAP fit
 
 // COORDS (async)
 coordsA, coordsB
@@ -190,6 +197,50 @@ Both produce `Float32Array` of shape `[N*2]` (interleaved x,y). The result is sp
 
 `triggerProjection()` dispatches to the correct algorithm based on `projectionMode`. On PCA result, a single `coordsA/coordsB` pair is set (no slots). On UMAP result, the current slot is populated; slots rotate on recompute.
 
+### Feature build (`buildUMAPFeatureData`)
+
+Per-frame feature vectors are built in a fixed order; the order matters.
+
+```
+1. base frames     — embEnc / embQuant / codebook-lookup per umapMode + embSpace
+2. embMode         — 'emb' | 'emb+delta' | 'delta'; deltas are direction-aware:
+                     past → f[t]−f[t−1], centered → (f[t+1]−f[t−1])/2, future → f[t+1]−f[t]
+2b. appendScaleDim — optional log(scale) loudness dim (scaleFeatEnabled, 48k only);
+                     weighted AFTER z-score to carry ~10% of total feature variance
+                     (one unit-variance dim among D would be negligible)
+3. zscoreFrames    — per-dim z-score, jointly over A and B
+4. applyContextWindow — K slots placed by ctxDirection:
+                     past     [t−K+1 … t]            (anchor last)
+                     centered [t−⌊K/2⌋ … t+⌈K/2⌉−1]  (anchor middle)
+                     future   [t … t+K−1]            (anchor first)
+                     per-slot weights by ctxShape (flat / triangular / gaussian σ=K/3),
+                     anchor weight 1.0; edges clamp (repeat first/last frame)
+```
+
+**Why z-score before windowing:** per-dim z-scoring after windowing would normalise each slot dimension to unit variance, exactly cancelling any constant per-slot weight. Normalising the base frames first lets the window weights survive into pairwise distances. The anchor frame appears exactly once in the window (no separate anchor prepend).
+
+### Pre-PCA reduction (`reduce_features`)
+
+When `preReduceEnabled` (default on, UMAP mode only) and `D > PRE_REDUCE_KMAX` (32), the feature matrix is PCA-reduced in the worker before any UMAP slot runs:
+
+- Randomized SVD (range finding + one power iteration, Jacobi eigen on the small Gram matrix). Never materialises the centered matrix or a D×D covariance; deterministic (fixed seed).
+- Keeps the smallest m components reaching `PRE_REDUCE_VAR` (95%) cumulative variance, clamped to [2, 32].
+- Runs on the UMAP-side matrix (`fd.umapFlat`, i.e. after optional dedup); on `reduce_result`, `fd.umapFlat/umapD` are replaced (`fd.reduced` marks it). `fd.flat` is never touched — `launchPCA` always projects the full matrix. `#preReduceInfo` shows `D_in→m dims · NN% var`.
+- Why: per-dim z-scoring amplifies noise dims to equal weight; dropping the variance tail makes distances meaningful and umap-js several times faster at large context windows.
+
+### Dedup (`dedupFeatures`)
+
+When `dedupEnabled` (UMAP mode only, default off), runs of consecutive frames whose cosine distance to the previous KEPT frame is below `#dedupThresh` are collapsed per source (a B frame never merges into an A run) **before** pre-PCA reduction and the UMAP fit. Why: adjacent frames of one source are nearly identical, so the KNN graph fills with trivial temporal neighbours and clusters form by source-and-time rather than content.
+
+Bookkeeping: `fd.flat/T_A/T_B/D` (full matrix) are never touched — PCA mode always projects the full matrix. The UMAP path uses `fd.umapFlat/umapTA/umapTB/umapD` (reps, then reduced). `fd.repMapA/repMapB` map every full frame to its representative's global rep row; the `umap_result` handler expands worker coords back to full length, so `coordsA/coordsB` always have one entry per frame (skipped frames overlap their representative on the map). `nNeighbors` is re-clamped to the rep count in `launchUMAPSlot`. `#dedupInfo` shows `N→M pts`.
+
+### UMAP metric + PCA-seeded init
+
+- `umapMetric` (`'euclidean'` default | `'cosine'`) — cosine passes a `distanceFn` to umap-js; discounts overall energy differences, groups timbre better.
+- When pre-reduction ran, columns 0–1 of the reduced matrix (the top-2 PCA scores) seed every slot's UMAP init: `umap.embedding` is mutated **in place** after `initializeFit` (the optimizer holds a reference to the same array — replacing it would break the link), scaled to umap-js's ±10 init range plus tiny per-slot jitter. Layouts become more stable across slots and globally more honest; slot variety comes from per-seed negative sampling. Seeding is best-effort (try/catch) — without reduction, slots use random init as before.
+
+The window is non-causal by design — the map is offline analysis, so causality is irrelevant for layout even on the causal 24k model. Generation context is a separate, model-aware mechanism (see "Grain context — `ctxMode`"): causal pre-roll on 24k, symmetric pre+post on 48k.
+
 ---
 
 ## Source visibility
@@ -282,8 +333,8 @@ const bwdSegBounds = fwdSegBounds.map(b => M - b).reverse();
 
 const buildSeq = (wps, N_target, kOverride, ctxArg) =>
   snapMode === 'k_frames'
-    ? buildSnapSequence(wps, kOverride, K_post, ...)
-    : buildSnapSequenceFixed(wps, Math.max(wps.length, N_target), K_post, ..., ctxArg ?? snapCtxArg());
+    ? buildSnapSequence(wps, kOverride, K_post, ..., ctxMode)
+    : buildSnapSequenceFixed(wps, Math.max(wps.length, N_target), K_post, ..., ctxArg ?? snapCtxArg(), ctxMode);
 
 // pingpong: bwdSeq._wp tags offset by M so renderer indexes snapFrames[M..2M-1]
 seq = [...fwdSeq, ...bwdSeq.map(f => ({ ...f, _wp: f._wp + M }))];
@@ -318,6 +369,17 @@ function snapWaypointArgs() {
 `pinCoords()` maps `pinPoints[{src,idx}]` to live UMAP coords. `enabledSrcs` filters which source frames are valid snap targets.
 
 ---
+
+## Grain context — `ctxMode`, `walkBackward` / `walkForward`
+
+Per-waypoint context shape is model-aware (`ctxMode`, derived from `mp.getModelHz()` in `computeWaypoints` and passed to both sequence builders and the renderer):
+
+- **`'pre'` (24k, causal decoder)** — pure pre-roll: K frames of `walkBackward` context lead into each waypoint (decoder warm-up). The old tail-only `K_post` applies (0 for 24k in practice).
+- **`'sym'` (48k, non-causal decoder)** — each waypoint gets `⌈K/2⌉` pre (`walkBackward`) + waypoint + `⌊K/2⌋` post (`walkForward`). The 48k decoder renders each chunk non-causally, so the audio *at* the waypoint is shaped by embeddings on both sides — symmetric context keeps the grain's identity intact instead of giving it an unrelated right context. The tail-only `K_post` is ignored: the last waypoint's post-roll serves that role. Per-waypoint frame count is K + 1 in both modes, so `getContextKs` duration budgets are unchanged.
+
+The continuity shortcut (consecutive same-source waypoints) accounts for the previous waypoint's post-roll: it walks from `prev.idx + kF + 1` to the next waypoint. `pingPongExtendFwd` mirrors `pingPongExtend` for forward walks (pads at the far end).
+
+`walkForward` mirrors `walkBackward` including the context-swap branch — a swap in the post-roll replaces everything *newer* than the branch with the chosen frame's temporal post-roll, morphing the grain's **release** rather than its attack.
 
 ## Context swap — `walkBackward`
 
@@ -398,6 +460,8 @@ function applyGenFade(pcm, sr) {
 
 The code/snap branches read `genPlaySeq` (already set by `computeWaypoints()`), extract embeddings column-wise into a `Float32Array`, and dispatch to the worker. The draw branch interpolates between the two nearest enabled-source frames inline. On worker reply (`trajectory_audio_exp6`), `lastRawPcm` is stored and `applyGenFade` is applied before `playerG.setAudio`.
 
+**48k loudness (worker, `runDecodeTrajectoryExp6`)**: when `frameScales` are supplied, every chunk decodes at scale = 1 and a per-SAMPLE gain envelope (linear interp between per-frame scales) is applied after OLA. Scale is a linear post-multiply in the decoder graph, so this is exact — and it removes the loudness steps the old per-chunk mean scale produced when loud and quiet grains mixed within one 150-frame chunk. Without `frameScales` the old per-segment fallback scale applies.
+
 ---
 
 ## autoRegenerate()
@@ -444,6 +508,8 @@ SOURCE / MODEL CHANGE
               └─► markDirty('COORDS', 'WAYPOINTS', 'AUDIO', 'RENDER')
                     └─► runEffects()
                           └─► triggerProjection()
+                                ├─ UMAP mode: startUMAPReduction()
+                                │    [dedup (sync) → reduce_features → reduce_result → launchUMAPSlot(0)]
                                 └─► onUMAPWorkerMsg (umap_result / pca_result)
                                       └─► markDirty('WAYPOINTS', 'AUDIO', 'RENDER')
                                             └─► runEffects()
@@ -504,7 +570,7 @@ Opt-in IndexedDB cache that stores per-source encoder outputs so repeated loads 
 | `embQuantDims` | `number[]` | Shape of embQuant |
 | `codesData` | `ArrayBuffer` (Int32) | VQ codebook indices |
 | `codesDims` | `number[]` | Shape of codes |
-| `scalesData` | `ArrayBuffer` (Float32) \| `null` | Per-frame scales (24 kHz model) |
+| `scalesData` | `ArrayBuffer` (Float32) \| `null` | Per-frame scales (48 kHz model; null for 24 kHz) |
 | `timestamp` | `number` | `Date.now()` at save time |
 
 Storing `embQuant` + `codes` alongside `embEnc` means a cache hit requires **zero additional inference** — `currentEmbeds` is assembled directly from the stored buffers.
@@ -531,3 +597,7 @@ If only one source is a file, or if one source misses, the full encode pipeline 
 10. **Multi-segment independence** — each draw stroke is sampled independently in `computeSnapWaypoints`; the renderer inserts `moveTo` gaps so no connecting line is drawn or traversed.
 11. **Source disable is non-destructive** — `pinPoints` is never modified; disabling a source re-snaps pins at `computeWaypoints()` time; re-enabling restores the original snapping automatically.
 12. **Fade is post-processing** — `lastRawPcm` stores the unmodified decoded audio. Changing fade values re-applies to the stored PCM instantly without touching the WAYPOINTS/AUDIO pipeline.
+13. **Normalise, then weight** — `zscoreFrames` runs on base feature frames BEFORE the context window and the loudness dim get their weights; z-scoring afterwards would normalise every weighted dim back to unit variance and cancel the weights.
+14. **Model-aware grain context** — `ctxMode` is derived from the model: 24k (causal decoder) gets pure pre-roll warm-up; 48k (non-causal) gets symmetric ⌈K/2⌉ pre + ⌊K/2⌋ post per waypoint. Per-waypoint frame count is K + 1 either way, so duration budgets are mode-independent.
+15. **Full vs UMAP-side matrix** — `fd.flat` (full feature matrix) is immutable after build; dedup and pre-PCA reduction only ever produce `fd.umapFlat`. PCA mode always projects the full matrix; UMAP results expand back to full length via `repMapA/B`, so `coordsA/coordsB` always have one entry per frame.
+16. **Loudness is exact at decode** — 48k chunks decode at scale = 1 and a per-sample envelope (linear interp of per-frame scales) is applied after OLA. Scale is a linear post-multiply in the decoder graph, so this is mathematically identical per grain and removes per-chunk loudness steps.

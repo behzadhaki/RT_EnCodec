@@ -2030,8 +2030,11 @@ async function runDecodeTrajectoryExp6(msg) {
 
     if (modelHz === '48k') {
       // 48k decoder must be called in ≤150-frame chunks (matches OLA path).
-      // Scale is per-segment in the captures; use the mean of each chunk's per-frame
-      // scale values (provided by the main thread) so each chunk gets its own correct scale.
+      // Loudness: when per-frame scales are supplied, decode every chunk at
+      // scale = 1 and apply a per-SAMPLE gain envelope (linear interp between
+      // frame scales) after OLA — scale is a linear post-multiply in the
+      // decoder graph, so this is exact, and it removes the loudness steps a
+      // per-chunk mean produces when loud and quiet grains mix within a chunk.
       // Fall back to captureCache first-segment scale if frameScales wasn't supplied.
       const caps    = captureCache.A || captureCache.B;
       const refCap  = !caps ? null
@@ -2062,15 +2065,12 @@ async function runDecodeTrajectoryExp6(msg) {
 
         // Always use fallbackScaleDims (real shape from the ONNX encoder output) —
         // never hardcode [1,1,1]; a shape mismatch silently hangs the 48k decoder.
-        let scale = fallbackScale, scaleDims = fallbackScaleDims;
-        if (frameScales) {
-          let sum = 0;
-          for (let i = tStart; i < tEnd; i++) sum += frameScales[i];
-          scale     = new Float32Array(fallbackScale.length).fill(sum / chunk_T);
-          scaleDims = fallbackScaleDims;
-        }
+        // With frameScales: unit scale here, per-sample envelope applied after OLA.
+        const scale = frameScales
+          ? new Float32Array(fallbackScale.length).fill(1.0)
+          : fallbackScale;
 
-        const res = await decodeFromLatents(chunkEmb, [1, D, chunk_T], scale, scaleDims, modelHz, hDec, cDec);
+        const res = await decodeFromLatents(chunkEmb, [1, D, chunk_T], scale, fallbackScaleDims, modelHz, hDec, cDec);
         hDec = res.hDecNew; cDec = res.cDecNew;
 
         const sampleOffset = tStart * HOP_48;
@@ -2083,6 +2083,17 @@ async function runDecodeTrajectoryExp6(msg) {
 
       for (let i = 0; i < totalSamples; i++) {
         if (wgtBuf[i] > 0) outBuf[i] /= wgtBuf[i];
+      }
+
+      // Per-sample gain envelope from the per-frame scales (linear interp).
+      if (frameScales) {
+        for (let s = 0; s < totalSamples; s++) {
+          const t  = s / HOP_48;
+          const t0 = Math.min(N - 1, Math.floor(t));
+          const t1 = Math.min(N - 1, t0 + 1);
+          const fr = t - t0;
+          outBuf[s] *= frameScales[t0] * (1 - fr) + frameScales[t1] * fr;
+        }
       }
       decoded = outBuf;
     } else {
