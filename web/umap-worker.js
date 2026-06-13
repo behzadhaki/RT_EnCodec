@@ -344,6 +344,41 @@ self.onmessage = ({ data: msg }) => {
     return;
   }
 
+  // ── 1-D UMAP (wheel-mode angle) ───────────────────────────────────────────
+  // Returns one scalar per frame; the main thread rank-wraps it to [0, 2π).
+  // Neighbourhood-preserving, so timbre families stay angularly contiguous —
+  // unlike PC1, which is a single linear axis.
+  if (msg.type === 'compute_umap_1d') {
+    const { jobId, seed = 7, flat, T_A, T_B, D, nNeighbors, minDist, metric = 'euclidean' } = msg;
+    Math.random = mulberry32(seed);
+    try {
+      const n = T_A + T_B;
+      const all = [];
+      for (let i = 0; i < n; i++)
+        all.push(Array.from(flat.subarray(i * D, (i + 1) * D)));
+
+      const opts = { nComponents: 1, nNeighbors, minDist };
+      if (metric === 'cosine') opts.distanceFn = cosineDist;
+      const umap    = new UMAP(opts);
+      const nEpochs = umap.initializeFit(all);
+
+      for (let e = 0; e < nEpochs; e++) {
+        umap.step();
+        if (e % 10 === 0 || e === nEpochs - 1)
+          self.postMessage({ type: 'umap1d_progress', jobId, epoch: e, nEpochs });
+      }
+
+      const coords = umap.getEmbedding();
+      const result = new Float32Array(n);
+      for (let i = 0; i < n; i++) result[i] = coords[i][0];
+
+      self.postMessage({ type: 'umap1d_result', jobId, result, T_A, T_B }, [result.buffer]);
+    } catch (err) {
+      self.postMessage({ type: 'umap1d_error', jobId, message: err.message });
+    }
+    return;
+  }
+
   // ── UMAP ──────────────────────────────────────────────────────────────────
   if (msg.type !== 'compute_umap') return;
 

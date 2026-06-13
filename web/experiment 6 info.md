@@ -37,7 +37,10 @@ currentEmbeds        // {embEncA/B, embEncDimsA/B, embQuantA/B, embQuantDimsA/B,
 encodePhase          // 'A' | 'B' | null
 
 // COORDS inputs
-projectionMode       // 'umap' | 'pca'
+projectionMode       // 'umap' | 'pca' | 'wheel'
+wheelRadius          // 'loud' | 'time' | 'atyp' — wheel-mode radius source
+wheelAngle           // 'umap1d' | 'pc1' — wheel-mode angle source
+wheelScale           // 'value' | 'rank' — wheel-mode radius scaling
 umapMode, umapLevel, embSpace, embMode
 nNeighbors, minDist, umapWindow
 ctxDirection         // 'past' | 'centered' | 'future' — context window placement + delta type
@@ -188,10 +191,14 @@ All former direct `renderScatter()` call sites go through `scheduleRender()`. At
 
 ## Projection — UMAP and PCA
 
-`projectionMode` (`'umap'` | `'pca'`) controls which algorithm runs in the web worker.
+`projectionMode` (`'umap'` | `'pca'` | `'wheel'`) controls which algorithm runs in the web worker.
 
 - **UMAP**: standard UMAP via `umap-js`. Six slots with distinct seeds (`mulberry32`) for reproducible but visually varied layouts.
 - **PCA**: two-component PCA via power iteration (covariance matrix, O(N·D²)). Deterministic, no seeds. Runs in the same worker on `compute_pca` message.
+- **Wheel**: polar controller layout — θ = `wheelAngle` source **rank** wrapped to [0, 2π) (rank, not value, for even angular spread), r = `wheelRadius` ∈ {loudness (48k scales or raw-audio frame RMS), time, atypicality (z-scored feature norm, `fd.featNorm`)}, mapped to [0.18, 1] per `wheelScale`: `'value'` = proportional with a 5–95% percentile clip (outlier guard; Time skips the clip — its values are uniform by construction), `'rank'` = rank-normalised (outlier-immune, even fill, but radial distance no longer proportional to the value).
+  - **Angle sources**: `'umap1d'` (default) — a 1-component UMAP fit (`compute_umap_1d` worker message); neighbourhood-preserving, so timbre families stay angularly contiguous; stochastic. `'pc1'` — the top PCA component via `compute_pca`; deterministic but orders by one linear axis only.
+  - Both angle sources cache on `fd.pc1` / `fd.umap1d`; switching angle or radius reuses the cache with no worker round-trip (a missing source computes once). The `pca_result` / `umap1d_result` handlers route to `applyWheelCoords()` only when the mode AND the matching `wheelAngle` are active.
+  - Drawn orbits make seamless loops (no pingpong needed). Caveat by design: screen proximity across the centre does NOT mean latent similarity — it's a controller, not a map. UMAP-only rows (neighbours, min-dist, pre-PCA, metric, dedup) hide in wheel mode; Angle and Radius rows show.
 
 Both produce `Float32Array` of shape `[N*2]` (interleaved x,y). The result is split into `coordsA` (first T_A rows) and `coordsB` (last T_B rows) and stored identically regardless of algorithm.
 

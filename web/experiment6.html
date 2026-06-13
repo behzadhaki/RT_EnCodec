@@ -357,8 +357,31 @@ umapSection.className = 'section';
 umapSection.innerHTML = `
   <div class="section-title">Projection</div>
   <div class="row" style="gap:3px">
-    <button class="tog active" id="togUMAPMode" style="flex:1">UMAP</button>
-    <button class="tog"        id="togPCAMode"  style="flex:1">PCA</button>
+    <button class="tog active" id="togUMAPMode"  style="flex:1">UMAP</button>
+    <button class="tog"        id="togPCAMode"   style="flex:1">PCA</button>
+    <button class="tog"        id="togWheelMode" style="flex:1">Wheel</button>
+  </div>
+  <div class="row" id="wheelAngleRow" style="display:none">
+    <span class="lbl">Angle</span>
+    <div style="display:flex;gap:3px">
+      <button class="tog active" id="togWheelAngleUMAP">UMAP 1-D</button>
+      <button class="tog"        id="togWheelAnglePC1">PC1</button>
+    </div>
+  </div>
+  <div class="row" id="wheelRadiusRow" style="display:none">
+    <span class="lbl">Radius</span>
+    <div style="display:flex;gap:3px">
+      <button class="tog active" id="togWheelLoud">Loud</button>
+      <button class="tog"        id="togWheelTime">Time</button>
+      <button class="tog"        id="togWheelAtyp">Atyp</button>
+    </div>
+  </div>
+  <div class="row" id="wheelScaleRow" style="display:none">
+    <span class="lbl">R scale</span>
+    <div style="display:flex;gap:3px">
+      <button class="tog active" id="togWheelScaleVal">Value</button>
+      <button class="tog"        id="togWheelScaleRank">Rank</button>
+    </div>
   </div>
   <div class="row">
     <span class="lbl">Features</span>
@@ -747,9 +770,12 @@ const PRE_REDUCE_VAR  = 0.95;  // target cumulative explained variance
 let coordsA         = null;
 let coordsB         = null;
 
-// Projection mode — 'umap' | 'pca'
+// Projection mode — 'umap' | 'pca' | 'wheel'
 let projectionMode  = 'umap';
 let pcaCoords       = null;  // {coordsA, coordsB} — cached PCA result for current features
+let wheelRadius     = 'loud';   // 'loud' | 'time' | 'atyp' — wheel-mode radius source
+let wheelAngle      = 'umap1d'; // 'umap1d' | 'pc1' — wheel-mode angle source
+let wheelScale      = 'value';  // 'value' | 'rank' — wheel-mode radius scaling
 
 // UMAP multi-slot (reproducible layout browser)
 const UMAP_N_SLOTS  = 6;
@@ -1392,7 +1418,7 @@ function initWorker() {
 
 function initUMAPWorker() {
   if (umapWorker) umapWorker.terminate();
-  umapWorker = new Worker(new URL('./umap-worker.js?v=5', import.meta.url), { type: 'module' });
+  umapWorker = new Worker(new URL('./umap-worker.js?v=6', import.meta.url), { type: 'module' });
   umapWorker.onmessage = onUMAPWorkerMsg;
 }
 
@@ -1481,6 +1507,19 @@ function onUMAPWorkerMsg({ data: msg }) {
     for (let i = 0; i < T_B; i++) slot.coordsB.push([result[(T_A + i) * 2], result[(T_A + i) * 2 + 1]]);
     pcaCoords = slot;
 
+    // Stash PC1 — wheel mode derives its angle from it (rank-wrapped).
+    if (umapFeatureData) {
+      const pc1 = new Float32Array(T_A + T_B);
+      for (let i = 0; i < T_A + T_B; i++) pc1[i] = result[i * 2];
+      umapFeatureData.pc1 = pc1;
+    }
+
+    if (projectionMode === 'wheel' && wheelAngle === 'pc1') {
+      applyWheelCoords();
+      markDirty('WAYPOINTS', 'AUDIO', 'RENDER');
+      return;
+    }
+
     viewZoom = 1; viewPanX = 0; viewPanY = 0;
     const hadDrawTraj = rawDrawSegments.some(s => s.pts.length >= 2) || rawDrawPoints.length >= 2;
     rawDrawSegments = []; rawDrawPoints = []; drawSegmentBoundaries = []; clearSoloState();
@@ -1497,6 +1536,28 @@ function onUMAPWorkerMsg({ data: msg }) {
     return;
 
   } else if (msg.type === 'pca_error') {
+    progWrap.style.display = 'none';
+    setStatus(msg.message, true);
+    return;
+  }
+
+  // ── 1-D UMAP (wheel angle) ─────────────────────────────────────────────────
+  if (msg.type === 'umap1d_progress') {
+    const pct = Math.round(msg.epoch / msg.nEpochs * 100);
+    progBar.style.width = pct + '%';
+    setStatus(`Wheel — 1-D UMAP epoch ${msg.epoch} / ${msg.nEpochs}`);
+    return;
+
+  } else if (msg.type === 'umap1d_result') {
+    if (umapFeatureData) umapFeatureData.umap1d = msg.result;
+    if (projectionMode === 'wheel' && wheelAngle === 'umap1d') {
+      applyWheelCoords();
+      markDirty('WAYPOINTS', 'AUDIO', 'RENDER');
+    }
+    progWrap.style.display = 'none';
+    return;
+
+  } else if (msg.type === 'umap1d_error') {
     progWrap.style.display = 'none';
     setStatus(msg.message, true);
     return;
@@ -1594,17 +1655,158 @@ function launchPCA() {
   umapWorker.postMessage({ type: 'compute_pca', jobId: activeUMAPJobId, flat, T_A, T_B, D });
 }
 
+// ── Wheel projection ───────────────────────────────────────────────────────────
+// θ = PC1 rank wrapped to [0, 2π) — similarity as a circular dimension, so
+// drawn orbits make seamless loops. Rank (not raw value) spreads frames evenly
+// around the circle. r = a chosen scalar, percentile-normalised to [0.18, 1]
+// so the centre never piles up. NOTE: screen proximity across the centre does
+// NOT mean latent similarity in this mode — it's a controller, not a map.
+
+// Per-frame RMS of the raw source audio — Loud radius fallback when the model
+// has no per-frame scales (24 kHz).
+function frameRms(raw, ch, T_frames) {
+  const total = raw.length / ch;
+  const hop   = total / T_frames;
+  const out   = new Float32Array(T_frames);
+  for (let t = 0; t < T_frames; t++) {
+    const s0 = Math.floor(t * hop), s1 = Math.max(s0 + 1, Math.min(total, Math.floor((t + 1) * hop)));
+    let s = 0, n = 0;
+    for (let c = 0; c < ch; c++)
+      for (let i = s0; i < s1; i++) { const v = raw[c * total + i]; s += v * v; n++; }
+    out[t] = n ? Math.sqrt(s / n) : 0;
+  }
+  return out;
+}
+
+function wheelRadiusValues(fd) {
+  const { T_A, T_B } = fd;
+  if (wheelRadius === 'time') {
+    const rA = Float32Array.from({ length: T_A }, (_, i) => T_A > 1 ? i / (T_A - 1) : 0.5);
+    const rB = Float32Array.from({ length: T_B }, (_, i) => T_B > 1 ? i / (T_B - 1) : 0.5);
+    return { rA, rB };
+  }
+  if (wheelRadius === 'atyp') {
+    return { rA: fd.featNorm.slice(0, T_A), rB: fd.featNorm.slice(T_A) };
+  }
+  // 'loud': per-frame log(scale) on 48k; raw-audio frame RMS otherwise.
+  const logScales = s => Float32Array.from(s, v => Math.log(Math.max(v || 0, 1e-6)));
+  const rA = currentEmbeds?.scalesA ? logScales(currentEmbeds.scalesA)
+           : rawAudioA              ? frameRms(rawAudioA, rawAudioCh, T_A)
+           : new Float32Array(T_A);
+  const rB = currentEmbeds?.scalesB ? logScales(currentEmbeds.scalesB)
+           : rawAudioB              ? frameRms(rawAudioB, rawAudioCh, T_B)
+           : new Float32Array(T_B);
+  return { rA, rB };
+}
+
+// Angle source helpers. Both sources are cached on umapFeatureData (pc1 /
+// umap1d) so switching angle or radius never re-runs the worker once computed.
+function wheelAngleReady() {
+  return wheelAngle === 'pc1' ? !!umapFeatureData?.pc1 : !!umapFeatureData?.umap1d;
+}
+
+function launchWheelAngle() {
+  if (wheelAngle === 'pc1') launchPCA();
+  else                      launchUMAP1D();
+}
+
+function launchUMAP1D() {
+  if (!umapFeatureData) return;
+  const { flat, T_A, T_B, D, nNeighbors, minDist } = umapFeatureData;
+
+  initUMAPWorker();
+  activeUMAPJobId = ++jobSeq;
+
+  progWrap.style.display = 'block';
+  progBar.style.width = '0%';
+  setStatus(`Wheel — fitting 1-D UMAP… (${T_A + T_B} frames)`);
+
+  umapWorker.postMessage({
+    type: 'compute_umap_1d', jobId: activeUMAPJobId,
+    flat, T_A, T_B, D, nNeighbors, minDist,
+    metric: umapMetric,
+  });
+}
+
+function applyWheelCoords() {
+  const fd = umapFeatureData;
+  const angleVals = wheelAngle === 'pc1' ? fd?.pc1 : fd?.umap1d;
+  if (!angleVals) return;
+  const N = fd.T_A + fd.T_B;
+
+  // Angle: joint rank over both sources → even angular spread, order preserved.
+  const order = Array.from({ length: N }, (_, i) => i).sort((a, b) => angleVals[a] - angleVals[b]);
+  const theta = new Float32Array(N);
+  order.forEach((idx, rank) => { theta[idx] = rank / N * 2 * Math.PI; });
+
+  // Radius, mapped to [0.18, 1] (the floor keeps the centre from piling up).
+  const { rA, rB } = wheelRadiusValues(fd);
+  const rawR = new Float32Array(N);
+  rawR.set(rA, 0);
+  rawR.set(rB, fd.T_A);
+
+  const R_MIN = 0.18, R_SPAN = 0.82;
+  const radius = new Float32Array(N);
+  if (wheelScale === 'rank') {
+    // Rank: outlier-immune and uses the whole band with no saturation —
+    // but radial distance is no longer proportional to the underlying value.
+    const ord = Array.from({ length: N }, (_, i) => i).sort((a, b) => rawR[a] - rawR[b]);
+    ord.forEach((idx, rank) => { radius[idx] = R_MIN + R_SPAN * (N > 1 ? rank / (N - 1) : 0.5); });
+  } else {
+    // Value: percentile-clip (5–95%) so one silent/extreme frame can't rescale
+    // the whole axis — except Time, whose values are uniform by construction
+    // and need no robustification (clipping would only saturate the ends).
+    let lo, hi;
+    if (wheelRadius === 'time') {
+      lo = 0; hi = 1;
+    } else {
+      const sorted = rawR.slice().sort();
+      lo = sorted[Math.floor(0.05 * (N - 1))];
+      hi = sorted[Math.floor(0.95 * (N - 1))];
+    }
+    for (let i = 0; i < N; i++) {
+      const t = hi > lo ? (rawR[i] - lo) / (hi - lo) : 0.5;
+      radius[i] = R_MIN + R_SPAN * Math.min(1, Math.max(0, t));
+    }
+  }
+
+  coordsA = []; coordsB = [];
+  for (let i = 0; i < fd.T_A; i++) {
+    coordsA.push([radius[i] * Math.cos(theta[i]), radius[i] * Math.sin(theta[i])]);
+  }
+  for (let i = 0; i < fd.T_B; i++) {
+    const j = fd.T_A + i;
+    coordsB.push([radius[j] * Math.cos(theta[j]), radius[j] * Math.sin(theta[j])]);
+  }
+
+  viewZoom = 1; viewPanX = 0; viewPanY = 0;
+  const hadDrawTraj = rawDrawSegments.some(s => s.pts.length >= 2) || rawDrawPoints.length >= 2;
+  rawDrawSegments = []; rawDrawPoints = []; drawSegmentBoundaries = []; clearSoloState();
+  userTrajectory = pinPoints.length >= 2 ? resamplePath(pinCoords(), 300) : [];
+  progWrap.style.display = 'none';
+  const radLbl = { loud: 'loudness', time: 'time', atyp: 'atypicality' }[wheelRadius]
+               + (wheelScale === 'rank' ? ' (rank)' : '');
+  const angLbl = wheelAngle === 'pc1' ? 'PC1 rank' : '1-D UMAP';
+  setStatus(hadDrawTraj && pinPoints.length < 2
+    ? 'Wheel updated — draw trajectory cleared. Redraw to regenerate.'
+    : `Wheel — angle: ${angLbl} · radius: ${radLbl}`);
+}
+
 // ── Projection mode toggle ─────────────────────────────────────────────────────
 
 function setProjectionMode(mode) {
   projectionMode = mode;
-  document.getElementById('togUMAPMode').classList.toggle('active', mode === 'umap');
-  document.getElementById('togPCAMode') .classList.toggle('active', mode === 'pca');
+  document.getElementById('togUMAPMode') .classList.toggle('active', mode === 'umap');
+  document.getElementById('togPCAMode')  .classList.toggle('active', mode === 'pca');
+  document.getElementById('togWheelMode').classList.toggle('active', mode === 'wheel');
   document.getElementById('neighborRow') .style.display = mode === 'umap' ? '' : 'none';
   document.getElementById('minDistRow')  .style.display = mode === 'umap' ? '' : 'none';
   document.getElementById('preReduceRow').style.display = mode === 'umap' ? '' : 'none';
   document.getElementById('metricRow')   .style.display = mode === 'umap' ? '' : 'none';
   document.getElementById('dedupRow')    .style.display = mode === 'umap' ? '' : 'none';
+  document.getElementById('wheelAngleRow') .style.display = mode === 'wheel' ? '' : 'none';
+  document.getElementById('wheelRadiusRow').style.display = mode === 'wheel' ? '' : 'none';
+  document.getElementById('wheelScaleRow') .style.display = mode === 'wheel' ? '' : 'none';
   slotWrap.classList.toggle('visible', mode === 'umap' && umapSlots.some(s => s));
 
   if (!umapFeatureData) return; // nothing computed yet — triggerProjection() will dispatch when ready
@@ -1619,6 +1821,13 @@ function setProjectionMode(mode) {
       markDirty('WAYPOINTS', 'AUDIO', 'RENDER');
     } else {
       launchPCA(); // cancels any in-progress UMAP slot
+    }
+  } else if (mode === 'wheel') {
+    if (wheelAngleReady()) {
+      applyWheelCoords();
+      markDirty('WAYPOINTS', 'AUDIO', 'RENDER');
+    } else {
+      launchWheelAngle(); // result handler routes to wheel coords by mode
     }
   } else { // umap
     slotWrap.classList.add('visible');
@@ -2347,8 +2556,42 @@ togScaleFeat.addEventListener('click', () => {
   markDirty('COORDS', 'WAYPOINTS', 'AUDIO', 'RENDER');
 });
 
-document.getElementById('togUMAPMode').addEventListener('click', () => setProjectionMode('umap'));
-document.getElementById('togPCAMode') .addEventListener('click', () => setProjectionMode('pca'));
+document.getElementById('togUMAPMode') .addEventListener('click', () => setProjectionMode('umap'));
+document.getElementById('togPCAMode')  .addEventListener('click', () => setProjectionMode('pca'));
+document.getElementById('togWheelMode').addEventListener('click', () => setProjectionMode('wheel'));
+
+// Wheel angle source — uses the cached PC1 / 1-D UMAP if available, else computes it.
+createToggleGroup([
+  { el: document.getElementById('togWheelAngleUMAP'), value: 'umap1d' },
+  { el: document.getElementById('togWheelAnglePC1'),  value: 'pc1' },
+], v => {
+  wheelAngle = v;
+  if (projectionMode !== 'wheel' || !umapFeatureData) return;
+  if (wheelAngleReady()) {
+    applyWheelCoords();
+    markDirty('WAYPOINTS', 'AUDIO', 'RENDER');
+  } else {
+    launchWheelAngle();
+  }
+});
+
+// Wheel radius source / scaling — recompute coords from the cached angle, no re-projection.
+const wheelRadiusRefresh = () => {
+  if (projectionMode === 'wheel' && wheelAngleReady()) {
+    applyWheelCoords();
+    markDirty('WAYPOINTS', 'AUDIO', 'RENDER');
+  }
+};
+createToggleGroup([
+  { el: document.getElementById('togWheelLoud'), value: 'loud' },
+  { el: document.getElementById('togWheelTime'), value: 'time' },
+  { el: document.getElementById('togWheelAtyp'), value: 'atyp' },
+], v => { wheelRadius = v; wheelRadiusRefresh(); });
+
+createToggleGroup([
+  { el: document.getElementById('togWheelScaleVal'),  value: 'value' },
+  { el: document.getElementById('togWheelScaleRank'), value: 'rank' },
+], v => { wheelScale = v; wheelRadiusRefresh(); });
 
 // Source A / B visibility toggles
 document.getElementById('togSrcA').addEventListener('click', () => {
@@ -2766,6 +3009,8 @@ function triggerProjection() {
       umapFeatureData = fd;
       if (projectionMode === 'pca') {
         launchPCA();
+      } else if (projectionMode === 'wheel') {
+        launchWheelAngle(); // result handler routes to wheel coords
       } else {
         slotWrap.classList.add('visible');
         startUMAPReduction();
@@ -2919,13 +3164,23 @@ async function buildUMAPFeatureData() {
   framesA.forEach((f, i) => flat.set(f, i * D));
   framesB.forEach((f, i) => flat.set(f, (T_A + i) * D));
 
+  // Per-frame feature norm — frames are z-scored (zero mean per dim), so the
+  // L2 norm is the distance from the dataset centroid = "atypicality".
+  // Used as the wheel-mode Atyp radius.
+  const featNorm = new Float32Array(T_A + T_B);
+  for (let i = 0; i < T_A + T_B; i++) {
+    let s = 0;
+    for (let d = 0; d < D; d++) s += flat[i * D + d] ** 2;
+    featNorm[i] = Math.sqrt(s);
+  }
+
   const nNeighbors = Math.min(
     Math.max(2, parseInt(nNeighborsEl.value) || 15),
     Math.max(2, Math.floor((T_A + T_B) / 3))
   );
   const minDist = parseFloat(minDistEl.value) || 0.1;
 
-  return { flat, T_A, T_B, D, nNeighbors, minDist };
+  return { flat, T_A, T_B, D, nNeighbors, minDist, featNorm };
 }
 
 // Send one slot job to the worker. Each slot gets a unique seed (slotIdx + 1)
@@ -3920,6 +4175,14 @@ initHelpTips({
   // Projection panel
   '#togUMAPMode':    'UMAP: nonlinear neighbour-preserving layout, 6 seeded variants. Better clusters, no fixed axes.',
   '#togPCAMode':     'PCA: linear projection onto the top-2 variance directions. Deterministic, preserves global structure, weaker clustering.',
+  '#togWheelMode':   'Wheel: similarity as the angle (1-D UMAP or PC1), a chosen scalar as the radius. Drawn orbits loop seamlessly. Proximity across the centre does NOT mean similarity — it’s a controller, not a map.',
+  '#togWheelAngleUMAP': 'Angle from a 1-D UMAP: neighbourhood-preserving, so timbre families stay angularly contiguous. Stochastic; recomputed per feature change.',
+  '#togWheelAnglePC1':  'Angle from PC1 rank: the dominant linear axis of variation. Deterministic and instant, but only orders by one direction of the feature space.',
+  '#togWheelLoud':   'Radius = per-frame loudness (48 kHz scale, or raw-audio RMS on 24 kHz). Pull paths outward for louder grains.',
+  '#togWheelTime':   'Radius = position in the source — centre is the start, rim is the end.',
+  '#togWheelAtyp':   'Radius = atypicality: distance from the average frame in feature space. Rim = the most extreme moments.',
+  '#togWheelScaleVal':  'Radius proportional to the value, percentile-clipped (5–95%) so one silent/extreme frame can’t rescale the axis. Time skips the clip (already uniform).',
+  '#togWheelScaleRank': 'Radius from the value’s rank: outlier-immune, fills the whole band evenly — but radial distance no longer reflects how different the values are.',
   '#togEmbOnly':     'Features = the frame embedding itself: organise by sound content.',
   '#togEmbDelta':    'Features = embedding + its frame-to-frame delta: content plus how it is changing.',
   '#togDeltaOnly':   'Features = delta only: organise purely by motion/transients, ignoring static content.',
