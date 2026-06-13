@@ -668,6 +668,23 @@ async function runEncode(msg) {
   }
 }
 
+// Experiment 6 parallel encode: encode ONE pre-sliced segment chunk (stateless,
+// zero LSTM init — segments are independent) and return its capture. The main
+// thread slices the 1 s chunks and distributes them across a worker pool, then
+// reassembles per-source captures via set_captures. Pool workers never decode.
+async function runEncodeSegment(msg) {
+  const { jobId, source, segIdx, chunk, leftGuardFrames, channels, offset, validEnd,
+          modelHz, bwKbps } = msg;
+  try {
+    await ensureSessions(modelHz, bwKbps);
+    const cap = await encodeCapture(chunk, modelHz, zeroState(1), zeroState(1), leftGuardFrames, channels);
+    delete cap.hEncNew; delete cap.cEncNew;   // unused without state carry — shrink payload
+    self.postMessage({ type: 'segment_cap', jobId, source, segIdx, cap, offset, validEnd });
+  } catch (err) {
+    self.postMessage({ type: 'segment_error', jobId, source, segIdx, message: err.message });
+  }
+}
+
 // Encode full audio, capture intermediate tensors, decode for display.
 // Non-streaming: single pass.  Streaming: OLA with encoder state carried.
 async function encodeAndCapture24k(audio, streaming, frameSize, jobId, skipPreview = false) {
@@ -2182,6 +2199,17 @@ self.onmessage = (e) => {
       // Experiment2/3/4: encode one source, cache captures, return decoded audio
       currentJobId = msg.jobId;
       runEncode(msg);
+      break;
+    case 'encode_segment':
+      // Experiment6 parallel pool: encode one pre-sliced 1 s segment (stateless).
+      // No currentJobId — staleness is handled on the main thread.
+      runEncodeSegment(msg);
+      break;
+    case 'set_captures':
+      // Experiment6 parallel pool: inject reassembled per-source captures so the
+      // existing get_embeddings_exp6 / decode / explore paths work unchanged.
+      captureCache[msg.source] = msg.captures;
+      self.postMessage({ type: 'captures_set', jobId: msg.jobId, source: msg.source });
       break;
     case 'interpolate':
       // Experiment2: interpolate using cached captures — no audio needed

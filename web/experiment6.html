@@ -295,6 +295,12 @@ import {
 
 const MODELS_BASE = new URL('../serialization/encodec_onnx_exports', location.href).href;
 
+// 48k OLA segment geometry — must match encodec-worker.js encodeAndCapture48k.
+const SEG_48_M    = 48000;
+const STRIDE_48_M = 43200;
+const HOP_48_M    = 320;
+const GUARD_48_M  = 16 * HOP_48_M;
+
 // ── Controls ──────────────────────────────────────────────────────────────────
 
 const controls = document.getElementById('controls');
@@ -359,7 +365,7 @@ encOptSection.id = 'encOptSection';
 encOptSection.innerHTML = `
   <div class="row" id="statefulOlaRow">
     <span class="lbl">48k OLA</span>
-    <button class="tog active" id="togStatefulOla">Stateful</button>
+    <button class="tog" id="togStatefulOla">Stateless</button>
   </div>
 `.trim();
 controls.appendChild(encOptSection);
@@ -763,8 +769,8 @@ let currentEmbeds = null;
 let codebooks     = null;
 let codebooksFor  = null;
 let encodeTimer   = null;
-let statefulOla   = true;   // 48k: carry encoder/decoder LSTM state across OLA segments
-                            // (false = reset per chunk → independent segments)
+let statefulOla   = false;  // 48k: carry encoder/decoder LSTM state across OLA segments
+                            // (false = reset per chunk → independent segments, parallel encode)
 
 // UMAP
 let umapWorker      = null;
@@ -2268,6 +2274,155 @@ function cancelProjection() {
   initUMAPWorker();
 }
 
+// ── Parallel 48k encode (stateless) ─────────────────────────────────────────────
+// In stateless mode the 1 s OLA segments are independent, so they encode
+// concurrently across a pool of workers. Output is bit-identical to the
+// sequential stateless path (same chunks, zero state each).
+
+let encPool          = null;            // { slots: [{ w, onResult }] }
+let encodeBatchPromise = Promise.resolve();  // serialises pool batches (no overlap → no stale-slot reuse)
+
+function ensureEncPool() {
+  if (encPool) return encPool;
+  const K = Math.max(2, Math.min(navigator.hardwareConcurrency || 4, 6));
+  const slots = [];
+  for (let i = 0; i < K; i++) {
+    const w = new Worker('encodec-worker.js?pool=' + i + '_' + Date.now());
+    w.postMessage({ type: 'init', modelsBaseUrl: MODELS_BASE });
+    const slot = { w, onResult: null };
+    w.onmessage = (e) => {
+      const m = e.data;
+      if (m.type === 'segment_cap' || m.type === 'segment_error') {
+        const cb = slot.onResult; slot.onResult = null; if (cb) cb(m);
+      }
+    };
+    slots.push(slot);
+  }
+  encPool = { slots };
+  return encPool;
+}
+
+function destroyEncPool() {
+  if (!encPool) return;
+  for (const s of encPool.slots) s.w.terminate();
+  encPool = null;
+}
+
+// Slice planar audio into the exact same 1 s chunks as encodeAndCapture48k.
+function sliceSegments48k(audio, channels) {
+  const totalLen = audio.length / channels;
+  const numSegs  = Math.ceil(totalLen / STRIDE_48_M);
+  const segs = [];
+  for (let s = 0; s < numSegs; s++) {
+    const offset          = s * STRIDE_48_M;
+    const leftGuard       = Math.min(offset, GUARD_48_M);
+    const leftGuardFrames = leftGuard / HOP_48_M;
+    const extLen = leftGuard + SEG_48_M;
+    const chunk  = new Float32Array(channels * extLen);
+    for (let ch = 0; ch < channels; ch++) {
+      const srcOff = ch * totalLen + offset - leftGuard;
+      const n      = Math.min(extLen, totalLen - (offset - leftGuard));
+      chunk.set(audio.subarray(srcOff, srcOff + n), ch * extLen);
+    }
+    const validEnd = Math.min(offset + SEG_48_M, totalLen);
+    segs.push({ segIdx: s, chunk, leftGuardFrames, channels, offset, validEnd });
+  }
+  return { segs, totalLen };
+}
+
+// Run all jobs across the pool; resolves with caps in job order, rejects on error.
+function doParallelBatch(jobs, onProgress) {
+  const { slots } = ensureEncPool();
+  const results = new Array(jobs.length);
+  let next = 0, done = 0, settled = false;
+  return new Promise((resolve, reject) => {
+    const pump = (slot) => {
+      if (settled || next >= jobs.length) return;
+      const idx = next++;
+      const job = jobs[idx];
+      slot.onResult = (m) => {
+        if (settled) return;
+        if (m.type === 'segment_error') { settled = true; reject(new Error(m.message)); return; }
+        results[idx] = { source: m.source, segIdx: m.segIdx, cap: m.cap, offset: m.offset, validEnd: m.validEnd };
+        done++;
+        onProgress && onProgress(done, jobs.length);
+        if (done === jobs.length) { settled = true; resolve(results); }
+        else pump(slot);
+      };
+      slot.w.postMessage({ type: 'encode_segment', ...job }, [job.chunk.buffer]);
+    };
+    slots.forEach(pump);
+  });
+}
+
+// Inject reassembled captures into the primary worker; resolves on ack.
+function setCapturesOnPrimary(source, captures) {
+  return new Promise((resolve) => {
+    const jid = ++jobSeq;
+    const h = (e) => { if (e.data.type === 'captures_set' && e.data.jobId === jid) { worker.removeEventListener('message', h); resolve(); } };
+    worker.addEventListener('message', h);
+    worker.postMessage({ type: 'set_captures', jobId: jid, source, captures });
+  });
+}
+
+async function runParallelEncode48k(audioA, audioB, channels, myRun) {
+  const stale   = () => myRun !== encodeRunSeq;
+  const modelHz = '48k', bwKbps = mp.getBwKbps();
+
+  const A = sliceSegments48k(audioA, channels);
+  const B = sliceSegments48k(audioB, channels);
+  const jobs = [
+    ...A.segs.map(s => ({ ...s, source: 'A', modelHz, bwKbps })),
+    ...B.segs.map(s => ({ ...s, source: 'B', modelHz, bwKbps })),
+  ];
+
+  progWrap.style.display = 'block';
+  progBar.style.width    = '0%';
+  setStatus(`Encoding ${jobs.length} segments in parallel…`);
+
+  // Serialise: never overlap two batches on the pool.
+  const prev = encodeBatchPromise;
+  let release;
+  encodeBatchPromise = new Promise(r => { release = r; });
+  try {
+    try { await prev; } catch (_) {}
+    if (stale()) return;
+
+    let caps;
+    try {
+      caps = await doParallelBatch(jobs, (d, t) => {
+        if (!stale()) { progBar.style.width = Math.round(d / t * 100) + '%'; setStatus(`Encoding ${d}/${t} segments…`); }
+      });
+    } catch (err) {
+      destroyEncPool();   // a failed segment may leave workers busy — rebuild clean
+      if (!stale()) setStatus('Parallel encode failed: ' + err.message, true);
+      return;
+    }
+    if (stale()) return;
+
+    const build = (src, totalLen) => ({
+      mode: 'ola48', totalLen,
+      segments: caps.filter(c => c.source === src).sort((a, b) => a.segIdx - b.segIdx)
+                    .map(c => ({ cap: c.cap, offset: c.offset, validEnd: c.validEnd })),
+    });
+    const capturesA = build('A', A.totalLen);
+    const capturesB = build('B', B.totalLen);
+
+    if (!worker) initWorker();
+    await setCapturesOnPrimary('A', capturesA);
+    await setCapturesOnPrimary('B', capturesB);
+    if (stale()) return;
+
+    activeJobId = ++jobSeq;
+    encodePhase = null;
+    progBar.style.width = '100%';
+    setStatus('Fetching embeddings…');
+    worker.postMessage({ type: 'get_embeddings_exp6', jobId: activeJobId });
+  } finally {
+    release();
+  }
+}
+
 async function startEncode() {
   if (!worker) initWorker();
 
@@ -2371,7 +2526,13 @@ async function startEncode() {
     pendingCacheKeyB = keyB;
   }
 
-  // ── Encode via worker ─────────────────────────────────────────────────────────
+  // ── Parallel path: 48k stateless segments are independent → encode in a pool ──
+  if (modelHz === '48k' && !statefulOla) {
+    runParallelEncode48k(audioA, audioB, srcCh, myRun);
+    return;
+  }
+
+  // ── Sequential encode via the primary worker (24k, or 48k stateful) ───────────
   pendingAudioB = audioB;
   encodePhase   = 'A';
   activeJobId   = ++jobSeq;
@@ -4200,7 +4361,7 @@ initHelpTips({
   '.mp-frame':  'Streaming frame size in samples per encoder call.',
 
   // 48k OLA continuity
-  '#togStatefulOla': 'Stateful: carry encoder/decoder LSTM state across the 48 kHz 1 s OLA segments — smoother across boundaries (default). Stateless: reset state per segment, making segments independent (and parallelisable); closer to stock EnCodec but can reintroduce faint seams. Changes the embeddings, so it re-encodes; stateless bypasses the analysis cache.',
+  '#togStatefulOla': 'Stateless (default): reset LSTM state per 48 kHz 1 s segment → segments are independent and encode in PARALLEL across a worker pool (~3× faster); closer to stock EnCodec. Stateful: carry encoder/decoder state across segments — smoother across boundaries but sequential. Changes the embeddings, so it re-encodes; stateless bypasses the analysis cache.',
 
   // Embedding space tabs + level picker
   '#togPreVQMode':  'Map the encoder’s continuous embeddings, before quantisation. Most detailed space; requires a re-encode if loaded from cache.',

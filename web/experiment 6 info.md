@@ -22,7 +22,8 @@ VIEWPORT (pan/zoom) and PLAYBACK_TICK are orthogonal — they only affect render
 ```js
 // Sources
 rawAudioA, rawAudioB, modelHz
-statefulOla          // 48k: carry LSTM state across OLA segments (false = reset per chunk)
+statefulOla          // 48k: carry LSTM state across OLA segments (false = reset per chunk; default false → parallel encode)
+encPool              // persistent pool of encode workers for parallel 48k-stateless segments
 durA, durB               // actual loaded duration (s) per source; null until first encode
 
 // Analysis cache (IndexedDB via encodec-cache.js)
@@ -491,7 +492,20 @@ Two encode-message flags, both 48k-relevant:
 
 - **`skipPreview`** (exp6 always sends `true`): the per-segment `decodeFromLatents` in `encodeAndCapture48k`/`24k` produces a decoded *preview* (`outBuf`) that exp6's `'result'` handler discards — only the captures (codes/embQuant/scales) are used. Skipping it removes a full decoder conv stack per segment plus the decoder LSTM chain: **measured 1.86× faster** 48k encode (the decode was ~46% of encode time). Default `false`, so experiments 2–5 keep their preview.
 
-- **`statefulOLA`** (UI toggle "48k OLA", shown only on 48k, default `true` = "Stateful"): controls whether the encoder/decoder LSTM state is carried across the 1 s OLA segments (`if (statefulOLA) { hEnc = cap.hEncNew; ... }`) or reset to zero per segment. Stateful = the fork's cross-boundary continuity; **Stateless** makes segments independent (parallelisable) and closer to stock EnCodec, at the cost of faint boundary seams (guard frames still warm the conv stack). It changes the embeddings — chunk 0 is identical between modes (both start zero-state), divergence begins after the first segment boundary (measured ~2% on later frames). Toggling re-encodes (`currentEmbeds = null; scheduleEncode`). **Stateless bypasses the analysis cache** (`cacheable = modelHz !== '48k' || statefulOla`) since it has no key disambiguator against the stateful entries.
+- **`statefulOLA`** (UI toggle "48k OLA", shown only on 48k, default `false` = "Stateless"): controls whether the encoder/decoder LSTM state is carried across the 1 s OLA segments (`if (statefulOLA) { hEnc = cap.hEncNew; ... }`) or reset to zero per segment. Stateful = the fork's cross-boundary continuity (sequential); **Stateless** (default) makes segments independent and closer to stock EnCodec, at the cost of faint boundary seams (guard frames still warm the conv stack). It changes the embeddings — chunk 0 is identical between modes (both start zero-state), divergence begins after the first segment boundary (measured ~2% on later frames). Toggling re-encodes (`currentEmbeds = null; scheduleEncode`). **Stateless bypasses the analysis cache** (`cacheable = modelHz !== '48k' || statefulOla`) since it has no key disambiguator against the stateful entries.
+
+### Parallel encode (48k stateless)
+
+Because stateless segments are independent, the 1 s chunks encode concurrently across a **persistent worker pool** (`ensureEncPool`, K = min(cores, 6) workers each with their own ONNX sessions). Flow:
+
+1. `startEncode` branches to `runParallelEncode48k` when `modelHz === '48k' && !statefulOla`.
+2. `sliceSegments48k` cuts each source's planar audio into the exact same guarded chunks as `encodeAndCapture48k` (must match — same geometry constants `SEG_48_M/STRIDE_48_M/HOP_48_M/GUARD_48_M`).
+3. All A+B segment chunks dispatch across the pool (`doParallelBatch`); each pool worker runs `encode_segment` → `encodeCapture` with zero state and returns the cap (chunk transferred in).
+4. Main thread reassembles per-source `{mode:'ola48', totalLen, segments}`, ships them to the **primary** worker via `set_captures`, then sends the usual `get_embeddings_exp6`. So `captureCache`, `get_embeddings_exp6`, decode, and explore-click all work **unchanged** — the caps just arrive pre-computed.
+
+Batches are serialised (`encodeBatchPromise`) so two never overlap on the pool (no stale-slot reuse); a superseded run is discarded via the `myRun`/`encodeRunSeq` guard before results are applied; a segment error rebuilds the pool clean. **Output is bit-identical to the sequential stateless path** (same chunks, zero state each — verified: early/late embedding checksums match to full float precision). Measured: clean sequential 2-source encode 8.1 s → parallel end-to-end ~3.0 s (encode-only speedup higher; bounded by the segment-wave count over the pool size).
+
+24k and 48k-stateful keep the sequential primary-worker path.
 
 ---
 
