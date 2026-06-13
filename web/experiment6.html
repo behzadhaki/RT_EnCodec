@@ -347,10 +347,22 @@ restoreSession();
 const mp = createModelPanel({
   defaultModel: '48k',
   defaultBw:    24,
-  onChange: () => { currentEmbeds = null; refreshDropdowns(); scheduleEncode(0); },
+  onChange: () => { currentEmbeds = null; refreshDropdowns(); updateEncOptVisibility(); scheduleEncode(0); },
 });
 controls.appendChild(mp.modelSection);
 controls.appendChild(mp.modeSection);
+
+// 48k-only encode option: LSTM state continuity across OLA segments.
+const encOptSection = document.createElement('div');
+encOptSection.className = 'section';
+encOptSection.id = 'encOptSection';
+encOptSection.innerHTML = `
+  <div class="row" id="statefulOlaRow">
+    <span class="lbl">48k OLA</span>
+    <button class="tog active" id="togStatefulOla">Stateful</button>
+  </div>
+`.trim();
+controls.appendChild(encOptSection);
 
 const umapSection = document.createElement('div');
 umapSection.className = 'section';
@@ -751,6 +763,8 @@ let currentEmbeds = null;
 let codebooks     = null;
 let codebooksFor  = null;
 let encodeTimer   = null;
+let statefulOla   = true;   // 48k: carry encoder/decoder LSTM state across OLA segments
+                            // (false = reset per chunk → independent segments)
 
 // UMAP
 let umapWorker      = null;
@@ -2300,11 +2314,14 @@ async function startEncode() {
   // ── Cache lookup (only when both sources are files with valid CRCs) ───────────
   // segEnd is the planar array length, so stereo entries never collide with
   // legacy dual-mono ones (2T vs T); channels is stored for display.
+  // Stateless 48k OLA produces different embeddings than the cached (stateful)
+  // ones and has no key disambiguator, so it bypasses the cache entirely.
   const modelOpts = { modelHz, bwKbps, sampleRate: sr, channels: srcCh };
+  const cacheable  = modelHz !== '48k' || statefulOla;
   pendingCacheKeyA = null;
   pendingCacheKeyB = null;
 
-  if (crcA && crcB) {
+  if (crcA && crcB && cacheable) {
     const keyA = makeCacheKey(fileA, crcA, modelOpts, audioA.length);
     const keyB = makeCacheKey(fileB, crcB, modelOpts, audioB.length);
 
@@ -2371,6 +2388,8 @@ async function startEncode() {
     bwKbps,
     streaming: mp.isStreaming(),
     frameSize: mp.getFrameSize(),
+    skipPreview: true,   // exp6 uses only the captures; the decoded preview is discarded
+    statefulOLA: statefulOla,
   });
 }
 
@@ -2385,6 +2404,8 @@ function startEncodeB() {
     bwKbps:    mp.getBwKbps(),
     streaming: mp.isStreaming(),
     frameSize: mp.getFrameSize(),
+    skipPreview: true,
+    statefulOLA: statefulOla,
   });
   pendingAudioB = null;
 }
@@ -2417,6 +2438,8 @@ function startPreVQEncode() {
     modelHz, bwKbps,
     streaming: mp.isStreaming(),
     frameSize: mp.getFrameSize(),
+    skipPreview: true,
+    statefulOLA: statefulOla,
   });
 }
 
@@ -2555,6 +2578,22 @@ togScaleFeat.addEventListener('click', () => {
   togScaleFeat.textContent = scaleFeatEnabled ? 'On' : 'Off';
   markDirty('COORDS', 'WAYPOINTS', 'AUDIO', 'RENDER');
 });
+
+// 48k stateful vs stateless OLA — changes the embeddings, so re-encode.
+// (Row is hidden on 24k, where the OLA segments don't carry LSTM state.)
+const togStatefulOla = document.getElementById('togStatefulOla');
+togStatefulOla.addEventListener('click', () => {
+  statefulOla = !statefulOla;
+  togStatefulOla.classList.toggle('active', statefulOla);
+  togStatefulOla.textContent = statefulOla ? 'Stateful' : 'Stateless';
+  currentEmbeds = null;
+  scheduleEncode(0);
+});
+
+function updateEncOptVisibility() {
+  document.getElementById('statefulOlaRow').style.display = mp.getModelHz() === '48k' ? '' : 'none';
+}
+updateEncOptVisibility();
 
 document.getElementById('togUMAPMode') .addEventListener('click', () => setProjectionMode('umap'));
 document.getElementById('togPCAMode')  .addEventListener('click', () => setProjectionMode('pca'));
@@ -4159,6 +4198,9 @@ initHelpTips({
   '.mp-ns':     'Encode the whole signal in one pass (24 kHz only).',
   '.mp-s':      'Encode in fixed-size frames with LSTM state carried across calls — simulates real-time streaming (24 kHz only).',
   '.mp-frame':  'Streaming frame size in samples per encoder call.',
+
+  // 48k OLA continuity
+  '#togStatefulOla': 'Stateful: carry encoder/decoder LSTM state across the 48 kHz 1 s OLA segments — smoother across boundaries (default). Stateless: reset state per segment, making segments independent (and parallelisable); closer to stock EnCodec but can reintroduce faint seams. Changes the embeddings, so it re-encodes; stateless bypasses the analysis cache.',
 
   // Embedding space tabs + level picker
   '#togPreVQMode':  'Map the encoder’s continuous embeddings, before quantisation. Most detailed space; requires a re-encode if loaded from cache.',

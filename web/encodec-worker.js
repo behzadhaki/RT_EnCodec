@@ -641,18 +641,22 @@ const captureCache = { A: null, B: null };
 
 // Encode one source, store captures, and return the decoded audio for display.
 async function runEncode(msg) {
-  const { jobId, source, audio, modelHz, bwKbps, streaming, frameSize, channels = 1 } = msg;
+  const { jobId, source, audio, modelHz, bwKbps, streaming, frameSize, channels = 1,
+          skipPreview = false, statefulOLA = true } = msg;
 
   try {
     self.postMessage({ type: 'progress', jobId, value: 0, status: 'Loading models…' });
     await ensureSessions(modelHz, bwKbps);
     if (currentJobId !== jobId) return;
 
+    // skipPreview: callers that only need the captures (e.g. experiment 6, which
+    // discards the decoded preview) skip the per-segment decode_audio pass —
+    // roughly halves 48k encode time at zero cost since the output is unused.
     let decoded, captures;
     if (modelHz === '48k') {
-      [decoded, captures] = await encodeAndCapture48k(audio, jobId, channels);
+      [decoded, captures] = await encodeAndCapture48k(audio, jobId, channels, skipPreview, statefulOLA);
     } else {
-      [decoded, captures] = await encodeAndCapture24k(audio, streaming, frameSize, jobId);
+      [decoded, captures] = await encodeAndCapture24k(audio, streaming, frameSize, jobId, skipPreview);
     }
 
     if (decoded === null) return;   // cancelled
@@ -666,13 +670,18 @@ async function runEncode(msg) {
 
 // Encode full audio, capture intermediate tensors, decode for display.
 // Non-streaming: single pass.  Streaming: OLA with encoder state carried.
-async function encodeAndCapture24k(audio, streaming, frameSize, jobId) {
+async function encodeAndCapture24k(audio, streaming, frameSize, jobId, skipPreview = false) {
   const totalLen = audio.length;
 
   if (!streaming) {
     self.postMessage({ type: 'progress', jobId, value: 0.3, status: 'Encoding…' });
     const cap = await encodeCapture(audio.slice(), '24k', zeroState(1), zeroState(1));
     if (currentJobId !== jobId) return [null, null];
+
+    if (skipPreview) {
+      self.postMessage({ type: 'progress', jobId, value: 1.0, status: 'Done.' });
+      return [new Float32Array(0), { mode: 'single', cap, totalLen }];
+    }
 
     self.postMessage({ type: 'progress', jobId, value: 0.7, status: 'Decoding…' });
     const dec = await decodeFromLatents(
@@ -696,8 +705,8 @@ async function encodeAndCapture24k(audio, streaming, frameSize, jobId) {
     win[i] = 0.5 - Math.abs(t - 0.5);
   }
 
-  const outBuf  = new Float32Array(totalLen);
-  const wgtBuf  = new Float32Array(totalLen);
+  const outBuf  = skipPreview ? null : new Float32Array(totalLen);
+  const wgtBuf  = skipPreview ? null : new Float32Array(totalLen);
   const numSegs = Math.ceil(totalLen / stride);
   const chunks  = [];
 
@@ -716,17 +725,19 @@ async function encodeAndCapture24k(audio, streaming, frameSize, jobId) {
     const cap = await encodeCapture(chunk, '24k', hEnc, cEnc);
     hEnc = cap.hEncNew; cEnc = cap.cEncNew;
 
-    const dec = await decodeFromLatents(
-      cap.emb_quant, cap.embQuantDims, cap.scale, cap.scaleDims,
-      '24k', hDec, cDec);
-    hDec = dec.hDecNew; cDec = dec.cDecNew;
-
     chunks.push({ cap, srcS, srcE, off });
 
-    for (let i = srcS - off; i < srcE - off; i++) {
-      const pos = off + i;
-      outBuf[pos] += win[i] * dec.outAudio[i];
-      wgtBuf[pos] += win[i];
+    if (!skipPreview) {
+      if (currentJobId !== jobId) return [null, null];
+      const dec = await decodeFromLatents(
+        cap.emb_quant, cap.embQuantDims, cap.scale, cap.scaleDims,
+        '24k', hDec, cDec);
+      hDec = dec.hDecNew; cDec = dec.cDecNew;
+      for (let i = srcS - off; i < srcE - off; i++) {
+        const pos = off + i;
+        outBuf[pos] += win[i] * dec.outAudio[i];
+        wgtBuf[pos] += win[i];
+      }
     }
 
     self.postMessage({
@@ -736,6 +747,7 @@ async function encodeAndCapture24k(audio, streaming, frameSize, jobId) {
     });
   }
 
+  if (skipPreview) return [new Float32Array(0), { mode: 'ola24', stride, seg, win, totalLen, chunks }];
   for (let i = 0; i < totalLen; i++) {
     if (wgtBuf[i] > 0) outBuf[i] /= wgtBuf[i];
   }
@@ -747,10 +759,13 @@ async function encodeAndCapture24k(audio, streaming, frameSize, jobId) {
 // channels = 2: audio is planar stereo [2*totalLen] (L plane, R plane) and each
 // segment chunk is sliced per plane so the encoder sees real L/R. The decoded
 // preview (outBuf) stays mono either way — it's display-only.
-async function encodeAndCapture48k(audio, jobId, channels = 1) {
+// statefulOLA = false: reset LSTM state per segment (encoder/decoder both start
+// from zero each chunk) — segments become independent (parallelisable), at the
+// cost of the cross-boundary continuity. Guard frames still warm the conv stack.
+async function encodeAndCapture48k(audio, jobId, channels = 1, skipPreview = false, statefulOLA = true) {
   const totalLen = audio.length / channels;
-  const outBuf   = new Float32Array(totalLen);
-  const wgtBuf   = new Float32Array(totalLen);
+  const outBuf   = skipPreview ? null : new Float32Array(totalLen);
+  const wgtBuf   = skipPreview ? null : new Float32Array(totalLen);
   const numSegs  = Math.ceil(totalLen / STRIDE_48);
   const segments = [];
 
@@ -772,20 +787,25 @@ async function encodeAndCapture48k(audio, jobId, channels = 1) {
       chunk.set(audio.subarray(srcOff, srcOff + n), ch * extLen);
     }
 
+    // Stateless mode keeps hEnc/cEnc at their initial zero state every chunk.
     const cap = await encodeCapture(chunk, '48k', hEnc, cEnc, leftGuardFrames, channels);
-    hEnc = cap.hEncNew; cEnc = cap.cEncNew;
-
-    const dec = await decodeFromLatents(
-      cap.emb_quant, cap.embQuantDims, cap.scale, cap.scaleDims,
-      '48k', hDec, cDec);
-    hDec = dec.hDecNew; cDec = dec.cDecNew;
+    if (statefulOLA) { hEnc = cap.hEncNew; cEnc = cap.cEncNew; }
 
     const validEnd = Math.min(offset + SEG_48, totalLen);
     segments.push({ cap, offset, validEnd });
 
-    for (let i = 0; i < validEnd - offset; i++) {
-      outBuf[offset + i] += TRI_WIN_48[i] * dec.outAudio[i];
-      wgtBuf[offset + i] += TRI_WIN_48[i];
+    // Preview decode — display-only, skipped when the caller discards it.
+    // Carries decoder LSTM state, so it's a second sequential chain we avoid entirely.
+    if (!skipPreview) {
+      if (currentJobId !== jobId) return [null, null];
+      const dec = await decodeFromLatents(
+        cap.emb_quant, cap.embQuantDims, cap.scale, cap.scaleDims,
+        '48k', hDec, cDec);
+      if (statefulOLA) { hDec = dec.hDecNew; cDec = dec.cDecNew; }
+      for (let i = 0; i < validEnd - offset; i++) {
+        outBuf[offset + i] += TRI_WIN_48[i] * dec.outAudio[i];
+        wgtBuf[offset + i] += TRI_WIN_48[i];
+      }
     }
 
     self.postMessage({
@@ -795,6 +815,7 @@ async function encodeAndCapture48k(audio, jobId, channels = 1) {
     });
   }
 
+  if (skipPreview) return [new Float32Array(0), { mode: 'ola48', totalLen, segments }];
   for (let i = 0; i < totalLen; i++) {
     if (wgtBuf[i] > 0) outBuf[i] /= wgtBuf[i];
   }

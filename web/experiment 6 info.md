@@ -22,6 +22,7 @@ VIEWPORT (pan/zoom) and PLAYBACK_TICK are orthogonal — they only affect render
 ```js
 // Sources
 rawAudioA, rawAudioB, modelHz
+statefulOla          // 48k: carry LSTM state across OLA segments (false = reset per chunk)
 durA, durB               // actual loaded duration (s) per source; null until first encode
 
 // Analysis cache (IndexedDB via encodec-cache.js)
@@ -481,6 +482,16 @@ The 48k model is natively stereo (C=2, joint embedding for the pair); the 24k mo
 - **Consequence**: grain concatenation splices stereo images too — two timbrally similar grains with opposite panning are *different* latents and may sit apart on the map. Panning is part of the granular texture now.
 
 `durA`/`durB` and all FPS math use frames (`audio.length / srcCh / sr`). The 24k path is byte-identical to before (channels = 1 defaults everywhere).
+
+---
+
+## Encode performance — `skipPreview`, `statefulOLA`
+
+Two encode-message flags, both 48k-relevant:
+
+- **`skipPreview`** (exp6 always sends `true`): the per-segment `decodeFromLatents` in `encodeAndCapture48k`/`24k` produces a decoded *preview* (`outBuf`) that exp6's `'result'` handler discards — only the captures (codes/embQuant/scales) are used. Skipping it removes a full decoder conv stack per segment plus the decoder LSTM chain: **measured 1.86× faster** 48k encode (the decode was ~46% of encode time). Default `false`, so experiments 2–5 keep their preview.
+
+- **`statefulOLA`** (UI toggle "48k OLA", shown only on 48k, default `true` = "Stateful"): controls whether the encoder/decoder LSTM state is carried across the 1 s OLA segments (`if (statefulOLA) { hEnc = cap.hEncNew; ... }`) or reset to zero per segment. Stateful = the fork's cross-boundary continuity; **Stateless** makes segments independent (parallelisable) and closer to stock EnCodec, at the cost of faint boundary seams (guard frames still warm the conv stack). It changes the embeddings — chunk 0 is identical between modes (both start zero-state), divergence begins after the first segment boundary (measured ~2% on later frames). Toggling re-encodes (`currentEmbeds = null; scheduleEncode`). **Stateless bypasses the analysis cache** (`cacheable = modelHz !== '48k' || statefulOla`) since it has no key disambiguator against the stateful entries.
 
 ---
 
