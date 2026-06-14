@@ -1,4 +1,5 @@
 export const MAX_S = 10;
+export const PEAK_TARGET = 0.75; // loaded sources are peak-normalised to this
 
 // Returns a raw (un-normalized) Float32Array for the given synth type.
 export function generateSource(type, freq, dur, sr) {
@@ -83,7 +84,7 @@ export async function loadFile(file, sr, maxS = MAX_S, channels = 1) {
     const out = new Float32Array(2 * T);
     out.set(rendered.getChannelData(0), 0);
     out.set(rendered.getChannelData(Math.min(1, rendered.numberOfChannels - 1)), T);
-    return out;
+    return normalizePeak(out, PEAK_TARGET); // match loaded sources to a common peak
   }
 
   const mono = new Float32Array(rendered.length);
@@ -91,7 +92,7 @@ export async function loadFile(file, sr, maxS = MAX_S, channels = 1) {
     const d = rendered.getChannelData(ch);
     for (let i = 0; i < rendered.length; i++) mono[i] += d[i] / rendered.numberOfChannels;
   }
-  return mono;
+  return normalizePeak(mono, PEAK_TARGET);
 }
 
 export const MAX_FOLDER_FILES = 20;

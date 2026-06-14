@@ -378,8 +378,16 @@ umapSection.innerHTML = `
   <div class="row" style="gap:3px">
     <button class="tog active" id="togUMAPMode"  style="flex:1">UMAP</button>
     <button class="tog"        id="togPCAMode"   style="flex:1">PCA</button>
+    <button class="tog"        id="togMDSMode"   style="flex:1">MDS</button>
     <button class="tog"        id="togWheelMode" style="flex:1">Wheel</button>
     <button class="tog"        id="togSSMMode"   style="flex:1">SSM</button>
+  </div>
+  <div class="row" id="embedInputRow" style="display:none">
+    <span class="lbl">Embed from</span>
+    <div style="display:flex;gap:3px">
+      <button class="tog active" id="togEmbedFeat">Features</button>
+      <button class="tog"        id="togEmbedSSM">SSM</button>
+    </div>
   </div>
   <div class="row" id="ssmResRow" style="display:none">
     <span class="lbl">Resolution</span>
@@ -398,6 +406,7 @@ umapSection.innerHTML = `
     <div style="display:flex;gap:3px">
       <button class="tog active" id="togWheelAngleUMAP">UMAP 1-D</button>
       <button class="tog"        id="togWheelAnglePC1">PC1</button>
+      <button class="tog"        id="togWheelAngleMDS">MDS 1-D</button>
     </div>
   </div>
   <div class="row" id="wheelRadiusRow" style="display:none">
@@ -406,6 +415,7 @@ umapSection.innerHTML = `
       <button class="tog active" id="togWheelLoud">Loud</button>
       <button class="tog"        id="togWheelTime">Time</button>
       <button class="tog"        id="togWheelAtyp">Atyp</button>
+      <button class="tog"        id="togWheelTyp">Typ</button>
     </div>
   </div>
   <div class="row" id="wheelScaleRow" style="display:none">
@@ -428,7 +438,7 @@ umapSection.innerHTML = `
     <input type="number" id="umapWindow" value="1" min="1" max="16" step="1">
     <span style="font-size:11px;color:var(--muted);margin-left:2px">frames</span>
   </div>
-  <div class="row">
+  <div class="row" id="ctxDirRow">
     <span class="lbl">Direction</span>
     <div style="display:flex;gap:3px">
       <button class="tog"        id="togCtxPast">Past</button>
@@ -436,7 +446,7 @@ umapSection.innerHTML = `
       <button class="tog"        id="togCtxFuture">Future</button>
     </div>
   </div>
-  <div class="row">
+  <div class="row" id="ctxWeightRow">
     <span class="lbl">Weighting</span>
     <div style="display:flex;gap:3px">
       <button class="tog"        id="togWinFlat">Flat</button>
@@ -455,11 +465,6 @@ umapSection.innerHTML = `
       <button class="tog active" id="togMetricEuc">Euclid</button>
       <button class="tog"        id="togMetricCos">Cosine</button>
     </div>
-  </div>
-  <div class="row" id="scaleFeatRow">
-    <span class="lbl">Loudness</span>
-    <button class="tog" id="togScaleFeat">Off</button>
-    <span style="font-size:11px;color:var(--muted);margin-left:4px">log(scale) · 48k</span>
   </div>
   <div class="row" id="dedupRow">
     <span class="lbl">Dedup</span>
@@ -805,9 +810,14 @@ const PRE_REDUCE_VAR  = 0.95;  // target cumulative explained variance
 let coordsA         = null;
 let coordsB         = null;
 
-// Projection mode — 'umap' | 'pca' | 'wheel' | 'ssm'
+// Projection mode — 'umap' | 'pca' | 'wheel' | 'ssm' | 'mds'
 let projectionMode  = 'umap';
 let pcaCoords       = null;  // {coordsA, coordsB} — cached PCA result for current features
+let mdsCoords       = null;  // {coordsA, coordsB} — cached classical-MDS-on-SSM result
+
+// Projection input for UMAP/PCA — 'features' (z-scored flat) or 'ssm' (pooled
+// SSM rows). MDS is always SSM-based; SSM/wheel ignore this.
+let embedInput      = 'features';
 
 // SSM state (joint-only: A·A | A·B | B·B)
 let ssmBudget       = 1024;       // pixel budget P — caps the matrix at P×P (temporal pooling)
@@ -1377,6 +1387,29 @@ function renderScatter() {
   if (result !== null) lastTransform = result;
 }
 
+// Typicality = mean cosine similarity of each frame to all frames (the SSM
+// row-marginal, computed directly from features). Used by the wheel Typ radius.
+function computeTypicality(flat, N, D) {
+  // mean cosine similarity to all frames = alignment with the centroid of the
+  // L2-normalised frames (the SSM row-marginal, computed directly from features).
+  const c = new Float64Array(D);
+  const inv = new Float64Array(N);
+  for (let i = 0; i < N; i++) {
+    let s = 0; const off = i * D;
+    for (let d = 0; d < D; d++) s += flat[off + d] * flat[off + d];
+    inv[i] = s > 1e-12 ? 1 / Math.sqrt(s) : 0;
+    for (let d = 0; d < D; d++) c[d] += flat[off + d] * inv[i];
+  }
+  for (let d = 0; d < D; d++) c[d] /= N;
+  const out = new Float32Array(N);
+  for (let i = 0; i < N; i++) {
+    let s = 0; const off = i * D;
+    for (let d = 0; d < D; d++) s += flat[off + d] * inv[i] * c[d];
+    out[i] = s;
+  }
+  return out;
+}
+
 // ── SSM heatmap render ───────────────────────────────────────────────────────
 // Draws ssmImage (a w×h colour-mapped matrix) into umapCanvas, fit to the
 // available area preserving aspect, with axis labels, seam guides (joint scope),
@@ -1661,7 +1694,7 @@ function initWorker() {
 
 function initUMAPWorker() {
   if (umapWorker) umapWorker.terminate();
-  umapWorker = new Worker(new URL('./umap-worker.js?v=6', import.meta.url), { type: 'module' });
+  umapWorker = new Worker(new URL('./umap-worker.js?v=7', import.meta.url), { type: 'module' });
   umapWorker.onmessage = onUMAPWorkerMsg;
 }
 
@@ -1745,13 +1778,15 @@ function onUMAPWorkerMsg({ data: msg }) {
   // ── PCA result ─────────────────────────────────────────────────────────────
   if (msg.type === 'pca_result') {
     const { result, T_A, T_B } = msg;
-    const slot = { coordsA: [], coordsB: [] };
-    for (let i = 0; i < T_A; i++) slot.coordsA.push([result[i * 2], result[i * 2 + 1]]);
-    for (let i = 0; i < T_B; i++) slot.coordsB.push([result[(T_A + i) * 2], result[(T_A + i) * 2 + 1]]);
+    const superA = [], superB = [];
+    for (let i = 0; i < T_A; i++) superA.push([result[i * 2], result[i * 2 + 1]]);
+    for (let i = 0; i < T_B; i++) superB.push([result[(T_A + i) * 2], result[(T_A + i) * 2 + 1]]);
+    const slot = expandSlot(superA, superB);   // no-op unless PCA-from-SSM
     pcaCoords = slot;
 
-    // Stash PC1 — wheel mode derives its angle from it (rank-wrapped).
-    if (umapFeatureData) {
+    // Stash PC1 for the wheel angle — only when PCA ran on the per-frame
+    // features (SSM-PCA is super-frame indexed and would mismatch the wheel).
+    if (umapFeatureData && !umapFeatureData.projExpand) {
       const pc1 = new Float32Array(T_A + T_B);
       for (let i = 0; i < T_A + T_B; i++) pc1[i] = result[i * 2];
       umapFeatureData.pc1 = pc1;
@@ -1781,6 +1816,48 @@ function onUMAPWorkerMsg({ data: msg }) {
   } else if (msg.type === 'pca_error') {
     progWrap.style.display = 'none';
     setStatus(msg.message, true);
+    return;
+  }
+
+  // ── MDS result (classical MDS on the SSM) ──────────────────────────────────
+  if (msg.type === 'mds_result') {
+    const si = umapFeatureData?.projExpand;
+    if (!si) { progWrap.style.display = 'none'; return; }
+    const { result } = msg;
+    const superA = [], superB = [];
+    for (let i = 0; i < si.pA; i++)      superA.push([result[i * 2], result[i * 2 + 1]]);
+    for (let i = 0; i < si.pB; i++)      superB.push([result[(si.pA + i) * 2], result[(si.pA + i) * 2 + 1]]);
+    const slot = expandSlot(superA, superB);
+    mdsCoords = slot;
+
+    // Stash the 1-D MDS (first component, per frame) for the wheel angle.
+    if (umapFeatureData) {
+      const mds1d = new Float32Array(si.T_A + si.T_B);
+      for (let t = 0; t < si.T_A; t++) mds1d[t]            = slot.coordsA[t][0];
+      for (let t = 0; t < si.T_B; t++) mds1d[si.T_A + t]   = slot.coordsB[t][0];
+      umapFeatureData.mds1d = mds1d;
+    }
+
+    if (projectionMode === 'wheel' && wheelAngle === 'mds1d') {
+      progWrap.style.display = 'none';
+      applyWheelCoords();
+      markDirty('WAYPOINTS', 'AUDIO', 'RENDER');
+      return;
+    }
+
+    viewZoom = 1; viewPanX = 0; viewPanY = 0;
+    rawDrawSegments = []; rawDrawPoints = []; drawSegmentBoundaries = []; clearSoloState();
+    userTrajectory = pinPoints.length >= 2 ? resamplePath(pinCoords(), 300) : [];
+    coordsA = slot.coordsA;
+    coordsB = slot.coordsB;
+    progWrap.style.display = 'none';
+    setStatus(`MDS — ${si.pA + si.pB} super-frames · ${si.T_A + si.T_B} frames`);
+    markDirty('WAYPOINTS', 'AUDIO', 'RENDER');
+    return;
+
+  } else if (msg.type === 'mds_error') {
+    progWrap.style.display = 'none';
+    setStatus('MDS: ' + msg.message, true);
     return;
   }
 
@@ -1836,6 +1913,11 @@ function onUMAPWorkerMsg({ data: msg }) {
       for (let i = 0; i < T_A; i++) slot.coordsA.push([result[i * 2], result[i * 2 + 1]]);
       for (let i = 0; i < T_B; i++) slot.coordsB.push([result[(T_A + i) * 2], result[(T_A + i) * 2 + 1]]);
     }
+    // UMAP-from-SSM fits the ≤P super-frames; expand each to its frames.
+    if (umapFeatureData?.projExpand) {
+      const fin = expandSlot(slot.coordsA, slot.coordsB);
+      slot.coordsA = fin.coordsA; slot.coordsB = fin.coordsB;
+    }
     umapSlots[slotIdx] = slot;
     updateSlotDots();
 
@@ -1882,11 +1964,92 @@ function onUMAPWorkerMsg({ data: msg }) {
   }
 }
 
+// ── SSM as a projection input ───────────────────────────────────────────────
+// The pooled joint cosine SSM (the same matrix the heatmap uses) doubles as the
+// input for MDS / UMAP-on-SSM / PCA-on-SSM. It embeds the ≤P super-frames; each
+// real frame then inherits its super-frame's 2-D coordinate (expandSlot).
+
+// frame → super-frame index map, matching ssm-worker's poolRows boundaries.
+function sfMap(T, p) {
+  const map = new Int32Array(T);
+  for (let i = 0; i < p; i++) {
+    const lo = Math.floor((i * T) / p), hi = Math.floor(((i + 1) * T) / p);
+    for (let t = lo; t < hi; t++) map[t] = i;
+  }
+  return map;
+}
+
+// Compute (or return cached) the pooled SSM for the current features. Runs in a
+// short-lived worker so it never collides with the heatmap's ssmWorker state.
+function ensureSSMInput() {
+  const fd = umapFeatureData;
+  if (fd.ssmInput) return Promise.resolve(fd.ssmInput);
+  const P = Math.max(16, Math.min(4096, parseInt(ssmBudgetEl.value) || 1024));
+  return new Promise((resolve, reject) => {
+    const w = new Worker(new URL('./ssm-worker.js?v=2', import.meta.url), { type: 'module' });
+    w.onmessage = ({ data }) => {
+      if (data.type !== 'ssm_input_result') return;
+      const si = {
+        sim: new Float32Array(data.sim), pA: data.pA, pB: data.pB,
+        T_A: data.T_A, T_B: data.T_B,
+        sfA: sfMap(data.T_A, data.pA), sfB: sfMap(data.T_B, data.pB),
+      };
+      fd.ssmInput = si;
+      w.terminate();
+      resolve(si);
+    };
+    w.onerror = e => { w.terminate(); reject(new Error(e.message || 'SSM input failed')); };
+    w.postMessage({ type: 'compute_ssm_input', flat: fd.flat, T_A: fd.T_A, T_B: fd.T_B, D: fd.D, P });
+  });
+}
+
+// Expand super-frame coords (pA A-coords then pB B-coords) to one coord per
+// real frame, using the active projExpand map. No-op when not SSM-based.
+function expandSlot(superA, superB) {
+  const si = umapFeatureData?.projExpand;
+  if (!si) return { coordsA: superA, coordsB: superB };
+  const coordsA = new Array(si.T_A), coordsB = new Array(si.T_B);
+  for (let t = 0; t < si.T_A; t++) coordsA[t] = superA[si.sfA[t]];
+  for (let t = 0; t < si.T_B; t++) coordsB[t] = superB[si.sfB[t]];
+  return { coordsA, coordsB };
+}
+
+// ── MDS launch (classical MDS on the SSM) ───────────────────────────────────────
+
+function launchMDS() {
+  if (!umapFeatureData) return;
+  const sid = umapSessionId;
+  progWrap.style.display = 'block';
+  progBar.style.width = '15%';
+  setStatus('MDS — pooling SSM…');
+  ensureSSMInput().then(si => {
+    // Allowed for MDS scatter mode and the wheel's 1-D-MDS angle source.
+    const wheelMDS = projectionMode === 'wheel' && wheelAngle === 'mds1d';
+    if (umapSessionId !== sid || (projectionMode !== 'mds' && !wheelMDS)) return;
+    umapFeatureData.projExpand = si;
+    initUMAPWorker();
+    activeUMAPJobId = ++jobSeq;
+    progBar.style.width = '45%';
+    setStatus(`MDS — embedding SSM (${si.pA + si.pB} pts)…`);
+    umapWorker.postMessage({ type: 'compute_mds', jobId: activeUMAPJobId, sim: si.sim, N: si.pA + si.pB });
+  }).catch(err => { progWrap.style.display = 'none'; setStatus('MDS: ' + err.message, true); });
+}
+
 // ── PCA launch ─────────────────────────────────────────────────────────────────
 
 function launchPCA() {
   if (!umapFeatureData) return;
-  const { flat, T_A, T_B, D } = umapFeatureData;
+  const fd = umapFeatureData;
+  // PCA from SSM rows when selected (else the z-scored features). The wheel's
+  // PC1 angle always uses features (it indexes per-frame, not super-frame).
+  let flat, T_A, T_B, D;
+  if (embedInput === 'ssm' && fd.ssmInput && projectionMode === 'pca') {
+    flat = fd.ssmInput.sim; T_A = fd.ssmInput.pA; T_B = fd.ssmInput.pB; D = T_A + T_B;
+    fd.projExpand = fd.ssmInput;
+  } else {
+    ({ flat, T_A, T_B, D } = fd);
+    fd.projExpand = null;
+  }
 
   initUMAPWorker();
   activeUMAPJobId = ++jobSeq;
@@ -2017,6 +2180,11 @@ function wheelRadiusValues(fd) {
   if (wheelRadius === 'atyp') {
     return { rA: fd.featNorm.slice(0, T_A), rB: fd.featNorm.slice(T_A) };
   }
+  if (wheelRadius === 'typ') {
+    // Typicality = centroid alignment (SSM marginal), computed from features.
+    if (!fd.typicality) fd.typicality = computeTypicality(fd.flat, T_A + T_B, fd.D);
+    return { rA: fd.typicality.slice(0, T_A), rB: fd.typicality.slice(T_A) };
+  }
   // 'loud': per-frame log(scale) on 48k; raw-audio frame RMS otherwise.
   const logScales = s => Float32Array.from(s, v => Math.log(Math.max(v || 0, 1e-6)));
   const rA = currentEmbeds?.scalesA ? logScales(currentEmbeds.scalesA)
@@ -2031,12 +2199,15 @@ function wheelRadiusValues(fd) {
 // Angle source helpers. Both sources are cached on umapFeatureData (pc1 /
 // umap1d) so switching angle or radius never re-runs the worker once computed.
 function wheelAngleReady() {
-  return wheelAngle === 'pc1' ? !!umapFeatureData?.pc1 : !!umapFeatureData?.umap1d;
+  return wheelAngle === 'pc1'   ? !!umapFeatureData?.pc1
+       : wheelAngle === 'mds1d' ? !!umapFeatureData?.mds1d
+       :                          !!umapFeatureData?.umap1d;
 }
 
 function launchWheelAngle() {
-  if (wheelAngle === 'pc1') launchPCA();
-  else                      launchUMAP1D();
+  if (wheelAngle === 'pc1')        launchPCA();
+  else if (wheelAngle === 'mds1d') launchMDS();   // mds_result routes to wheel coords
+  else                             launchUMAP1D();
 }
 
 function launchUMAP1D() {
@@ -2059,7 +2230,9 @@ function launchUMAP1D() {
 
 function applyWheelCoords() {
   const fd = umapFeatureData;
-  const angleVals = wheelAngle === 'pc1' ? fd?.pc1 : fd?.umap1d;
+  const angleVals = wheelAngle === 'pc1'   ? fd?.pc1
+                  : wheelAngle === 'mds1d' ? fd?.mds1d
+                  :                          fd?.umap1d;
   if (!angleVals) return;
   const N = fd.T_A + fd.T_B;
 
@@ -2113,9 +2286,9 @@ function applyWheelCoords() {
   rawDrawSegments = []; rawDrawPoints = []; drawSegmentBoundaries = []; clearSoloState();
   userTrajectory = pinPoints.length >= 2 ? resamplePath(pinCoords(), 300) : [];
   progWrap.style.display = 'none';
-  const radLbl = { loud: 'loudness', time: 'time', atyp: 'atypicality' }[wheelRadius]
+  const radLbl = { loud: 'loudness', time: 'time', atyp: 'atypicality', typ: 'typicality' }[wheelRadius]
                + (wheelScale === 'rank' ? ' (rank)' : '');
-  const angLbl = wheelAngle === 'pc1' ? 'PC1 rank' : '1-D UMAP';
+  const angLbl = wheelAngle === 'pc1' ? 'PC1 rank' : wheelAngle === 'mds1d' ? 'MDS 1-D' : '1-D UMAP';
   setStatus(hadDrawTraj && pinPoints.length < 2
     ? 'Wheel updated — draw trajectory cleared. Redraw to regenerate.'
     : `Wheel — angle: ${angLbl} · radius: ${radLbl}`);
@@ -2127,17 +2300,20 @@ function setProjectionMode(mode) {
   projectionMode = mode;
   document.getElementById('togUMAPMode') .classList.toggle('active', mode === 'umap');
   document.getElementById('togPCAMode')  .classList.toggle('active', mode === 'pca');
+  document.getElementById('togMDSMode')  .classList.toggle('active', mode === 'mds');
   document.getElementById('togWheelMode').classList.toggle('active', mode === 'wheel');
   document.getElementById('togSSMMode')  .classList.toggle('active', mode === 'ssm');
+  const ssmInputActive = embedInput === 'ssm' && (mode === 'umap' || mode === 'pca');
   document.getElementById('neighborRow') .style.display = mode === 'umap' ? '' : 'none';
   document.getElementById('minDistRow')  .style.display = mode === 'umap' ? '' : 'none';
   document.getElementById('preReduceRow').style.display = mode === 'umap' ? '' : 'none';
   document.getElementById('metricRow')   .style.display = mode === 'umap' ? '' : 'none';
-  document.getElementById('dedupRow')    .style.display = mode === 'umap' ? '' : 'none';
+  document.getElementById('dedupRow')    .style.display = (mode === 'umap' && !ssmInputActive) ? '' : 'none';
   document.getElementById('wheelAngleRow') .style.display = mode === 'wheel' ? '' : 'none';
   document.getElementById('wheelRadiusRow').style.display = mode === 'wheel' ? '' : 'none';
   document.getElementById('wheelScaleRow') .style.display = mode === 'wheel' ? '' : 'none';
-  document.getElementById('ssmResRow')    .style.display = mode === 'ssm' ? '' : 'none';
+  document.getElementById('embedInputRow').style.display = (mode === 'umap' || mode === 'pca') ? '' : 'none';
+  document.getElementById('ssmResRow')    .style.display = (mode === 'ssm' || mode === 'mds' || ssmInputActive) ? '' : 'none';
   document.getElementById('ssmMetricRow') .style.display = mode === 'ssm' ? '' : 'none';
   document.getElementById('trajPanel')     .style.display = mode === 'ssm' ? 'none' : '';
   slotWrap.classList.toggle('visible', mode === 'umap' && umapSlots.some(s => s));
@@ -2146,7 +2322,17 @@ function setProjectionMode(mode) {
 
   if (!umapFeatureData) return; // nothing computed yet — triggerProjection() will dispatch when ready
 
-  if (mode === 'pca') {
+  if (mode === 'mds') {
+    if (mdsCoords) {
+      coordsA = mdsCoords.coordsA; coordsB = mdsCoords.coordsB;
+      umapFeatureData.projExpand = umapFeatureData.ssmInput; // keep expand consistent
+      viewZoom = 1; viewPanX = 0; viewPanY = 0;
+      setStatus('MDS');
+      markDirty('WAYPOINTS', 'AUDIO', 'RENDER');
+    } else {
+      launchMDS();
+    }
+  } else if (mode === 'pca') {
     if (pcaCoords) {
       // Already have a cached PCA result for current features — switch instantly.
       coordsA = pcaCoords.coordsA;
@@ -3005,11 +3191,21 @@ togPreVQMode .addEventListener('click', () => setUmapSpace('pre_vq'));
 togVQMode    .addEventListener('click', () => setUmapSpace('vq'));
 togPostVQMode.addEventListener('click', () => setUmapSpace('post_vq'));
 
+// Direction applies to both the context window AND the Δ difference, so it
+// shows whenever Context > 1 OR a Δ mode is active. Weighting only weights the
+// context slots, so it shows only when Context > 1.
+function updateCtxRowsVisibility() {
+  const K = Math.max(1, parseInt(umapWindowEl.value) || 1);
+  const isDelta = embMode === 'delta' || embMode === 'emb+delta';
+  document.getElementById('ctxDirRow')   .style.display = (K > 1 || isDelta) ? '' : 'none';
+  document.getElementById('ctxWeightRow').style.display = (K > 1) ? '' : 'none';
+}
+
 createToggleGroup([
   { el: document.getElementById('togEmbOnly'),  value: 'emb' },
   { el: document.getElementById('togEmbDelta'), value: 'emb+delta' },
   { el: document.getElementById('togDeltaOnly'), value: 'delta' },
-], v => { embMode = v; markDirty('COORDS', 'WAYPOINTS', 'AUDIO', 'RENDER'); });
+], v => { embMode = v; updateCtxRowsVisibility(); markDirty('COORDS', 'WAYPOINTS', 'AUDIO', 'RENDER'); });
 
 createToggleGroup([
   { el: document.getElementById('togCtxPast'),     value: 'past' },
@@ -3049,15 +3245,6 @@ document.getElementById('dedupThresh').addEventListener('change', () => {
   if (dedupEnabled && projectionMode === 'umap') markDirty('COORDS', 'WAYPOINTS', 'AUDIO', 'RENDER');
 });
 
-// Loudness feature changes the feature matrix → affects both UMAP and PCA.
-const togScaleFeat = document.getElementById('togScaleFeat');
-togScaleFeat.addEventListener('click', () => {
-  scaleFeatEnabled = !scaleFeatEnabled;
-  togScaleFeat.classList.toggle('active', scaleFeatEnabled);
-  togScaleFeat.textContent = scaleFeatEnabled ? 'On' : 'Off';
-  markDirty('COORDS', 'WAYPOINTS', 'AUDIO', 'RENDER');
-});
-
 // 48k stateful vs stateless OLA — changes the embeddings, so re-encode.
 // (Row is hidden on 24k, where the OLA segments don't carry LSTM state.)
 const togStatefulOla = document.getElementById('togStatefulOla');
@@ -3076,8 +3263,40 @@ updateEncOptVisibility();
 
 document.getElementById('togUMAPMode') .addEventListener('click', () => setProjectionMode('umap'));
 document.getElementById('togPCAMode')  .addEventListener('click', () => setProjectionMode('pca'));
+document.getElementById('togMDSMode')  .addEventListener('click', () => setProjectionMode('mds'));
 document.getElementById('togWheelMode').addEventListener('click', () => setProjectionMode('wheel'));
 document.getElementById('togSSMMode')  .addEventListener('click', () => setProjectionMode('ssm'));
+
+// Re-run the active scatter projection without rebuilding the feature matrix
+// (used when the embed-input or pooling budget changes).
+async function relaunchScatter() {
+  const fd = umapFeatureData;
+  if (!fd) return;
+  if (embedInput === 'ssm' && (projectionMode === 'umap' || projectionMode === 'pca' || projectionMode === 'mds')) {
+    try { await ensureSSMInput(); } catch (e) { setStatus('SSM input: ' + e.message, true); return; }
+  }
+  if (projectionMode === 'pca') { pcaCoords = null; launchPCA(); }
+  else if (projectionMode === 'mds') { mdsCoords = null; launchMDS(); }
+  else if (projectionMode === 'umap') {
+    umapSlots = Array(UMAP_N_SLOTS).fill(null); umapSlotIdx = 0;
+    fd.umapFlat = null; fd.reduced = false; fd.initCoords = null;
+    updateSlotDots(); startUMAPReduction();
+  }
+}
+
+// Embed-input: Features (z-scored flat) vs SSM (pooled similarity rows).
+createToggleGroup([
+  { el: document.getElementById('togEmbedFeat'), value: 'features' },
+  { el: document.getElementById('togEmbedSSM'),  value: 'ssm' },
+], v => {
+  embedInput = v;
+  const ssmInputActive = embedInput === 'ssm' && (projectionMode === 'umap' || projectionMode === 'pca');
+  document.getElementById('ssmResRow').style.display =
+    (projectionMode === 'ssm' || projectionMode === 'mds' || ssmInputActive) ? '' : 'none';
+  document.getElementById('dedupRow').style.display =
+    (projectionMode === 'umap' && !ssmInputActive) ? '' : 'none';
+  relaunchScatter();
+});
 
 // SSM controls — metric/resolution change only the matrix, not the feature
 // build, so they just relaunch the worker on the existing flat. (Scope is
@@ -3089,12 +3308,18 @@ createToggleGroup([
   { el: document.getElementById('togSSMMetricCos'), value: 'cosine' },
   { el: document.getElementById('togSSMMetricEuc'), value: 'euclidean' },
 ], v => { ssmMetric = v; recomputeSSMIfActive(); });
-ssmBudgetEl.addEventListener('change', recomputeSSMIfActive);
+ssmBudgetEl.addEventListener('change', () => {
+  if (umapFeatureData) umapFeatureData.ssmInput = null; // pooling budget changed
+  recomputeSSMIfActive();
+  if (projectionMode === 'mds' ||
+      (embedInput === 'ssm' && (projectionMode === 'umap' || projectionMode === 'pca'))) relaunchScatter();
+});
 
 // Wheel angle source — uses the cached PC1 / 1-D UMAP if available, else computes it.
 createToggleGroup([
   { el: document.getElementById('togWheelAngleUMAP'), value: 'umap1d' },
   { el: document.getElementById('togWheelAnglePC1'),  value: 'pc1' },
+  { el: document.getElementById('togWheelAngleMDS'),  value: 'mds1d' },
 ], v => {
   wheelAngle = v;
   if (projectionMode !== 'wheel' || !umapFeatureData) return;
@@ -3117,6 +3342,7 @@ createToggleGroup([
   { el: document.getElementById('togWheelLoud'), value: 'loud' },
   { el: document.getElementById('togWheelTime'), value: 'time' },
   { el: document.getElementById('togWheelAtyp'), value: 'atyp' },
+  { el: document.getElementById('togWheelTyp'),  value: 'typ' },
 ], v => { wheelRadius = v; wheelRadiusRefresh(); });
 
 createToggleGroup([
@@ -3139,7 +3365,8 @@ document.getElementById('togSrcB').addEventListener('click', () => {
 });
 
 // umapWindow affects the feature matrix → recompute everything.
-umapWindowEl.addEventListener('change', () => markDirty('COORDS', 'WAYPOINTS', 'AUDIO', 'RENDER'));
+umapWindowEl.addEventListener('change', () => { updateCtxRowsVisibility(); markDirty('COORDS', 'WAYPOINTS', 'AUDIO', 'RENDER'); });
+updateCtxRowsVisibility(); // initial state (Context defaults to 1 → both rows hidden)
 
 // nNeighbors / minDist only affect UMAP — skip recompute when in PCA mode.
 [nNeighborsEl, minDistEl].forEach(el =>
@@ -3529,6 +3756,7 @@ function triggerProjection() {
   umapSlotIdx     = 0;
   umapFeatureData = null;
   pcaCoords       = null;
+  mdsCoords       = null;
   ssmImage        = null;  // features changed — invalidate cached matrix
   updateSlotDots();
   slotWrap.classList.toggle('visible', projectionMode === 'umap');
@@ -3536,10 +3764,17 @@ function triggerProjection() {
   document.getElementById('preReduceInfo').textContent = '';
   document.getElementById('dedupInfo').textContent = '';
   buildUMAPFeatureData()
-    .then(fd => {
+    .then(async fd => {
       if (umapSessionId !== sid) return; // superseded by a newer call
       umapFeatureData = fd;
-      if (projectionMode === 'pca') {
+      // UMAP/PCA from SSM need the pooled SSM ready before launching.
+      if (embedInput === 'ssm' && (projectionMode === 'umap' || projectionMode === 'pca')) {
+        try { await ensureSSMInput(); } catch (e) { setStatus('SSM input: ' + e.message, true); return; }
+        if (umapSessionId !== sid) return;
+      }
+      if (projectionMode === 'mds') {
+        launchMDS();
+      } else if (projectionMode === 'pca') {
         launchPCA();
       } else if (projectionMode === 'wheel') {
         launchWheelAngle(); // result handler routes to wheel coords
@@ -3599,7 +3834,15 @@ function startUMAPReduction() {
   const fd = umapFeatureData;
   const dedupInfo = document.getElementById('dedupInfo');
 
-  if (!fd.umapFlat) {
+  // UMAP-from-SSM: fit the pooled SSM rows (no dedup); each super-frame is
+  // expanded back to its frames in the result handler.
+  if (embedInput === 'ssm' && fd.ssmInput) {
+    const si = fd.ssmInput;
+    fd.umapFlat = si.sim; fd.umapTA = si.pA; fd.umapTB = si.pB; fd.umapD = si.pA + si.pB;
+    fd.repMapA = null; fd.repMapB = null; fd.projExpand = si;
+    dedupInfo.textContent = '';
+  } else if (!fd.umapFlat) {
+    fd.projExpand = null;
     if (dedupEnabled) {
       const thresh = Math.max(0, parseFloat(document.getElementById('dedupThresh').value) || 0.05);
       const { repFlat, repTA, repTB, repMapA, repMapB } = dedupFeatures(fd, thresh);
@@ -4728,16 +4971,19 @@ initHelpTips({
   // Projection panel
   '#togUMAPMode':    'UMAP: nonlinear neighbour-preserving layout, 6 seeded variants. Better clusters, no fixed axes.',
   '#togPCAMode':     'PCA: linear projection onto the top-2 variance directions. Deterministic, preserves global structure, weaker clustering.',
-  '#togWheelMode':   'Wheel: similarity as the angle (1-D UMAP or PC1), a chosen scalar as the radius. Drawn orbits loop seamlessly. Proximity across the centre does NOT mean similarity — it’s a controller, not a map.',
+  '#togMDSMode':     'MDS: classical multidimensional scaling on the pooled SSM — places frames so 2-D distances best match the similarity matrix. Deterministic and global-structure-preserving (the scatter form of the SSM). Runs on ≤resolution super-frames; each frame inherits its super-frame’s position.',
+  '#togWheelMode':   'Wheel: similarity as the angle (1-D UMAP / PC1 / MDS), a chosen scalar as the radius. Drawn orbits loop seamlessly. Proximity across the centre does NOT mean similarity — it’s a controller, not a map.',
   '#togSSMMode':     'SSM: joint similarity matrix over the same features — block matrix with A·A and B·B self-similarity on the diagonal and the A·B cross-similarity off-diagonal (blue lines mark the seam). Preserves global structure exactly and is fast (one matmul); long files are mean-pooled to the resolution cap. Side strips show each frame’s similarity to A (left) and B (right); the top strip shows the overall marginal.',
   '#togSSMMetricCos':'Cosine similarity on L2-normalised frames (∈[−1,1]). Fixed colour scale across files. Scale-invariant — direction in feature space, not magnitude.',
   '#togSSMMetricEuc':'Euclidean distance → similarity (auto-ranged per matrix). Sensitive to magnitude, so loudness/atypicality affect it.',
   '#ssmBudget':      'Resolution cap. If a source has more frames than this, it is mean-pooled down to this many super-frames before the matrix is built — caps compute & memory at P×P so arbitrarily long audio stays fast. Pooling also denoises; lower it for very long files, raise it for fine detail.',
   '#togWheelAngleUMAP': 'Angle from a 1-D UMAP: neighbourhood-preserving, so timbre families stay angularly contiguous. Stochastic; recomputed per feature change.',
   '#togWheelAnglePC1':  'Angle from PC1 rank: the dominant linear axis of variation. Deterministic and instant, but only orders by one direction of the feature space.',
+  '#togWheelAngleMDS':  'Angle from the 1-D MDS of the SSM: orders frames along the dominant axis of the pooled similarity matrix. Deterministic; honours global SSM geometry rather than a single feature direction.',
   '#togWheelLoud':   'Radius = per-frame loudness (48 kHz scale, or raw-audio RMS on 24 kHz). Pull paths outward for louder grains.',
   '#togWheelTime':   'Radius = position in the source — centre is the start, rim is the end.',
   '#togWheelAtyp':   'Radius = atypicality: distance from the average frame in feature space. Rim = the most extreme moments.',
+  '#togWheelTyp':    'Radius = typicality: mean cosine similarity to all frames (the SSM marginal). Rim = the most representative/recurring moments — the inverse of Atyp.',
   '#togWheelScaleVal':  'Radius proportional to the value, percentile-clipped (5–95%) so one silent/extreme frame can’t rescale the axis. Time skips the clip (already uniform).',
   '#togWheelScaleRank': 'Radius from the value’s rank: outlier-immune, fills the whole band evenly — but radial distance no longer reflects how different the values are.',
   '#togEmbOnly':     'Features = the frame embedding itself: organise by sound content.',
@@ -4753,7 +4999,6 @@ initHelpTips({
   '#togPreReduce':   'PCA-reduce features to ≤32 dims (95% variance) before UMAP. Removes noise dimensions, speeds UMAP up several×, and seeds layouts from the PCA. Recommended on.',
   '#togMetricEuc':   'Straight-line distance between feature vectors.',
   '#togMetricCos':   'Angle-based distance — ignores overall magnitude, often groups timbre better.',
-  '#togScaleFeat':   'Append log(loudness scale) as a feature so loudness becomes an organising axis (48 kHz only — its embeddings are otherwise loudness-normalised).',
   '#togDedup':       'Collapse runs of consecutive near-identical frames before fitting UMAP, so clusters form by content rather than source-and-time. Skipped frames land on their representative.',
   '#dedupThresh':    'Cosine-distance threshold for "near-identical". Higher = more aggressive collapsing. Try 0.03–0.1.',
   '#nNeighbors':     'UMAP: how many neighbours define each point’s local structure. Low = tight local clusters; high = more global layout.',

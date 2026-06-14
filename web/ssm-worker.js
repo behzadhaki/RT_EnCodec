@@ -80,7 +80,37 @@ function dot(A, i, B, j, D) {
   return s;
 }
 
+// Pooled joint cosine SSM used as a projection input (MDS / UMAP-on-SSM /
+// PCA-on-SSM). Returns the raw (pA+pB)² similarity matrix — no colormap — plus
+// the pooled per-source counts so the main thread can map super-frames → frames.
+function computeSSMInput(flat, T_A, T_B, D, P) {
+  const budget = Math.max(2, P | 0);
+  const pA = T_A > 0 ? Math.min(budget, T_A) : 0;
+  const pB = T_B > 0 ? Math.min(budget, T_B) : 0;
+  const M  = pA + pB;
+  const X  = new Float32Array(M * D);
+  if (pA) X.set(poolRows(flat, 0,   T_A, D, pA), 0);
+  if (pB) X.set(poolRows(flat, T_A, T_B, D, pB), pA * D);
+  l2normRows(X, M, D);                 // cosine ⇒ S = X·Xᵀ ∈ [-1,1], PSD
+  const sim = new Float32Array(M * M);
+  for (let i = 0; i < M; i++) {
+    for (let j = i; j < M; j++) {
+      const v = dot(X, i, X, j, D);
+      sim[i * M + j] = v;
+      sim[j * M + i] = v;
+    }
+  }
+  return { sim, pA, pB, T_A, T_B };
+}
+
 self.onmessage = ({ data: msg }) => {
+  if (msg.type === 'compute_ssm_input') {
+    const { jobId, flat, T_A, T_B, D, P } = msg;
+    const r = computeSSMInput(flat, T_A, T_B, D, P);
+    self.postMessage({ type: 'ssm_input_result', jobId, sim: r.sim.buffer,
+      pA: r.pA, pB: r.pB, T_A: r.T_A, T_B: r.T_B }, [r.sim.buffer]);
+    return;
+  }
   if (msg.type !== 'compute_ssm') return;
   const { jobId, flat, T_A, T_B, D, scope, which, P, metric } = msg;
 

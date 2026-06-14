@@ -90,6 +90,63 @@ function computePCA(flat, N, D) {
   return result;
 }
 
+// ── Classical MDS (PCoA) on a similarity matrix ───────────────────────────────
+// sim is N×N (row-major), cosine ∈ [-1,1] ⇒ d² = 2-2·sim, so the MDS Gram
+// matrix B = -½·J·d²·J reduces (the constant 2 and rank-1 terms vanish under
+// centering) to B = J·sim·J — the double-centred similarity. We take its top-2
+// eigenvectors by power iteration (B is PSD for a cosine Gram), with B·v formed
+// implicitly so no N×N matrix is materialised. coords = vₖ·√λₖ.
+function computeMDS(sim, N) {
+  const r = new Float64Array(N); // row means (= col means; sim symmetric)
+  let g = 0;
+  for (let i = 0; i < N; i++) {
+    let s = 0; const off = i * N;
+    for (let j = 0; j < N; j++) s += sim[off + j];
+    r[i] = s / N; g += r[i];
+  }
+  g /= N;
+
+  function Bmul(v) {
+    let sumv = 0, rv = 0;
+    for (let i = 0; i < N; i++) { sumv += v[i]; rv += r[i] * v[i]; }
+    const out = new Float64Array(N);
+    for (let i = 0; i < N; i++) {
+      let sv = 0; const off = i * N;
+      for (let j = 0; j < N; j++) sv += sim[off + j] * v[j];
+      out[i] = sv - r[i] * sumv - rv + g * sumv;
+    }
+    return out;
+  }
+
+  function powerIter(deflect) {
+    const v = new Float64Array(N);
+    for (let i = 0; i < N; i++) v[i] = Math.sin(i + 1); // non-constant start (B kills the constant)
+    for (let it = 0; it < 120; it++) {
+      const Mv = Bmul(v);
+      if (deflect) {
+        let d = 0; for (let i = 0; i < N; i++) d += Mv[i] * deflect[i];
+        for (let i = 0; i < N; i++) Mv[i] -= d * deflect[i];
+      }
+      let norm = 0; for (let i = 0; i < N; i++) norm += Mv[i] * Mv[i];
+      norm = Math.sqrt(norm);
+      if (norm < 1e-14) break;
+      for (let i = 0; i < N; i++) v[i] = Mv[i] / norm;
+    }
+    const Bv = Bmul(v);
+    let lambda = 0; for (let i = 0; i < N; i++) lambda += v[i] * Bv[i];
+    return { v, s: Math.sqrt(Math.max(0, lambda)) };
+  }
+
+  const e1 = powerIter(null);
+  const e2 = powerIter(e1.v);
+  const result = new Float32Array(N * 2);
+  for (let i = 0; i < N; i++) {
+    result[i * 2]     = e1.v[i] * e1.s;
+    result[i * 2 + 1] = e2.v[i] * e2.s;
+  }
+  return result;
+}
+
 // ── Randomized PCA — feature pre-reduction ────────────────────────────────────
 // Reduce flat (N×D row-major) to its top-m principal-component scores, where m
 // is the smallest count whose cumulative explained variance reaches varTarget
@@ -328,6 +385,18 @@ self.onmessage = ({ data: msg }) => {
       }
     } catch (err) {
       self.postMessage({ type: 'reduce_error', jobId, message: 'PCA reduce: ' + err.message });
+    }
+    return;
+  }
+
+  // ── MDS (classical / PCoA on the SSM) ──────────────────────────────────────
+  if (msg.type === 'compute_mds') {
+    const { jobId, sim, N } = msg;
+    try {
+      const result = computeMDS(sim, N);
+      self.postMessage({ type: 'mds_result', jobId, result, N }, [result.buffer]);
+    } catch (err) {
+      self.postMessage({ type: 'mds_error', jobId, message: err.message });
     }
     return;
   }
