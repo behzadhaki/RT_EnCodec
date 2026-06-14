@@ -380,21 +380,6 @@ umapSection.innerHTML = `
     <button class="tog"        id="togWheelMode" style="flex:1">Wheel</button>
     <button class="tog"        id="togSSMMode"   style="flex:1">SSM</button>
   </div>
-  <div class="row" id="ssmScopeRow" style="display:none">
-    <span class="lbl">Scope</span>
-    <div style="display:flex;gap:3px">
-      <button class="tog active" id="togSSMJoint">Joint</button>
-      <button class="tog"        id="togSSMCross">Cross A×B</button>
-      <button class="tog"        id="togSSMSelf">Self</button>
-    </div>
-  </div>
-  <div class="row" id="ssmWhichRow" style="display:none">
-    <span class="lbl">Source</span>
-    <div style="display:flex;gap:3px">
-      <button class="tog active" id="togSSMWhichA">A</button>
-      <button class="tog"        id="togSSMWhichB">B</button>
-    </div>
-  </div>
   <div class="row" id="ssmResRow" style="display:none">
     <span class="lbl">Resolution</span>
     <input type="number" id="ssmBudget" value="1024" min="16" max="4096" step="16" style="width:64px">
@@ -823,9 +808,7 @@ let coordsB         = null;
 let projectionMode  = 'umap';
 let pcaCoords       = null;  // {coordsA, coordsB} — cached PCA result for current features
 
-// SSM (self-/cross-similarity matrix) state
-let ssmScope        = 'joint';    // 'joint' | 'cross' | 'self'
-let ssmWhich        = 'A';        // self-scope source: 'A' | 'B'
+// SSM state (joint-only: A·A | A·B | B·B)
 let ssmBudget       = 1024;       // pixel budget P — caps the matrix at P×P (temporal pooling)
 let ssmMetric       = 'cosine';   // 'cosine' | 'euclidean'
 let ssmImage        = null;       // { rgba:ImageData, w, h, scope, seam, pA, pB, T_A, T_B, vmin, vmax, metric }
@@ -1417,7 +1400,7 @@ function renderSSM() {
     return;
   }
 
-  const { rgba, w, h, scope, seam, pA, pB } = ssmImage;
+  const { rgba, w, h, seam, pA, pB } = ssmImage;
 
   // Stage the matrix into an offscreen canvas at native resolution.
   if (!ssmOffscreen) ssmOffscreen = document.createElement('canvas');
@@ -1426,18 +1409,20 @@ function renderSSM() {
   }
   ssmOffscreen.getContext('2d').putImageData(rgba, 0, 0);
 
-  // Fit into the canvas with margins for labels/title (physical px). A left
-  // gutter (profileW) holds the per-frame marginal profile, aligned row-for-row
-  // with the matrix.
-  const mL = 30 * dpr, mT = 28 * dpr, mR = 12 * dpr, mB = 22 * dpr;
-  const profileW = 56 * dpr, profGap = 6 * dpr;
-  const leftReserve = mL + profileW + profGap;
-  const availW = Math.max(1, PW - leftReserve - mR);
-  const availH = Math.max(1, PH - mT - mB);
+  // Fit into the canvas, reserving a left strip (→A marginal), a right strip
+  // (→B marginal), a top strip (overall marginal), the title, and left A/B axis
+  // labels. (SSM is joint-only: A·A | A·B | B·B.)
+  const titleH = 16 * dpr, topStripH = 52 * dpr, sideStripW = 58 * dpr;
+  const labelL = 18 * dpr, gap = 6 * dpr, mR = 10 * dpr, mB = 18 * dpr;
+  const leftReserve  = labelL + sideStripW + gap;
+  const rightReserve = sideStripW + gap + mR;
+  const topReserve   = titleH + topStripH + gap;
+  const availW = Math.max(1, PW - leftReserve - rightReserve);
+  const availH = Math.max(1, PH - topReserve - mB);
   const scale = Math.min(availW / w, availH / h);
   const dw = w * scale, dh = h * scale;
   const dx = leftReserve + (availW - dw) / 2;
-  const dy = mT + (availH - dh) / 2;
+  const dy = topReserve + (availH - dh) / 2;
   ssmRect = { x: dx, y: dy, w: dw, h: dh };
 
   ctx.imageSmoothingEnabled = scale < 1; // smooth on downscale, crisp on upscale
@@ -1447,118 +1432,118 @@ function renderSSM() {
   ctx.strokeStyle = '#333'; ctx.lineWidth = 1 * dpr;
   ctx.strokeRect(dx + 0.5, dy + 0.5, dw, dh);
 
-  // Seam guides for the joint block matrix (A|B boundary on both axes).
-  if (scope === 'joint' && seam > 0 && seam < w) {
-    const fx = dx + (seam / w) * dw;
-    const fy = dy + (seam / h) * dh;
-    ctx.strokeStyle = 'rgba(120,200,255,0.55)';
-    ctx.lineWidth = 1 * dpr;
+  const seamX = dx + (pA / w) * dw, seamY = dy + (pA / h) * dh;
+
+  // Seam guides (A|B boundary on both axes).
+  if (seam > 0 && seam < w) {
+    ctx.strokeStyle = 'rgba(120,200,255,0.55)'; ctx.lineWidth = 1 * dpr;
     ctx.beginPath();
-    ctx.moveTo(fx, dy); ctx.lineTo(fx, dy + dh);
-    ctx.moveTo(dx, fy); ctx.lineTo(dx + dw, fy);
+    ctx.moveTo(seamX, dy); ctx.lineTo(seamX, dy + dh);
+    ctx.moveTo(dx, seamY); ctx.lineTo(dx + dw, seamY);
     ctx.stroke();
   }
 
-  // Live playback cursor. The playing source maps to a matrix index; for
-  // joint/self that index is on BOTH axes (crosshair on the diagonal), for
-  // cross it's the row (A) or column (B) only. The lit row/col reads as "how
-  // similar this instant is to every other moment".
+  // Live playback cursor — the playing source maps to a joint-matrix index
+  // (A block [0,pA), B block [pA,…)); drawn on both axes as a crosshair. Bright
+  // core over a dark casing so it stays visible over magma's own warm tones.
   if (ssmPlayhead) {
     const { src, pos } = ssmPlayhead;
-    let row = -1, col = -1;
-    if (scope === 'cross') {
-      if (src === 'A') row = pos * pA;            // rows = A
-      else             col = pos * pB;            // cols = B
-    } else if (scope === 'self') {
-      if (ssmWhich === src) { row = col = pos * (src === 'A' ? pA : pB); }
-    } else { // joint — A block [0,pA), B block [pA,pA+pB)
-      row = col = src === 'A' ? pos * pA : pA + pos * pB;
-    }
-    if (row >= 0 || col >= 0) {
-      // Bright core over a dark casing so the cursor stays visible over any
-      // matrix colour (magma's own orange/yellow would otherwise swallow it).
-      const core = src === 'A' ? '#ffd24a' : '#7fe0ff';
-      const x = col >= 0 ? dx + Math.min(col, w) / w * dw : -1;
-      const y = row >= 0 ? dy + Math.min(row, h) / h * dh : -1;
-      const lines = () => {
-        ctx.beginPath();
-        if (x >= 0) { ctx.moveTo(x, dy); ctx.lineTo(x, dy + dh); }
-        if (y >= 0) { ctx.moveTo(dx, y); ctx.lineTo(dx + dw, y); }
-        ctx.stroke();
-      };
-      ctx.save();
-      ctx.strokeStyle = 'rgba(0,0,0,0.75)'; ctx.lineWidth = 4 * dpr; lines(); // casing
-      ctx.strokeStyle = core;               ctx.lineWidth = 1.6 * dpr; lines(); // core
-      ctx.restore();
-    }
-  }
-
-  // Per-frame marginal profile (left gutter), aligned row-for-row with the
-  // matrix. Each row's mean similarity to all frames → a horizontal bar growing
-  // LEFT from the matrix edge: long = typical/connected, short = outlier. Joint
-  // colours A rows orange, B rows blue; the seam is marked.
-  if (ssmImage.rowProfile) {
-    const prof = ssmImage.rowProfile;
-    const pmin = ssmImage.profMin, pmax = ssmImage.profMax;
-    const span = pmax - pmin > 1e-9 ? pmax - pmin : 1;
-    const px1 = dx - profGap;             // right edge (matrix-adjacent baseline)
-    const px0 = px1 - profileW;           // far-left edge (max value)
-    // panel backdrop + baseline
-    ctx.fillStyle = 'rgba(255,255,255,0.04)';
-    ctx.fillRect(px0, dy, profileW, dh);
-    ctx.strokeStyle = '#444'; ctx.lineWidth = 1 * dpr;
-    ctx.beginPath(); ctx.moveTo(px1 + 0.5, dy); ctx.lineTo(px1 + 0.5, dy + dh); ctx.stroke();
-    // one horizontal line per matrix pixel-row (cheap; dh ≲ 1000)
-    const aColor = 'rgba(255,176,72,0.85)', bColor = 'rgba(84,200,255,0.85)';
-    const single = scope === 'self'
-      ? (ssmWhich === 'A' ? aColor : bColor)
-      : scope === 'cross' ? aColor : null; // cross rows = A
-    const nRows = Math.max(1, Math.round(dh));
-    for (let yy = 0; yy < nRows; yy++) {
-      const r = Math.min(h - 1, Math.floor((yy / nRows) * h));
-      const t = (prof[r] - pmin) / span;                 // 0..1
-      const len = t * profileW;
-      ctx.strokeStyle = single || (r < pA ? aColor : bColor);
+    const idx = src === 'A' ? pos * pA : pA + pos * pB;
+    const core = src === 'A' ? '#ffd24a' : '#7fe0ff';
+    const x = dx + Math.min(idx, w) / w * dw;
+    const y = dy + Math.min(idx, h) / h * dh;
+    const lines = () => {
       ctx.beginPath();
-      ctx.moveTo(px1, dy + yy + 0.5);
-      ctx.lineTo(px1 - len, dy + yy + 0.5);
+      ctx.moveTo(x, dy); ctx.lineTo(x, dy + dh);
+      ctx.moveTo(dx, y); ctx.lineTo(dx + dw, y);
       ctx.stroke();
-    }
-    // seam marker in the profile (joint only)
-    if (scope === 'joint' && pA > 0 && pA < h) {
-      const sy = dy + (pA / h) * dh;
-      ctx.strokeStyle = 'rgba(120,200,255,0.55)'; ctx.lineWidth = 1 * dpr;
-      ctx.beginPath(); ctx.moveTo(px0, sy); ctx.lineTo(px1, sy); ctx.stroke();
-    }
-    // caption
-    ctx.fillStyle = '#9a9a9a';
-    ctx.font = `${9 * dpr}px sans-serif`;
-    ctx.textAlign = 'center'; ctx.textBaseline = 'bottom';
-    ctx.fillText('typicality →', (px0 + px1) / 2, dy - 2 * dpr);
+    };
+    ctx.save();
+    ctx.strokeStyle = 'rgba(0,0,0,0.75)'; ctx.lineWidth = 4 * dpr; lines(); // casing
+    ctx.strokeStyle = core;               ctx.lineWidth = 1.6 * dpr; lines(); // core
+    ctx.restore();
   }
 
-  // Labels.
+  // Marginal profiles (mean similarity along a row/column). Bars are normalised
+  // per strip and grow away from the matrix. LEFT = →A (each frame's similarity
+  // to source A: AA for A rows, BA for B rows), RIGHT = →B (AB / BB); within-
+  // source blocks (AA, BB) bright, cross blocks (AB, BA) faded. TOP = overall
+  // (the full row/column marginal over the entire matrix), coloured by source.
+  if (ssmImage.profA && ssmImage.profB) {
+    const nRows = Math.max(1, Math.round(dh));
+    const nCols = Math.max(1, Math.round(dw));
+    const bright = (rgb, on) => `rgba(${rgb},${on ? 0.9 : 0.32})`;
+    const ORANGE = '255,176,72', BLUE = '84,200,255';
+    const cap = (text, cx, cy, align) => {
+      ctx.fillStyle = '#9a9a9a'; ctx.font = `${9 * dpr}px sans-serif`;
+      ctx.textAlign = align; ctx.textBaseline = 'bottom';
+      ctx.fillText(text, cx, cy);
+    };
+    const backdrop = (x, y, ww, hh) => { ctx.fillStyle = 'rgba(255,255,255,0.04)'; ctx.fillRect(x, y, ww, hh); };
+
+    // Vertical strip (per-row). baseX = matrix-adjacent edge; bars grow outward.
+    const rowStrip = (x0, x1, baseRight, prof, pmin, pmax, colorAt) => {
+      const span = pmax - pmin > 1e-9 ? pmax - pmin : 1;
+      const laneW = x1 - x0, baseX = baseRight ? x1 : x0;
+      backdrop(x0, dy, laneW, dh);
+      ctx.strokeStyle = '#444'; ctx.lineWidth = 1 * dpr;
+      ctx.beginPath(); ctx.moveTo(baseX + 0.5, dy); ctx.lineTo(baseX + 0.5, dy + dh); ctx.stroke();
+      for (let yy = 0; yy < nRows; yy++) {
+        const r = Math.min(h - 1, Math.floor((yy / nRows) * h));
+        const len = ((prof[r] - pmin) / span) * laneW;
+        ctx.strokeStyle = colorAt(r);
+        ctx.beginPath(); ctx.moveTo(baseX, dy + yy + 0.5); ctx.lineTo(baseRight ? baseX - len : baseX + len, dy + yy + 0.5); ctx.stroke();
+      }
+      ctx.strokeStyle = 'rgba(120,200,255,0.55)'; ctx.lineWidth = 1 * dpr;
+      ctx.beginPath(); ctx.moveTo(x0, seamY); ctx.lineTo(x1, seamY); ctx.stroke();
+    };
+
+    // Top strip (per-column). Bars grow up from the matrix-adjacent bottom edge.
+    const colStrip = (y0, y1, prof, pmin, pmax, colorAt) => {
+      const span = pmax - pmin > 1e-9 ? pmax - pmin : 1;
+      const laneH = y1 - y0;
+      backdrop(dx, y0, dw, laneH);
+      ctx.strokeStyle = '#444'; ctx.lineWidth = 1 * dpr;
+      ctx.beginPath(); ctx.moveTo(dx, y1 + 0.5); ctx.lineTo(dx + dw, y1 + 0.5); ctx.stroke();
+      for (let xx = 0; xx < nCols; xx++) {
+        const c = Math.min(w - 1, Math.floor((xx / nCols) * w));
+        const len = ((prof[c] - pmin) / span) * laneH;
+        ctx.strokeStyle = colorAt(c);
+        ctx.beginPath(); ctx.moveTo(dx + xx + 0.5, y1); ctx.lineTo(dx + xx + 0.5, y1 - len); ctx.stroke();
+      }
+      ctx.strokeStyle = 'rgba(120,200,255,0.55)'; ctx.lineWidth = 1 * dpr;
+      ctx.beginPath(); ctx.moveTo(seamX, y0); ctx.lineTo(seamX, y1); ctx.stroke();
+    };
+
+    // LEFT — →A
+    const lx1 = dx - gap, lx0 = lx1 - sideStripW;
+    rowStrip(lx0, lx1, true, ssmImage.profA, ssmImage.profAMin, ssmImage.profAMax,
+      r => bright(ORANGE, r < pA));
+    cap('A←', (lx0 + lx1) / 2, dy - 2 * dpr, 'center');
+    // RIGHT — →B
+    const rx0 = dx + dw + gap, rx1 = rx0 + sideStripW;
+    rowStrip(rx0, rx1, false, ssmImage.profB, ssmImage.profBMin, ssmImage.profBMax,
+      r => bright(BLUE, r >= pA));
+    cap('→B', (rx0 + rx1) / 2, dy - 2 * dpr, 'center');
+    // TOP — overall (entire matrix)
+    const ty1 = dy - gap, ty0 = ty1 - topStripH;
+    colStrip(ty0, ty1, ssmImage.rowProfile, ssmImage.profMin, ssmImage.profMax,
+      c => bright(c < pA ? ORANGE : BLUE, true));
+    cap('overall ↑', dx, ty0 - 2 * dpr, 'left');
+  }
+
+  // Title.
   ctx.fillStyle = '#bbb';
   ctx.font = `${11 * dpr}px sans-serif`;
   ctx.textAlign = 'center'; ctx.textBaseline = 'top';
-  const title = scope === 'cross' ? 'Cross-similarity  (rows A · cols B)'
-              : scope === 'self'  ? `Self-similarity  (${ssmWhich})`
-              : 'Joint SSM  (A·A | A·B | B·B)';
-  ctx.fillText(title, dx + dw / 2, 6 * dpr);
+  ctx.fillText('Joint SSM  (A·A | A·B | B·B)', dx + dw / 2, 2 * dpr);
 
-  // Axis source labels.
+  // Left axis source labels (A block / B block).
   ctx.fillStyle = '#9ad0ff';
-  ctx.textBaseline = 'middle';
-  if (scope === 'cross') {
-    ctx.save(); ctx.translate(mL * 0.45, dy + dh / 2); ctx.rotate(-Math.PI / 2);
-    ctx.fillText('A', 0, 0); ctx.restore();
-    ctx.textBaseline = 'top';
-    ctx.fillText('B', dx + dw / 2, dy + dh + 5 * dpr);
-  } else if (scope === 'joint') {
-    const aMid = dy + (pA / 2 / h) * dh, bMid = dy + ((pA + (w - pA) / 2) / h) * dh;
-    ctx.save(); ctx.translate(mL * 0.45, aMid); ctx.rotate(-Math.PI / 2); ctx.fillText('A', 0, 0); ctx.restore();
-    ctx.save(); ctx.translate(mL * 0.45, bMid); ctx.rotate(-Math.PI / 2); ctx.fillText('B', 0, 0); ctx.restore();
-  }
+  ctx.textBaseline = 'middle'; ctx.textAlign = 'center';
+  const aMid = dy + (pA / 2 / h) * dh, bMid = dy + ((pA + (h - pA) / 2) / h) * dh;
+  ctx.save(); ctx.translate(labelL * 0.5, aMid); ctx.rotate(-Math.PI / 2); ctx.fillText('A', 0, 0); ctx.restore();
+  ctx.save(); ctx.translate(labelL * 0.5, bMid); ctx.rotate(-Math.PI / 2); ctx.fillText('B', 0, 0); ctx.restore();
 }
 
 // Hover readout for the SSM: map cursor → matrix cell → (source, time) on each
@@ -1571,27 +1556,23 @@ function onSSMHover(e) {
   const py = (e.clientY - rect.top)  * dpr - ssmRect.y;
   if (px < 0 || py < 0 || px >= ssmRect.w || py >= ssmRect.h) return;
 
-  const { w, h, sim, scope, pA, pB } = ssmImage;
+  const { w, h, sim, pA, pB } = ssmImage;
   const col = Math.min(w - 1, Math.floor((px / ssmRect.w) * w));
   const row = Math.min(h - 1, Math.floor((py / ssmRect.h) * h));
   const v = sim[row * w + col];
 
-  // Map a super-frame index on a given axis to a "Source time" label.
-  const label = (idx, axis) => {
-    let src, sf, p;
-    if (scope === 'self')      { src = ssmWhich; sf = idx; p = src === 'A' ? pA : pB; }
-    else if (scope === 'cross'){ src = axis === 'row' ? 'A' : 'B'; sf = idx; p = src === 'A' ? pA : pB; }
-    else { // joint
-      if (idx < pA) { src = 'A'; sf = idx; p = pA; }
-      else          { src = 'B'; sf = idx - pA; p = pB; }
-    }
+  // Map a joint-matrix index (A block [0,pA), B block [pA,…)) to a time label.
+  const label = (idx) => {
+    const src = idx < pA ? 'A' : 'B';
+    const sf  = idx < pA ? idx : idx - pA;
+    const p   = src === 'A' ? pA : pB;
     const t = p > 0 ? ((sf + 0.5) / p) * srcDuration(src) : 0;
     return `${src} ${t.toFixed(2)}s`;
   };
 
   const unit = ssmImage.metric === 'cosine' ? 'cos' : 'd';
   const val  = ssmImage.metric === 'cosine' ? v.toFixed(3) : (-v).toFixed(3);
-  setStatus(`${label(row, 'row')} ↔ ${label(col, 'col')} · ${unit} ${val}`);
+  setStatus(`${label(row)} ↔ ${label(col)} · ${unit} ${val}`);
 }
 
 // ── Dirty flags & effect scheduler ───────────────────────────────────────────
@@ -1931,16 +1912,6 @@ function launchSSM() {
   if (!umapFeatureData) return;
   const { flat, T_A, T_B, D } = umapFeatureData;
 
-  // Cross/self need both/the chosen source to be non-empty.
-  if (ssmScope === 'cross' && (T_A === 0 || T_B === 0)) {
-    setStatus('Cross-SSM needs both sources encoded.', true);
-    return;
-  }
-  if (ssmScope === 'self' && ((ssmWhich === 'A' && T_A === 0) || (ssmWhich === 'B' && T_B === 0))) {
-    setStatus(`Self-SSM: source ${ssmWhich} is empty.`, true);
-    return;
-  }
-
   initSSMWorker();
   activeSSMJobId = ++jobSeq;
 
@@ -1949,13 +1920,13 @@ function launchSSM() {
 
   progWrap.style.display = 'block';
   progBar.style.width = '40%';
-  setStatus(`SSM — ${ssmScope}${ssmScope === 'self' ? ' ' + ssmWhich : ''}, ${ssmMetric}, ≤${P}px…`);
+  setStatus(`SSM — joint, ${ssmMetric}, ≤${P}px…`);
 
   // flat sent as a copy (not transferred) so it survives for re-runs / other modes.
   ssmWorker.postMessage({
     type: 'compute_ssm', jobId: activeSSMJobId,
     flat, T_A, T_B, D,
-    scope: ssmScope, which: ssmWhich, P, metric: ssmMetric,
+    scope: 'joint', which: 'A', P, metric: ssmMetric,
   });
 }
 
@@ -1973,25 +1944,41 @@ function onSSMWorkerMsg({ data: msg }) {
     scope: msg.scope, seam: msg.seam, pA: msg.pA, pB: msg.pB,
     T_A: msg.T_A, T_B: msg.T_B, vmin: msg.vmin, vmax: msg.vmax, metric: msg.metric,
   };
-  // Per-frame marginal: mean similarity of each row (frame) to all frames.
-  // sim is row-major (h rows × w cols). For symmetric scopes this is a frame's
-  // "typicality" (alignment with the centroid); for cross it's A-vs-B overall.
+  // Per-frame marginals. Total = mean similarity of each row to all frames
+  // (typicality). For the joint matrix we also split each row by column-block,
+  // so a frame shows its similarity to source A (AA / BA) vs source B (AB / BB)
+  // — i.e. the row sum decomposed at the column seam.
   {
     const { w, h } = msg;
-    const prof = new Float32Array(h);
-    let pmin = Infinity, pmax = -Infinity;
+    const splitJoint = msg.scope === 'joint' && msg.seam > 0 && msg.seam < w;
+    const cutA = splitJoint ? msg.seam : w;             // A-columns = [0, cutA)
+    const total = new Float32Array(h);
+    const profA = splitJoint ? new Float32Array(h) : null; // mean sim to A cols
+    const profB = splitJoint ? new Float32Array(h) : null; // mean sim to B cols
+    let tmin = Infinity, tmax = -Infinity;
+    let amin = Infinity, amax = -Infinity, bmin = Infinity, bmax = -Infinity;
     for (let r = 0; r < h; r++) {
-      let s = 0; const off = r * w;
-      for (let c = 0; c < w; c++) s += sim[off + c];
-      const m = s / w;
-      prof[r] = m;
-      if (m < pmin) pmin = m;
-      if (m > pmax) pmax = m;
+      const off = r * w;
+      let sa = 0, sb = 0;
+      for (let c = 0; c < cutA; c++) sa += sim[off + c];
+      for (let c = cutA; c < w; c++) sb += sim[off + c];
+      const mt = (sa + sb) / w;
+      total[r] = mt; if (mt < tmin) tmin = mt; if (mt > tmax) tmax = mt;
+      if (splitJoint) {
+        const ma = sa / cutA, mb = sb / (w - cutA);
+        profA[r] = ma; profB[r] = mb;
+        if (ma < amin) amin = ma; if (ma > amax) amax = ma;
+        if (mb < bmin) bmin = mb; if (mb > bmax) bmax = mb;
+      }
     }
-    ssmImage.rowProfile = prof; ssmImage.profMin = pmin; ssmImage.profMax = pmax;
+    ssmImage.rowProfile = total; ssmImage.profMin = tmin; ssmImage.profMax = tmax;
+    if (splitJoint) {
+      ssmImage.profA = profA; ssmImage.profAMin = amin; ssmImage.profAMax = amax;
+      ssmImage.profB = profB; ssmImage.profBMin = bmin; ssmImage.profBMax = bmax;
+    }
   }
   const pooled = (msg.pA && msg.pA < msg.T_A) || (msg.pB && msg.pB < msg.T_B);
-  setStatus(`SSM — ${msg.scope}${msg.scope === 'self' ? ' ' + ssmWhich : ''} · ${msg.w}×${msg.h}`
+  setStatus(`SSM — joint · ${msg.w}×${msg.h}`
     + (pooled ? ' (pooled)' : '') + ` · ${msg.metric}`);
   scheduleRender();
 }
@@ -2149,8 +2136,6 @@ function setProjectionMode(mode) {
   document.getElementById('wheelAngleRow') .style.display = mode === 'wheel' ? '' : 'none';
   document.getElementById('wheelRadiusRow').style.display = mode === 'wheel' ? '' : 'none';
   document.getElementById('wheelScaleRow') .style.display = mode === 'wheel' ? '' : 'none';
-  document.getElementById('ssmScopeRow')  .style.display = mode === 'ssm' ? '' : 'none';
-  document.getElementById('ssmWhichRow')  .style.display = mode === 'ssm' && ssmScope === 'self' ? '' : 'none';
   document.getElementById('ssmResRow')    .style.display = mode === 'ssm' ? '' : 'none';
   document.getElementById('ssmMetricRow') .style.display = mode === 'ssm' ? '' : 'none';
   document.getElementById('trajPanel')     .style.display = mode === 'ssm' ? 'none' : '';
@@ -3093,25 +3078,12 @@ document.getElementById('togPCAMode')  .addEventListener('click', () => setProje
 document.getElementById('togWheelMode').addEventListener('click', () => setProjectionMode('wheel'));
 document.getElementById('togSSMMode')  .addEventListener('click', () => setProjectionMode('ssm'));
 
-// SSM controls — scope/source/metric/resolution change only the matrix, not the
-// feature build, so they just relaunch the worker on the existing flat.
+// SSM controls — metric/resolution change only the matrix, not the feature
+// build, so they just relaunch the worker on the existing flat. (Scope is
+// always joint.)
 function recomputeSSMIfActive() {
   if (projectionMode === 'ssm' && umapFeatureData) { ssmImage = null; launchSSM(); }
 }
-createToggleGroup([
-  { el: document.getElementById('togSSMJoint'), value: 'joint' },
-  { el: document.getElementById('togSSMCross'), value: 'cross' },
-  { el: document.getElementById('togSSMSelf'),  value: 'self' },
-], v => {
-  ssmScope = v;
-  document.getElementById('ssmWhichRow').style.display =
-    projectionMode === 'ssm' && v === 'self' ? '' : 'none';
-  recomputeSSMIfActive();
-});
-createToggleGroup([
-  { el: document.getElementById('togSSMWhichA'), value: 'A' },
-  { el: document.getElementById('togSSMWhichB'), value: 'B' },
-], v => { ssmWhich = v; recomputeSSMIfActive(); });
 createToggleGroup([
   { el: document.getElementById('togSSMMetricCos'), value: 'cosine' },
   { el: document.getElementById('togSSMMetricEuc'), value: 'euclidean' },
@@ -4756,10 +4728,7 @@ initHelpTips({
   '#togUMAPMode':    'UMAP: nonlinear neighbour-preserving layout, 6 seeded variants. Better clusters, no fixed axes.',
   '#togPCAMode':     'PCA: linear projection onto the top-2 variance directions. Deterministic, preserves global structure, weaker clustering.',
   '#togWheelMode':   'Wheel: similarity as the angle (1-D UMAP or PC1), a chosen scalar as the radius. Drawn orbits loop seamlessly. Proximity across the centre does NOT mean similarity — it’s a controller, not a map.',
-  '#togSSMMode':     'SSM: similarity matrix over the same features. Every frame vs every frame — preserves global structure exactly (no neighbour distortion) and is fast (one matmul). Long files are mean-pooled to the resolution cap, so it scales to any length. Diagonals = repeats, blocks = homogeneous regions.',
-  '#togSSMJoint':    'Joint: stack both sources → block matrix with A·A and B·B self-similarity on the diagonal and the A·B cross-similarity off-diagonal. Blue lines mark the A/B seam.',
-  '#togSSMCross':    'Cross A×B: rows = A frames, cols = B frames. Strictly how similar each A frame is to each B frame — alignment / shared material between the two sources.',
-  '#togSSMSelf':     'Self: similarity of one source against itself (T×T). Classic music-structure view — find repeats, sections, loops within a single signal.',
+  '#togSSMMode':     'SSM: joint similarity matrix over the same features — block matrix with A·A and B·B self-similarity on the diagonal and the A·B cross-similarity off-diagonal (blue lines mark the seam). Preserves global structure exactly and is fast (one matmul); long files are mean-pooled to the resolution cap. Side strips show each frame’s similarity to A (left) and B (right); the top strip shows the overall marginal.',
   '#togSSMMetricCos':'Cosine similarity on L2-normalised frames (∈[−1,1]). Fixed colour scale across files. Scale-invariant — direction in feature space, not magnitude.',
   '#togSSMMetricEuc':'Euclidean distance → similarity (auto-ranged per matrix). Sensitive to magnitude, so loudness/atypicality affect it.',
   '#ssmBudget':      'Resolution cap. If a source has more frames than this, it is mean-pooled down to this many super-frames before the matrix is built — caps compute & memory at P×P so arbitrarily long audio stays fast. Pooling also denoises; lower it for very long files, raise it for fine detail.',

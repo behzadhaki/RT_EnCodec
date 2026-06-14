@@ -1955,21 +1955,41 @@ async function runApplySVD5(msg) {
 // Experiment6 helpers — shared by get_embeddings_exp6 and runPlayFrameExp6
 // ---------------------------------------------------------------------------
 
-// Flatten all segment caps into one concatenated cap along T.
+// The caps in flatten order (single / ola24 chunks / ola48 segments).
+function capListOf(caps) {
+  if (caps.mode === 'single') return [caps.cap];
+  if (caps.mode === 'ola24')  return caps.chunks.map(c => c.cap);
+  return caps.segments.map(s => s.cap); // ola48
+}
+
+// Frames to keep from each cap. 48k pads the final partial segment to a full
+// second for the encoder; here we trim each segment's frames back to its valid
+// audio length (validEnd-offset → frames), so the padded silence never enters
+// the embedding/codes timeline. Interior segments are full (validEnd-offset =
+// SEG_48 → all frames), so only the trailing partial segment shrinks.
+function capKeepFrames(caps) {
+  const capList = capListOf(caps);
+  if (caps.mode !== 'ola48') return capList.map(c => Number(c.codesDims[2]));
+  return caps.segments.map(s => {
+    const T = Number(s.cap.codesDims[2]);
+    return Math.min(T, Math.max(0, Math.round((s.validEnd - s.offset) / HOP_48)));
+  });
+}
+
+// Flatten all segment caps into one concatenated cap along T (padding trimmed).
 function flattenCaps(caps) {
   const toN = d => Number(d);
-  let capList;
-  if (caps.mode === 'single')     capList = [caps.cap];
-  else if (caps.mode === 'ola24') capList = caps.chunks.map(c => c.cap);
-  else                            capList = caps.segments.map(s => s.cap); // ola48
+  const capList = capListOf(caps);
+  const keep    = capKeepFrames(caps);
 
-  if (capList.length === 1) return capList[0];
+  // Fast path: a single cap with nothing to trim.
+  if (capList.length === 1 && keep[0] === toN(capList[0].codesDims[2])) return capList[0];
 
   const first   = capList[0];
   const D_enc   = toN(first.embEncDims[1]);
   const D_quant = toN(first.embQuantDims[1]);
   const K       = toN(first.codesDims[1]);
-  const totalT  = capList.reduce((s, c) => s + toN(c.codesDims[2]), 0);
+  const totalT  = keep.reduce((s, k) => s + k, 0);
 
   const emb_enc   = new Float32Array(D_enc   * totalT);
   const emb_quant = new Float32Array(D_quant * totalT);
@@ -1977,18 +1997,20 @@ function flattenCaps(caps) {
     ? new BigInt64Array(K * totalT) : new Int32Array(K * totalT);
 
   let tOff = 0;
-  for (const cap of capList) {
-    const T_i = toN(cap.codesDims[2]);
+  for (let ci = 0; ci < capList.length; ci++) {
+    const cap = capList[ci];
+    const T_i = toN(cap.codesDims[2]); // source width (full, incl. any padding)
+    const n   = keep[ci];              // frames copied (padding dropped)
     for (let d = 0; d < D_enc; d++)
-      for (let t = 0; t < T_i; t++)
+      for (let t = 0; t < n; t++)
         emb_enc[d * totalT + tOff + t] = cap.emb_enc[d * T_i + t];
     for (let d = 0; d < D_quant; d++)
-      for (let t = 0; t < T_i; t++)
+      for (let t = 0; t < n; t++)
         emb_quant[d * totalT + tOff + t] = cap.emb_quant[d * T_i + t];
     for (let k = 0; k < K; k++)
-      for (let t = 0; t < T_i; t++)
+      for (let t = 0; t < n; t++)
         codes[k * totalT + tOff + t] = cap.codes[k * T_i + t];
-    tOff += T_i;
+    tOff += n;
   }
   return { emb_enc, embEncDims: [1, D_enc, totalT],
            emb_quant, embQuantDims: [1, D_quant, totalT],
@@ -1998,19 +2020,16 @@ function flattenCaps(caps) {
 // Return a Float32Array(T) of per-frame scale scalars for 48k sources,
 // or null for 24k (where scale is not used).
 function flattenScales(caps) {
-  let capList;
-  if (caps.mode === 'single')     capList = [caps.cap];
-  else if (caps.mode === 'ola24') capList = caps.chunks.map(c => c.cap);
-  else                            capList = caps.segments.map(s => s.cap);
+  const capList = capListOf(caps);
   if (!capList[0].scale) return null; // 24k has no scale
-  const totalT = capList.reduce((s, c) => s + Number(c.codesDims[2]), 0);
+  const keep   = capKeepFrames(caps); // same trimming as flattenCaps
+  const totalT = keep.reduce((s, k) => s + k, 0);
   const out = new Float32Array(totalT);
   let tOff = 0;
-  for (const cap of capList) {
-    const T_i = Number(cap.codesDims[2]);
+  for (let ci = 0; ci < capList.length; ci++) {
     // cap.scale is [1,1,1] — treat the first element as the segment scalar
-    out.fill(cap.scale[0], tOff, tOff + T_i);
-    tOff += T_i;
+    out.fill(capList[ci].scale[0], tOff, tOff + keep[ci]);
+    tOff += keep[ci];
   }
   return out;
 }
@@ -2019,14 +2038,14 @@ function flattenScales(caps) {
 // Used to retrieve the 48k scale for the relevant segment.
 function getCapForFrame(caps, frameIdx) {
   if (caps.mode === 'single') return caps.cap;
-  const chunks = caps.mode === 'ola24' ? caps.chunks : caps.segments;
+  const capList = capListOf(caps);
+  const keep    = capKeepFrames(caps); // trimmed counts — must match flattenCaps
   let cum = 0;
-  for (const chunk of chunks) {
-    const T_i = Number(chunk.cap.codesDims[2]);
-    if (frameIdx < cum + T_i) return chunk.cap;
-    cum += T_i;
+  for (let ci = 0; ci < capList.length; ci++) {
+    if (frameIdx < cum + keep[ci]) return capList[ci];
+    cum += keep[ci];
   }
-  return chunks[chunks.length - 1].cap;
+  return capList[capList.length - 1];
 }
 
 // ---------------------------------------------------------------------------
