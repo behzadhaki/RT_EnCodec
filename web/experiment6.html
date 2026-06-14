@@ -378,6 +378,34 @@ umapSection.innerHTML = `
     <button class="tog active" id="togUMAPMode"  style="flex:1">UMAP</button>
     <button class="tog"        id="togPCAMode"   style="flex:1">PCA</button>
     <button class="tog"        id="togWheelMode" style="flex:1">Wheel</button>
+    <button class="tog"        id="togSSMMode"   style="flex:1">SSM</button>
+  </div>
+  <div class="row" id="ssmScopeRow" style="display:none">
+    <span class="lbl">Scope</span>
+    <div style="display:flex;gap:3px">
+      <button class="tog active" id="togSSMJoint">Joint</button>
+      <button class="tog"        id="togSSMCross">Cross A×B</button>
+      <button class="tog"        id="togSSMSelf">Self</button>
+    </div>
+  </div>
+  <div class="row" id="ssmWhichRow" style="display:none">
+    <span class="lbl">Source</span>
+    <div style="display:flex;gap:3px">
+      <button class="tog active" id="togSSMWhichA">A</button>
+      <button class="tog"        id="togSSMWhichB">B</button>
+    </div>
+  </div>
+  <div class="row" id="ssmResRow" style="display:none">
+    <span class="lbl">Resolution</span>
+    <input type="number" id="ssmBudget" value="1024" min="16" max="4096" step="16" style="width:64px">
+    <span style="font-size:11px;color:var(--muted);margin-left:2px">px max</span>
+  </div>
+  <div class="row" id="ssmMetricRow" style="display:none">
+    <span class="lbl">Metric</span>
+    <div style="display:flex;gap:3px">
+      <button class="tog active" id="togSSMMetricCos">Cosine</button>
+      <button class="tog"        id="togSSMMetricEuc">Euclid</button>
+    </div>
   </div>
   <div class="row" id="wheelAngleRow" style="display:none">
     <span class="lbl">Angle</span>
@@ -733,6 +761,7 @@ const levelMenu     = document.getElementById('levelMenu');
 const nNeighborsEl  = document.getElementById('nNeighbors');
 const minDistEl     = document.getElementById('minDist');
 const umapWindowEl  = document.getElementById('umapWindow');
+const ssmBudgetEl   = document.getElementById('ssmBudget');
 const togExplore    = document.getElementById('togExplore');
 const togDraw       = document.getElementById('togDraw');
 const togPins       = document.getElementById('togPins');
@@ -790,9 +819,18 @@ const PRE_REDUCE_VAR  = 0.95;  // target cumulative explained variance
 let coordsA         = null;
 let coordsB         = null;
 
-// Projection mode — 'umap' | 'pca' | 'wheel'
+// Projection mode — 'umap' | 'pca' | 'wheel' | 'ssm'
 let projectionMode  = 'umap';
 let pcaCoords       = null;  // {coordsA, coordsB} — cached PCA result for current features
+
+// SSM (self-/cross-similarity matrix) state
+let ssmScope        = 'joint';    // 'joint' | 'cross' | 'self'
+let ssmWhich        = 'A';        // self-scope source: 'A' | 'B'
+let ssmBudget       = 1024;       // pixel budget P — caps the matrix at P×P (temporal pooling)
+let ssmMetric       = 'cosine';   // 'cosine' | 'euclidean'
+let ssmImage        = null;       // { rgba:ImageData, w, h, scope, seam, pA, pB, T_A, T_B, vmin, vmax, metric }
+let ssmWorker       = null;
+let activeSSMJobId  = -1;
 let wheelRadius     = 'loud';   // 'loud' | 'time' | 'atyp' — wheel-mode radius source
 let wheelAngle      = 'umap1d'; // 'umap1d' | 'pc1' — wheel-mode angle source
 let wheelScale      = 'value';  // 'value' | 'rank' — wheel-mode radius scaling
@@ -1328,6 +1366,7 @@ function buildDrawUserTrajectory() {
 }
 
 function renderScatter() {
+  if (projectionMode === 'ssm') { renderSSM(); return; }
   const fps = coordsA ? coordsA.length / srcDuration('A') : 1;
   // Build the visual segments array: completed segments + live stroke if any.
   const drawSegments = canvasMode === 'draw'
@@ -1351,6 +1390,125 @@ function renderScatter() {
     srcAEnabled, srcBEnabled,
   });
   if (result !== null) lastTransform = result;
+}
+
+// ── SSM heatmap render ───────────────────────────────────────────────────────
+// Draws ssmImage (a w×h colour-mapped matrix) into umapCanvas, fit to the
+// available area preserving aspect, with axis labels, seam guides (joint scope),
+// and a title. Geometry of the drawn image is cached on ssmRect for hover hits.
+let ssmOffscreen = null;
+let ssmRect = null; // { x, y, w, h } in physical (dpr) pixels — placement of the image
+
+function renderSSM() {
+  const ctx = umapCanvas.getContext('2d');
+  const PW = umapCanvas.width, PH = umapCanvas.height; // physical px
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, PW, PH);
+  ctx.fillStyle = '#0c0c10';
+  ctx.fillRect(0, 0, PW, PH);
+
+  if (!ssmImage) {
+    ctx.fillStyle = '#888';
+    ctx.font = `${13 * dpr}px sans-serif`;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText('Encode source(s) to compute the similarity matrix.', PW / 2, PH / 2);
+    ssmRect = null;
+    return;
+  }
+
+  const { rgba, w, h, scope, seam, pA } = ssmImage;
+
+  // Stage the matrix into an offscreen canvas at native resolution.
+  if (!ssmOffscreen) ssmOffscreen = document.createElement('canvas');
+  if (ssmOffscreen.width !== w || ssmOffscreen.height !== h) {
+    ssmOffscreen.width = w; ssmOffscreen.height = h;
+  }
+  ssmOffscreen.getContext('2d').putImageData(rgba, 0, 0);
+
+  // Fit into the canvas with margins for labels/title (physical px).
+  const mL = 34 * dpr, mT = 28 * dpr, mR = 12 * dpr, mB = 22 * dpr;
+  const availW = Math.max(1, PW - mL - mR);
+  const availH = Math.max(1, PH - mT - mB);
+  const scale = Math.min(availW / w, availH / h);
+  const dw = w * scale, dh = h * scale;
+  const dx = mL + (availW - dw) / 2;
+  const dy = mT + (availH - dh) / 2;
+  ssmRect = { x: dx, y: dy, w: dw, h: dh };
+
+  ctx.imageSmoothingEnabled = scale < 1; // smooth on downscale, crisp on upscale
+  ctx.drawImage(ssmOffscreen, dx, dy, dw, dh);
+
+  // Frame.
+  ctx.strokeStyle = '#333'; ctx.lineWidth = 1 * dpr;
+  ctx.strokeRect(dx + 0.5, dy + 0.5, dw, dh);
+
+  // Seam guides for the joint block matrix (A|B boundary on both axes).
+  if (scope === 'joint' && seam > 0 && seam < w) {
+    const fx = dx + (seam / w) * dw;
+    const fy = dy + (seam / h) * dh;
+    ctx.strokeStyle = 'rgba(120,200,255,0.55)';
+    ctx.lineWidth = 1 * dpr;
+    ctx.beginPath();
+    ctx.moveTo(fx, dy); ctx.lineTo(fx, dy + dh);
+    ctx.moveTo(dx, fy); ctx.lineTo(dx + dw, fy);
+    ctx.stroke();
+  }
+
+  // Labels.
+  ctx.fillStyle = '#bbb';
+  ctx.font = `${11 * dpr}px sans-serif`;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+  const title = scope === 'cross' ? 'Cross-similarity  (rows A · cols B)'
+              : scope === 'self'  ? `Self-similarity  (${ssmWhich})`
+              : 'Joint SSM  (A·A | A·B | B·B)';
+  ctx.fillText(title, dx + dw / 2, 6 * dpr);
+
+  // Axis source labels.
+  ctx.fillStyle = '#9ad0ff';
+  ctx.textBaseline = 'middle';
+  if (scope === 'cross') {
+    ctx.save(); ctx.translate(mL * 0.45, dy + dh / 2); ctx.rotate(-Math.PI / 2);
+    ctx.fillText('A', 0, 0); ctx.restore();
+    ctx.textBaseline = 'top';
+    ctx.fillText('B', dx + dw / 2, dy + dh + 5 * dpr);
+  } else if (scope === 'joint') {
+    const aMid = dy + (pA / 2 / h) * dh, bMid = dy + ((pA + (w - pA) / 2) / h) * dh;
+    ctx.save(); ctx.translate(mL * 0.45, aMid); ctx.rotate(-Math.PI / 2); ctx.fillText('A', 0, 0); ctx.restore();
+    ctx.save(); ctx.translate(mL * 0.45, bMid); ctx.rotate(-Math.PI / 2); ctx.fillText('B', 0, 0); ctx.restore();
+  }
+}
+
+// Hover readout for the SSM: map cursor → matrix cell → (source, time) on each
+// axis + the similarity value. Pooling means a cell spans a time *range*; we
+// report its centre. Shown in the status bar (no overlay churn).
+function onSSMHover(e) {
+  if (!ssmImage || !ssmRect) return;
+  const rect = umapCanvas.getBoundingClientRect();
+  const px = (e.clientX - rect.left) * dpr - ssmRect.x;
+  const py = (e.clientY - rect.top)  * dpr - ssmRect.y;
+  if (px < 0 || py < 0 || px >= ssmRect.w || py >= ssmRect.h) return;
+
+  const { w, h, sim, scope, pA, pB } = ssmImage;
+  const col = Math.min(w - 1, Math.floor((px / ssmRect.w) * w));
+  const row = Math.min(h - 1, Math.floor((py / ssmRect.h) * h));
+  const v = sim[row * w + col];
+
+  // Map a super-frame index on a given axis to a "Source time" label.
+  const label = (idx, axis) => {
+    let src, sf, p;
+    if (scope === 'self')      { src = ssmWhich; sf = idx; p = src === 'A' ? pA : pB; }
+    else if (scope === 'cross'){ src = axis === 'row' ? 'A' : 'B'; sf = idx; p = src === 'A' ? pA : pB; }
+    else { // joint
+      if (idx < pA) { src = 'A'; sf = idx; p = pA; }
+      else          { src = 'B'; sf = idx - pA; p = pB; }
+    }
+    const t = p > 0 ? ((sf + 0.5) / p) * srcDuration(src) : 0;
+    return `${src} ${t.toFixed(2)}s`;
+  };
+
+  const unit = ssmImage.metric === 'cosine' ? 'cos' : 'd';
+  const val  = ssmImage.metric === 'cosine' ? v.toFixed(3) : (-v).toFixed(3);
+  setStatus(`${label(row, 'row')} ↔ ${label(col, 'col')} · ${unit} ${val}`);
 }
 
 // ── Dirty flags & effect scheduler ───────────────────────────────────────────
@@ -1675,6 +1833,68 @@ function launchPCA() {
   umapWorker.postMessage({ type: 'compute_pca', jobId: activeUMAPJobId, flat, T_A, T_B, D });
 }
 
+// ── SSM launch ─────────────────────────────────────────────────────────────────
+// Reuses umapFeatureData.flat (z-scored, all feature knobs baked in). The worker
+// pools each source to ≤ssmBudget super-frames, computes the similarity matrix,
+// and returns a colour-mapped RGBA image. Heavy work is one matmul on pooled data.
+
+function initSSMWorker() {
+  if (ssmWorker) ssmWorker.terminate();
+  ssmWorker = new Worker(new URL('./ssm-worker.js?v=1', import.meta.url), { type: 'module' });
+  ssmWorker.onmessage = onSSMWorkerMsg;
+}
+
+function launchSSM() {
+  if (!umapFeatureData) return;
+  const { flat, T_A, T_B, D } = umapFeatureData;
+
+  // Cross/self need both/the chosen source to be non-empty.
+  if (ssmScope === 'cross' && (T_A === 0 || T_B === 0)) {
+    setStatus('Cross-SSM needs both sources encoded.', true);
+    return;
+  }
+  if (ssmScope === 'self' && ((ssmWhich === 'A' && T_A === 0) || (ssmWhich === 'B' && T_B === 0))) {
+    setStatus(`Self-SSM: source ${ssmWhich} is empty.`, true);
+    return;
+  }
+
+  initSSMWorker();
+  activeSSMJobId = ++jobSeq;
+
+  const P = Math.max(16, Math.min(4096, parseInt(ssmBudgetEl.value) || 1024));
+  ssmBudget = P;
+
+  progWrap.style.display = 'block';
+  progBar.style.width = '40%';
+  setStatus(`SSM — ${ssmScope}${ssmScope === 'self' ? ' ' + ssmWhich : ''}, ${ssmMetric}, ≤${P}px…`);
+
+  // flat sent as a copy (not transferred) so it survives for re-runs / other modes.
+  ssmWorker.postMessage({
+    type: 'compute_ssm', jobId: activeSSMJobId,
+    flat, T_A, T_B, D,
+    scope: ssmScope, which: ssmWhich, P, metric: ssmMetric,
+  });
+}
+
+function onSSMWorkerMsg({ data: msg }) {
+  if (msg.type !== 'ssm_result' || msg.jobId !== activeSSMJobId) return;
+  progBar.style.width = '100%';
+  setTimeout(() => { progWrap.style.display = 'none'; progBar.style.width = '0%'; }, 200);
+
+  if (msg.empty) { ssmImage = null; setStatus('SSM — no frames.', true); return; }
+
+  const imgData = new ImageData(new Uint8ClampedArray(msg.rgba), msg.w, msg.h);
+  ssmImage = {
+    rgba: imgData, sim: new Float32Array(msg.sim), w: msg.w, h: msg.h,
+    scope: msg.scope, seam: msg.seam, pA: msg.pA, pB: msg.pB,
+    T_A: msg.T_A, T_B: msg.T_B, vmin: msg.vmin, vmax: msg.vmax, metric: msg.metric,
+  };
+  const pooled = (msg.pA && msg.pA < msg.T_A) || (msg.pB && msg.pB < msg.T_B);
+  setStatus(`SSM — ${msg.scope}${msg.scope === 'self' ? ' ' + ssmWhich : ''} · ${msg.w}×${msg.h}`
+    + (pooled ? ' (pooled)' : '') + ` · ${msg.metric}`);
+  scheduleRender();
+}
+
 // ── Wheel projection ───────────────────────────────────────────────────────────
 // θ = PC1 rank wrapped to [0, 2π) — similarity as a circular dimension, so
 // drawn orbits make seamless loops. Rank (not raw value) spreads frames evenly
@@ -1819,6 +2039,7 @@ function setProjectionMode(mode) {
   document.getElementById('togUMAPMode') .classList.toggle('active', mode === 'umap');
   document.getElementById('togPCAMode')  .classList.toggle('active', mode === 'pca');
   document.getElementById('togWheelMode').classList.toggle('active', mode === 'wheel');
+  document.getElementById('togSSMMode')  .classList.toggle('active', mode === 'ssm');
   document.getElementById('neighborRow') .style.display = mode === 'umap' ? '' : 'none';
   document.getElementById('minDistRow')  .style.display = mode === 'umap' ? '' : 'none';
   document.getElementById('preReduceRow').style.display = mode === 'umap' ? '' : 'none';
@@ -1827,7 +2048,14 @@ function setProjectionMode(mode) {
   document.getElementById('wheelAngleRow') .style.display = mode === 'wheel' ? '' : 'none';
   document.getElementById('wheelRadiusRow').style.display = mode === 'wheel' ? '' : 'none';
   document.getElementById('wheelScaleRow') .style.display = mode === 'wheel' ? '' : 'none';
+  document.getElementById('ssmScopeRow')  .style.display = mode === 'ssm' ? '' : 'none';
+  document.getElementById('ssmWhichRow')  .style.display = mode === 'ssm' && ssmScope === 'self' ? '' : 'none';
+  document.getElementById('ssmResRow')    .style.display = mode === 'ssm' ? '' : 'none';
+  document.getElementById('ssmMetricRow') .style.display = mode === 'ssm' ? '' : 'none';
+  document.getElementById('trajPanel')     .style.display = mode === 'ssm' ? 'none' : '';
   slotWrap.classList.toggle('visible', mode === 'umap' && umapSlots.some(s => s));
+
+  if (mode === 'ssm') scheduleRender(); // paint the heatmap (placeholder or cached) on entry
 
   if (!umapFeatureData) return; // nothing computed yet — triggerProjection() will dispatch when ready
 
@@ -1849,6 +2077,9 @@ function setProjectionMode(mode) {
     } else {
       launchWheelAngle(); // result handler routes to wheel coords by mode
     }
+  } else if (mode === 'ssm') {
+    if (ssmImage) scheduleRender();  // cached image for current features — show instantly
+    else          launchSSM();
   } else { // umap
     slotWrap.classList.add('visible');
     updateSlotDots();
@@ -2759,6 +2990,32 @@ updateEncOptVisibility();
 document.getElementById('togUMAPMode') .addEventListener('click', () => setProjectionMode('umap'));
 document.getElementById('togPCAMode')  .addEventListener('click', () => setProjectionMode('pca'));
 document.getElementById('togWheelMode').addEventListener('click', () => setProjectionMode('wheel'));
+document.getElementById('togSSMMode')  .addEventListener('click', () => setProjectionMode('ssm'));
+
+// SSM controls — scope/source/metric/resolution change only the matrix, not the
+// feature build, so they just relaunch the worker on the existing flat.
+function recomputeSSMIfActive() {
+  if (projectionMode === 'ssm' && umapFeatureData) { ssmImage = null; launchSSM(); }
+}
+createToggleGroup([
+  { el: document.getElementById('togSSMJoint'), value: 'joint' },
+  { el: document.getElementById('togSSMCross'), value: 'cross' },
+  { el: document.getElementById('togSSMSelf'),  value: 'self' },
+], v => {
+  ssmScope = v;
+  document.getElementById('ssmWhichRow').style.display =
+    projectionMode === 'ssm' && v === 'self' ? '' : 'none';
+  recomputeSSMIfActive();
+});
+createToggleGroup([
+  { el: document.getElementById('togSSMWhichA'), value: 'A' },
+  { el: document.getElementById('togSSMWhichB'), value: 'B' },
+], v => { ssmWhich = v; recomputeSSMIfActive(); });
+createToggleGroup([
+  { el: document.getElementById('togSSMMetricCos'), value: 'cosine' },
+  { el: document.getElementById('togSSMMetricEuc'), value: 'euclidean' },
+], v => { ssmMetric = v; recomputeSSMIfActive(); });
+ssmBudgetEl.addEventListener('change', recomputeSSMIfActive);
 
 // Wheel angle source — uses the cached PC1 / 1-D UMAP if available, else computes it.
 createToggleGroup([
@@ -3198,6 +3455,7 @@ function triggerProjection() {
   umapSlotIdx     = 0;
   umapFeatureData = null;
   pcaCoords       = null;
+  ssmImage        = null;  // features changed — invalidate cached matrix
   updateSlotDots();
   slotWrap.classList.toggle('visible', projectionMode === 'umap');
 
@@ -3211,6 +3469,8 @@ function triggerProjection() {
         launchPCA();
       } else if (projectionMode === 'wheel') {
         launchWheelAngle(); // result handler routes to wheel coords
+      } else if (projectionMode === 'ssm') {
+        launchSSM();
       } else {
         slotWrap.classList.add('visible');
         startUMAPReduction();
@@ -3646,6 +3906,7 @@ function resamplePath(pts, maxN) {
 umapCanvas.style.cursor = 'crosshair';
 
 umapCanvas.addEventListener('wheel', e => {
+  if (projectionMode === 'ssm') return;
   e.preventDefault();
   if (!lastTransform) return;
   const rect = umapCanvas.getBoundingClientRect();
@@ -3684,6 +3945,7 @@ window.addEventListener('keydown', e => {
 // ── Drag + draw event handlers ────────────────────────────────────────────────
 
 umapCanvas.addEventListener('mousedown', e => {
+  if (projectionMode === 'ssm') return;
   if (!lastTransform) return;
   if (e.shiftKey && userTrajectory.length >= 2) {
     isShiftDragging   = true;
@@ -3723,6 +3985,7 @@ umapCanvas.addEventListener('mousedown', e => {
 });
 
 umapCanvas.addEventListener('mousemove', e => {
+  if (projectionMode === 'ssm') { onSSMHover(e); return; }
   if (isPinDragging) {
     if (!coordsA || !coordsB) return;
     const [umapX, umapY] = canvasToUmap(e);
@@ -3852,6 +4115,7 @@ function hitTestSegments(physX, physY, threshPx = 12) {
 }
 
 umapCanvas.addEventListener('contextmenu', e => {
+  if (projectionMode === 'ssm') { e.preventDefault(); return; }
   e.preventDefault();
   closeSegCtxMenu();
   if (canvasMode !== 'draw' || !rawDrawSegments.length || !lastTransform) return;
@@ -3917,6 +4181,7 @@ document.addEventListener('keydown', e => { if (e.key === 'Escape') closeSegCtxM
 // ── Double-click: add/remove pins ────────────────────────────────────────────
 
 umapCanvas.addEventListener('dblclick', e => {
+  if (projectionMode === 'ssm') return;
   if (canvasMode !== 'pins' || !lastTransform || !coordsA || !coordsB) return;
   const rect   = umapCanvas.getBoundingClientRect();
   const physX  = (e.clientX - rect.left) * dpr;
@@ -3965,6 +4230,7 @@ umapCanvas.addEventListener('dblclick', e => {
 // ── Click to play (explore mode) ──────────────────────────────────────────────
 
 umapCanvas.addEventListener('click', async e => {
+  if (projectionMode === 'ssm') return;
   if (canvasMode !== 'explore') return;
   if (panDragMoved) { panDragMoved = false; return; }
   if (!coordsA || !coordsB || !lastTransform || !currentEmbeds) return;
@@ -4379,6 +4645,13 @@ initHelpTips({
   '#togUMAPMode':    'UMAP: nonlinear neighbour-preserving layout, 6 seeded variants. Better clusters, no fixed axes.',
   '#togPCAMode':     'PCA: linear projection onto the top-2 variance directions. Deterministic, preserves global structure, weaker clustering.',
   '#togWheelMode':   'Wheel: similarity as the angle (1-D UMAP or PC1), a chosen scalar as the radius. Drawn orbits loop seamlessly. Proximity across the centre does NOT mean similarity — it’s a controller, not a map.',
+  '#togSSMMode':     'SSM: similarity matrix over the same features. Every frame vs every frame — preserves global structure exactly (no neighbour distortion) and is fast (one matmul). Long files are mean-pooled to the resolution cap, so it scales to any length. Diagonals = repeats, blocks = homogeneous regions.',
+  '#togSSMJoint':    'Joint: stack both sources → block matrix with A·A and B·B self-similarity on the diagonal and the A·B cross-similarity off-diagonal. Blue lines mark the A/B seam.',
+  '#togSSMCross':    'Cross A×B: rows = A frames, cols = B frames. Strictly how similar each A frame is to each B frame — alignment / shared material between the two sources.',
+  '#togSSMSelf':     'Self: similarity of one source against itself (T×T). Classic music-structure view — find repeats, sections, loops within a single signal.',
+  '#togSSMMetricCos':'Cosine similarity on L2-normalised frames (∈[−1,1]). Fixed colour scale across files. Scale-invariant — direction in feature space, not magnitude.',
+  '#togSSMMetricEuc':'Euclidean distance → similarity (auto-ranged per matrix). Sensitive to magnitude, so loudness/atypicality affect it.',
+  '#ssmBudget':      'Resolution cap. If a source has more frames than this, it is mean-pooled down to this many super-frames before the matrix is built — caps compute & memory at P×P so arbitrarily long audio stays fast. Pooling also denoises; lower it for very long files, raise it for fine detail.',
   '#togWheelAngleUMAP': 'Angle from a 1-D UMAP: neighbourhood-preserving, so timbre families stay angularly contiguous. Stochastic; recomputed per feature change.',
   '#togWheelAnglePC1':  'Angle from PC1 rank: the dominant linear axis of variation. Deterministic and instant, but only orders by one direction of the feature space.',
   '#togWheelLoud':   'Radius = per-frame loudness (48 kHz scale, or raw-audio RMS on 24 kHz). Pull paths outward for louder grains.',
