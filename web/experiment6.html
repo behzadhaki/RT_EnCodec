@@ -1426,13 +1426,17 @@ function renderSSM() {
   }
   ssmOffscreen.getContext('2d').putImageData(rgba, 0, 0);
 
-  // Fit into the canvas with margins for labels/title (physical px).
-  const mL = 34 * dpr, mT = 28 * dpr, mR = 12 * dpr, mB = 22 * dpr;
-  const availW = Math.max(1, PW - mL - mR);
+  // Fit into the canvas with margins for labels/title (physical px). A left
+  // gutter (profileW) holds the per-frame marginal profile, aligned row-for-row
+  // with the matrix.
+  const mL = 30 * dpr, mT = 28 * dpr, mR = 12 * dpr, mB = 22 * dpr;
+  const profileW = 56 * dpr, profGap = 6 * dpr;
+  const leftReserve = mL + profileW + profGap;
+  const availW = Math.max(1, PW - leftReserve - mR);
   const availH = Math.max(1, PH - mT - mB);
   const scale = Math.min(availW / w, availH / h);
   const dw = w * scale, dh = h * scale;
-  const dx = mL + (availW - dw) / 2;
+  const dx = leftReserve + (availW - dw) / 2;
   const dy = mT + (availH - dh) / 2;
   ssmRect = { x: dx, y: dy, w: dw, h: dh };
 
@@ -1487,6 +1491,50 @@ function renderSSM() {
       ctx.strokeStyle = core;               ctx.lineWidth = 1.6 * dpr; lines(); // core
       ctx.restore();
     }
+  }
+
+  // Per-frame marginal profile (left gutter), aligned row-for-row with the
+  // matrix. Each row's mean similarity to all frames → a horizontal bar growing
+  // LEFT from the matrix edge: long = typical/connected, short = outlier. Joint
+  // colours A rows orange, B rows blue; the seam is marked.
+  if (ssmImage.rowProfile) {
+    const prof = ssmImage.rowProfile;
+    const pmin = ssmImage.profMin, pmax = ssmImage.profMax;
+    const span = pmax - pmin > 1e-9 ? pmax - pmin : 1;
+    const px1 = dx - profGap;             // right edge (matrix-adjacent baseline)
+    const px0 = px1 - profileW;           // far-left edge (max value)
+    // panel backdrop + baseline
+    ctx.fillStyle = 'rgba(255,255,255,0.04)';
+    ctx.fillRect(px0, dy, profileW, dh);
+    ctx.strokeStyle = '#444'; ctx.lineWidth = 1 * dpr;
+    ctx.beginPath(); ctx.moveTo(px1 + 0.5, dy); ctx.lineTo(px1 + 0.5, dy + dh); ctx.stroke();
+    // one horizontal line per matrix pixel-row (cheap; dh ≲ 1000)
+    const aColor = 'rgba(255,176,72,0.85)', bColor = 'rgba(84,200,255,0.85)';
+    const single = scope === 'self'
+      ? (ssmWhich === 'A' ? aColor : bColor)
+      : scope === 'cross' ? aColor : null; // cross rows = A
+    const nRows = Math.max(1, Math.round(dh));
+    for (let yy = 0; yy < nRows; yy++) {
+      const r = Math.min(h - 1, Math.floor((yy / nRows) * h));
+      const t = (prof[r] - pmin) / span;                 // 0..1
+      const len = t * profileW;
+      ctx.strokeStyle = single || (r < pA ? aColor : bColor);
+      ctx.beginPath();
+      ctx.moveTo(px1, dy + yy + 0.5);
+      ctx.lineTo(px1 - len, dy + yy + 0.5);
+      ctx.stroke();
+    }
+    // seam marker in the profile (joint only)
+    if (scope === 'joint' && pA > 0 && pA < h) {
+      const sy = dy + (pA / h) * dh;
+      ctx.strokeStyle = 'rgba(120,200,255,0.55)'; ctx.lineWidth = 1 * dpr;
+      ctx.beginPath(); ctx.moveTo(px0, sy); ctx.lineTo(px1, sy); ctx.stroke();
+    }
+    // caption
+    ctx.fillStyle = '#9a9a9a';
+    ctx.font = `${9 * dpr}px sans-serif`;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'bottom';
+    ctx.fillText('typicality →', (px0 + px1) / 2, dy - 2 * dpr);
   }
 
   // Labels.
@@ -1919,11 +1967,29 @@ function onSSMWorkerMsg({ data: msg }) {
   if (msg.empty) { ssmImage = null; setStatus('SSM — no frames.', true); return; }
 
   const imgData = new ImageData(new Uint8ClampedArray(msg.rgba), msg.w, msg.h);
+  const sim = new Float32Array(msg.sim);
   ssmImage = {
-    rgba: imgData, sim: new Float32Array(msg.sim), w: msg.w, h: msg.h,
+    rgba: imgData, sim, w: msg.w, h: msg.h,
     scope: msg.scope, seam: msg.seam, pA: msg.pA, pB: msg.pB,
     T_A: msg.T_A, T_B: msg.T_B, vmin: msg.vmin, vmax: msg.vmax, metric: msg.metric,
   };
+  // Per-frame marginal: mean similarity of each row (frame) to all frames.
+  // sim is row-major (h rows × w cols). For symmetric scopes this is a frame's
+  // "typicality" (alignment with the centroid); for cross it's A-vs-B overall.
+  {
+    const { w, h } = msg;
+    const prof = new Float32Array(h);
+    let pmin = Infinity, pmax = -Infinity;
+    for (let r = 0; r < h; r++) {
+      let s = 0; const off = r * w;
+      for (let c = 0; c < w; c++) s += sim[off + c];
+      const m = s / w;
+      prof[r] = m;
+      if (m < pmin) pmin = m;
+      if (m > pmax) pmax = m;
+    }
+    ssmImage.rowProfile = prof; ssmImage.profMin = pmin; ssmImage.profMax = pmax;
+  }
   const pooled = (msg.pA && msg.pA < msg.T_A) || (msg.pB && msg.pB < msg.T_B);
   setStatus(`SSM — ${msg.scope}${msg.scope === 'self' ? ' ' + ssmWhich : ''} · ${msg.w}×${msg.h}`
     + (pooled ? ' (pooled)' : '') + ` · ${msg.metric}`);
