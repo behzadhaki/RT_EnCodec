@@ -1,3 +1,5 @@
+import { MAX_FOLDER_FILES } from './audio-utils.js';
+
 /**
  * createSourcePanel — builds a .section element with source controls.
  *
@@ -35,6 +37,7 @@ export function createSourcePanel({
   showVol      = false,
   showGate     = false,
   showSilence  = false,
+  showFolder   = false,
   onChange     = () => {},
   onFilePicked = null,
 } = {}) {
@@ -53,6 +56,7 @@ export function createSourcePanel({
         <option value="sweep">Sweep</option>
         ${showSilence ? '<option value="silence">Silence</option>' : ''}
         <option value="file">File</option>
+        ${showFolder ? '<option value="folder">Folder (join WAVs)</option>' : ''}
       </select>
     </div>
     <div class="row src-freq-row">
@@ -64,6 +68,11 @@ export function createSourcePanel({
       <button class="file-btn src-file-btn">choose file…</button>
       <input type="file" class="src-file-input" accept="audio/*,audio/mp4,audio/x-m4a,.m4a,.m4b,.caf,.aiff,.aif" style="display:none">
     </div>
+    ${showFolder ? `
+    <div class="row src-folder-row" style="display:none">
+      <button class="file-btn src-folder-btn">choose folder…</button>
+      <input type="file" class="src-folder-input" webkitdirectory directory multiple style="display:none">
+    </div>` : ''}
     <div class="row src-load-row" style="display:none">
       <span class="lbl">Load</span>
       <label style="display:flex;align-items:center;gap:4px;font-size:11px;cursor:pointer;color:var(--muted)">
@@ -104,6 +113,9 @@ export function createSourcePanel({
   const fileRow     = section.querySelector('.src-file-row');
   const fileBtnEl   = section.querySelector('.src-file-btn');
   const fileInputEl = section.querySelector('.src-file-input');
+  const folderRow     = section.querySelector('.src-folder-row');
+  const folderBtnEl   = section.querySelector('.src-folder-btn');
+  const folderInputEl = section.querySelector('.src-folder-input');
   const loadRow     = section.querySelector('.src-load-row');
   const loadFullEl  = section.querySelector('.src-load-full');
   const trimRow     = section.querySelector('.src-trim-row');
@@ -118,15 +130,19 @@ export function createSourcePanel({
   let gateEnabled       = false;
   let currentFile       = null;
   let currentFileHandle = null;   // FileSystemFileHandle when available (null on Firefox)
+  let currentFolder     = null;   // Array<File> of .wav files, name-sorted (folder mode)
+  let currentFolderName = '';
 
   function updateVisibility() {
     const v        = typeEl.value;
     const isFile   = v === 'file';
+    const isFolder = v === 'folder';
     const loadFull = loadFullEl.checked;
     fileRow.style.display = isFile ? '' : 'none';
-    loadRow.style.display = isFile ? '' : 'none';
-    trimRow.style.display = (isFile && !loadFull) ? '' : 'none';
-    freqRow.style.display = (isFile || v === 'sweep' || v === 'silence') ? 'none' : '';
+    if (folderRow) folderRow.style.display = isFolder ? '' : 'none';
+    loadRow.style.display = (isFile || isFolder) ? '' : 'none';
+    trimRow.style.display = ((isFile || isFolder) && !loadFull) ? '' : 'none';
+    freqRow.style.display = (isFile || isFolder || v === 'sweep' || v === 'silence') ? 'none' : '';
   }
 
   typeEl.addEventListener('change',   () => { updateVisibility(); onChange(0); });
@@ -183,6 +199,46 @@ export function createSourcePanel({
     onChange(0);
   });
 
+  // Folder picker — collects every .wav in the chosen directory, name-sorted,
+  // to be concatenated into one source. Prefers showDirectoryPicker (gives a
+  // folder name + clean iteration); falls back to a webkitdirectory <input>.
+  function setFolder(files, name) {
+    const all = [...files].filter(f => /\.wave?$/i.test(f.name))
+      .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' }));
+    const wavs = all.slice(0, MAX_FOLDER_FILES); // ≤20 files; each capped to MAX_S at load
+    currentFolder     = wavs.length ? wavs : null;
+    currentFolderName = name || '';
+    folderBtnEl.textContent = wavs.length
+      ? `${currentFolderName || 'folder'} · ${wavs.length}${all.length > wavs.length ? '/' + all.length : ''} wav`
+      : 'no .wav files found';
+  }
+
+  if (folderBtnEl) {
+    folderBtnEl.addEventListener('click', async () => {
+      if ('showDirectoryPicker' in window) {
+        let dirHandle;
+        try { dirHandle = await window.showDirectoryPicker(); }
+        catch (err) { if (err.name !== 'AbortError') throw err; return; }
+        const files = [];
+        for await (const entry of dirHandle.values()) {
+          if (entry.kind === 'file' && /\.wave?$/i.test(entry.name)) files.push(await entry.getFile());
+        }
+        setFolder(files, dirHandle.name);
+        onChange(0);
+      } else {
+        folderInputEl.click(); // change handler takes over
+      }
+    });
+
+    folderInputEl.addEventListener('change', () => {
+      const files = [...folderInputEl.files];
+      if (!files.length) return;
+      const name = files[0].webkitRelativePath?.split('/')[0] || 'folder';
+      setFolder(files, name);
+      onChange(0);
+    });
+  }
+
   if (volEl) volEl.addEventListener('input', () => onChange(0));
 
   if (gateTogEl) {
@@ -206,6 +262,7 @@ export function createSourcePanel({
     getFreq:         () => parseFloat(freqEl.value) || 440,
     getFile:         () => currentFile,
     getFileHandle:   () => currentFileHandle,
+    getFolder:       () => currentFolder,   // Array<File> | null (folder mode)
     /** Silently restore a file (+ optional handle) without firing callbacks.
      *  Call onFilePicked / onChange separately if needed. */
     setFile(file, handle = null) {
@@ -227,6 +284,9 @@ export function createSourcePanel({
         file: currentFile,
         handle: currentFileHandle,
         fileName: currentFile ? fileBtnEl.textContent : null,
+        folder: currentFolder,
+        folderName: currentFolderName,
+        folderLabel: folderBtnEl ? folderBtnEl.textContent : null,
         loadFull: loadFullEl.checked,
         trimS:    parseFloat(trimSEl.value) || 10,
         volume: volEl ? parseFloat(volEl.value) : 1,
@@ -241,6 +301,9 @@ export function createSourcePanel({
       currentFile       = s.file   ?? null;
       currentFileHandle = s.handle ?? null;   // null if not in saved state (e.g. localStorage restore)
       fileBtnEl.textContent = s.fileName || 'choose file…';
+      currentFolder     = s.folder ?? null;   // in-memory File[] (survives swap, not localStorage)
+      currentFolderName = s.folderName ?? '';
+      if (folderBtnEl) folderBtnEl.textContent = s.folderLabel || 'choose folder…';
       if (s.loadFull !== undefined) loadFullEl.checked = s.loadFull;
       if (s.trimS   !== undefined) trimSEl.value = s.trimS;
       if (volEl) volEl.value = s.volume;
@@ -256,10 +319,12 @@ export function createSourcePanel({
       updateVisibility();
     },
     setEnabled(on) {
-      [typeEl, freqEl, fileInputEl, loadFullEl, trimSEl, volEl, gateTogEl, gateFreqEl, gateDecEl]
+      [typeEl, freqEl, fileInputEl, folderInputEl, loadFullEl, trimSEl, volEl, gateTogEl, gateFreqEl, gateDecEl]
         .filter(Boolean).forEach(el => { el.disabled = !on; });
-      fileBtnEl.style.opacity = on ? '' : '0.4';
-      fileBtnEl.style.pointerEvents = on ? '' : 'none';
+      for (const btn of [fileBtnEl, folderBtnEl].filter(Boolean)) {
+        btn.style.opacity = on ? '' : '0.4';
+        btn.style.pointerEvents = on ? '' : 'none';
+      }
     },
   };
 }

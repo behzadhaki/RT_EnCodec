@@ -24,7 +24,7 @@
  *   buildBothAudios(len, sr)    — async convenience; returns { audioA, audioB }
  */
 import { createSourcePanel } from './source-panel.js';
-import { generateSource, applyPulseGate, loadFile, loopToLength, getAudioFileDuration, MAX_S } from './audio-utils.js';
+import { generateSource, applyPulseGate, loadFile, loadFolder, loopToLength, getAudioFileDuration, MAX_S } from './audio-utils.js';
 
 export function createDoubleSourceWidget({
   defaultDur   = 4,
@@ -34,6 +34,7 @@ export function createDoubleSourceWidget({
   showDuration = true,
   defaultFreqA = 440,
   defaultFreqB = 880,
+  showFolder   = false,
   onChange     = () => {},
 } = {}) {
   const el = document.createElement('div');
@@ -61,13 +62,13 @@ export function createDoubleSourceWidget({
 
   const panelA = createSourcePanel({
     title: 'Source A', defaultFreq: defaultFreqA,
-    showVol: true, showGate: true, showSilence: true,
+    showVol: true, showGate: true, showSilence: true, showFolder,
     onChange, onFilePicked,
   });
 
   const panelB = createSourcePanel({
     title: 'Source B', defaultFreq: defaultFreqB,
-    showVol: true, showGate: true, showSilence: true,
+    showVol: true, showGate: true, showSilence: true, showFolder,
     onChange, onFilePicked,
   });
 
@@ -132,6 +133,12 @@ export function createDoubleSourceWidget({
       // complete file duration.  Otherwise clamp to the panel's trim value.
       const maxS = panel.getLoadFull() ? Infinity : panel.getTrimS();
       audio = await loadFile(f, sr, maxS, channels);
+    } else if (type === 'folder') {
+      const files = panel.getFolder();
+      if (!files) throw new Error(`No folder selected for "${panel.element.querySelector('.section-title').textContent}".`);
+      // maxS applies per file; "full file" → whole file, else trim each to trimS.
+      const maxS = panel.getLoadFull() ? Infinity : panel.getTrimS();
+      audio = await loadFolder(files, sr, maxS, channels);
     } else {
       const len = Math.round(getDuration() * sr);
       audio = generateSource(type, panel.getFreq(), len / sr, sr);

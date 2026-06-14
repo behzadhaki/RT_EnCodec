@@ -94,6 +94,48 @@ export async function loadFile(file, sr, maxS = MAX_S, channels = 1) {
   return mono;
 }
 
+export const MAX_FOLDER_FILES = 20;
+
+// Loads every file in `files`, decodes/resamples each to `sr` via loadFile,
+// and concatenates them into one source (name-sorted, natural order). At most
+// `maxFiles` files are used, and each file is capped at MAX_S seconds (so a
+// long clip contributes only its first MAX_S). channels = 2 keeps the planar
+// layout [L…|R…], concatenated per-plane so the joined stereo stays valid.
+// Unreadable files are skipped with a warning rather than aborting the whole set.
+export async function loadFolder(files, sr, maxS = MAX_S, channels = 1, maxFiles = MAX_FOLDER_FILES) {
+  if (!files || !files.length) throw new Error('No files in folder.');
+  const sorted = [...files].sort((a, b) =>
+    a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' })).slice(0, maxFiles);
+
+  const perFileMaxS = Math.min(maxS, MAX_S); // never more than MAX_S per clip
+  const bufs = [];
+  for (const f of sorted) {
+    try { bufs.push(await loadFile(f, sr, perFileMaxS, channels)); }
+    catch (e) { console.warn('loadFolder: skipping unreadable file', f.name, e); }
+  }
+  if (!bufs.length) throw new Error('No decodable audio in folder.');
+
+  if (channels === 2) {
+    const Ts     = bufs.map(b => b.length / 2);
+    const totalT = Ts.reduce((s, t) => s + t, 0);
+    const out    = new Float32Array(2 * totalT);
+    let off = 0;
+    for (let i = 0; i < bufs.length; i++) {
+      const T = Ts[i];
+      out.set(bufs[i].subarray(0, T),      off);            // L plane
+      out.set(bufs[i].subarray(T, 2 * T),  totalT + off);   // R plane
+      off += T;
+    }
+    return out;
+  }
+
+  const totalT = bufs.reduce((s, b) => s + b.length, 0);
+  const out = new Float32Array(totalT);
+  let off = 0;
+  for (const b of bufs) { out.set(b, off); off += b.length; }
+  return out;
+}
+
 // Returns the duration of an audio File in seconds, capped at MAX_S.
 export async function getAudioFileDuration(file) {
   const arrBuf  = await file.arrayBuffer();

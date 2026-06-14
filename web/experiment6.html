@@ -308,6 +308,7 @@ const controls = document.getElementById('controls');
 const srcWidget = createDoubleSourceWidget({
   defaultDur:   4,
   showDuration: false,   // each file loads at its own natural length (≤ 10 s)
+  showFolder:   true,    // "Folder (join WAVs)" source type — concatenate a directory of WAVs
   onChange: delay => { saveAllPanelSettings(); refreshDropdowns(); scheduleEncode(delay); },
 });
 controls.appendChild(srcWidget.element);
