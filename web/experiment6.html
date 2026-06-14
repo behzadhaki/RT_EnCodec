@@ -921,6 +921,36 @@ let notchFilters     = [];
 let rawAudioA    = null;
 let rawAudioB    = null;
 let rawAudioCh   = 1;     // 2 when sources were loaded as planar stereo (48k model)
+let folderClipFracsA = null; // [0..1] clip-start fractions when A is a folder source
+let folderClipFracsB = null;
+
+// Distinct colour per folder clip/file — shared by the waveform and the maps.
+function clipColor(k, n) {
+  const hue = n > 1 ? Math.round((k / n) * 320 + 20) % 360 : 200;
+  return `hsl(${hue}, 70%, 58%)`;
+}
+// Waveform per-pixel colour fn: pos∈[0,1] → the colour of the clip it falls in.
+function folderColorFn(fracs) {
+  const n = fracs.length;
+  return pos => {
+    let k = 0;
+    for (let i = 1; i < n; i++) { if (pos >= fracs[i]) k = i; else break; }
+    return clipColor(k, n);
+  };
+}
+// Per-frame clip colours for the scatter (T markers → clip colour each).
+function clipColorsFor(T, fracs) {
+  const n = fracs.length, out = new Array(T);
+  const fb = fracs.map(f => Math.min(T, Math.max(0, Math.round(f * T)))); fb.push(T);
+  for (let k = 0; k < n; k++) { const c = clipColor(k, n); for (let i = fb[k]; i < fb[k + 1]; i++) out[i] = c; }
+  return out;
+}
+// Cached per-point scatter colours (recomputed only when the coords array changes).
+let pointColorsA = null, pointColorsB = null, _pcCoordsA = null, _pcCoordsB = null;
+function refreshPointColors() {
+  if (coordsA !== _pcCoordsA) { _pcCoordsA = coordsA; pointColorsA = (folderClipFracsA && coordsA) ? clipColorsFor(coordsA.length, folderClipFracsA) : null; }
+  if (coordsB !== _pcCoordsB) { _pcCoordsB = coordsB; pointColorsB = (folderClipFracsB && coordsB) ? clipColorsFor(coordsB.length, folderClipFracsB) : null; }
+}
 let durA         = null;   // actual loaded duration (s) for source A
 let durB         = null;   // actual loaded duration (s) for source B
 
@@ -1362,6 +1392,7 @@ function buildDrawUserTrajectory() {
 
 function renderScatter() {
   if (projectionMode === 'ssm') { renderSSM(); return; }
+  refreshPointColors();
   const fps = coordsA ? coordsA.length / srcDuration('A') : 1;
   // Build the visual segments array: completed segments + live stroke if any.
   const drawSegments = canvasMode === 'draw'
@@ -1383,6 +1414,7 @@ function renderScatter() {
     ctxMode: mp.getModelHz() === '48k' ? 'sym' : 'pre',
     snapMode, snapKVal, snapDurVal, framesPerSec: fps,
     srcAEnabled, srcBEnabled,
+    pointColorsA, pointColorsB,
   });
   if (result !== null) lastTransform = result;
 }
@@ -2170,12 +2202,32 @@ function frameRms(raw, ch, T_frames) {
   return out;
 }
 
+// Per-frame normalized time. For a folder source each clip's time restarts at
+// its own beginning (0 at the clip start, 1 at its end) using the clip-start
+// fractions; otherwise it's the global 0→1 ramp over the whole source.
+function clipRelTime(T, fracs) {
+  const out = new Float32Array(T);
+  if (T <= 0) return out;
+  if (!fracs || fracs.length <= 1) {
+    for (let i = 0; i < T; i++) out[i] = T > 1 ? i / (T - 1) : 0.5;
+    return out;
+  }
+  const fb = fracs.map(f => Math.min(T, Math.max(0, Math.round(f * T))));
+  fb.push(T);
+  for (let k = 0; k < fb.length - 1; k++) {
+    const lo = fb[k], hi = fb[k + 1], len = hi - lo;
+    for (let i = lo; i < hi; i++) out[i] = len > 1 ? (i - lo) / (len - 1) : 0.5;
+  }
+  return out;
+}
+
 function wheelRadiusValues(fd) {
   const { T_A, T_B } = fd;
   if (wheelRadius === 'time') {
-    const rA = Float32Array.from({ length: T_A }, (_, i) => T_A > 1 ? i / (T_A - 1) : 0.5);
-    const rB = Float32Array.from({ length: T_B }, (_, i) => T_B > 1 ? i / (T_B - 1) : 0.5);
-    return { rA, rB };
+    return { rA: clipRelTime(T_A, folderClipFracsA), rB: clipRelTime(T_B, folderClipFracsB) };
+  }
+  if (wheelRadius === 'atyp') {
+    return { rA: fd.featNorm.slice(0, T_A), rB: fd.featNorm.slice(T_A) };
   }
   if (wheelRadius === 'atyp') {
     return { rA: fd.featNorm.slice(0, T_A), rB: fd.featNorm.slice(T_A) };
@@ -2967,8 +3019,14 @@ async function startEncode() {
   scheduleRender();
   rawAudioA = audioA; rawAudioB = audioB; rawAudioCh = srcCh;
   durA = audioA.length / srcCh / sr; durB = audioB.length / srcCh / sr;
-  playerA.setAudio(rawAudioA, sr, null, srcCh);
-  playerB.setAudio(rawAudioB, sr, null, srcCh);
+  // Folder sources carry per-clip boundaries — store as fractions of the source
+  // (resolution-independent) for per-clip wheel time, and tint the waveform.
+  const totA = audioA.length / srcCh, totB = audioB.length / srcCh;
+  folderClipFracsA = audioA.clipStarts ? audioA.clipStarts.map(s => s / totA) : null;
+  folderClipFracsB = audioB.clipStarts ? audioB.clipStarts.map(s => s / totB) : null;
+  // Folder sources colour their waveform per clip; the scatter matches via pointColors.
+  playerA.setAudio(rawAudioA, sr, folderClipFracsA ? folderColorFn(folderClipFracsA) : null, srcCh);
+  playerB.setAudio(rawAudioB, sr, folderClipFracsB ? folderColorFn(folderClipFracsB) : null, srcCh);
 
   // ── Cache lookup (only when both sources are files with valid CRCs) ───────────
   // segEnd is the planar array length, so stereo entries never collide with
@@ -4767,18 +4825,21 @@ function autoRegenerate() {
   markDirty('WAYPOINTS', 'AUDIO', 'RENDER');
 }
 
-// Build a per-position color function for the generated waveform based on
-// the source (A or B) of each frame in genPlaySeq.
+// Build a per-position color function for the generated waveform based on the
+// source frame each output frame came from. Reuses the scatter's per-frame
+// colours (pointColorsA/B) so a folder clip's colour carries through to the
+// generated signal; non-folder frames use the plain source colour.
 // Returns null for draw mode (interpolated — no discrete source attribution).
 function makeGenColorFn() {
   if (!genPlaySeq || genPlaySeq.length === 0 || pathMode === 'draw') return null;
-  const seq = genPlaySeq; // capture snapshot
+  refreshPointColors();            // ensure per-frame clip colours are current
+  const seq = genPlaySeq;          // capture snapshot
   const N   = seq.length;
-  const colA = '#c87800'; // matches playerA waveColor
-  const colB = '#2090c0'; // matches playerB waveColor
+  const pcA = pointColorsA, pcB = pointColorsB;
   return pos => {
-    const fi = Math.min(N - 1, Math.floor(pos * N));
-    return seq[fi].src === 'A' ? colA : colB;
+    const f = seq[Math.min(N - 1, Math.floor(pos * N))];
+    return f.src === 'A' ? ((pcA && pcA[f.idx]) || '#c87800')
+                         : ((pcB && pcB[f.idx]) || '#2090c0');
   };
 }
 

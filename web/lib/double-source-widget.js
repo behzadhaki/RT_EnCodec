@@ -149,9 +149,11 @@ export function createDoubleSourceWidget({
         audio = st;
       }
     }
+    const clipStarts = audio.clipStarts || null; // folder boundaries (vol/gate keep length)
     const vol = panel.getVolume();
     if (vol !== 1) audio = audio.map(x => x * vol);
     if (panel.isGateEnabled()) audio = applyPulseGate(audio, sr, panel.getGateFreq(), panel.getGateDecay(), channels);
+    if (clipStarts) audio.clipStarts = clipStarts;
     return audio;
   }
 

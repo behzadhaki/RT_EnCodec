@@ -54,20 +54,8 @@ export function renderScatter(canvas, dpr, state) {
     snapPlayFrames, trajDir, showTrail, ctxSwap = { prob: 0, range: 0 }, ctxMode = 'pre',
     snapMode, snapKVal, snapDurVal, framesPerSec, canvasMode,
     srcAEnabled = true, srcBEnabled = true,
-    colorValuesA = null, colorValuesB = null,
+    pointColorsA = null, pointColorsB = null,
   } = state;
-
-  // magma colormap (matches the SSM heatmap) for per-point value colouring.
-  const MAGMA = [
-    [0, 0, 4], [28, 16, 68], [79, 18, 123], [129, 37, 129], [181, 54, 122],
-    [229, 80, 100], [251, 135, 97], [254, 194, 135], [252, 253, 191],
-  ];
-  function magma(t) {
-    t = t < 0 ? 0 : t > 1 ? 1 : t;
-    const x = t * (MAGMA.length - 1), i = Math.min(MAGMA.length - 2, x | 0), f = x - i;
-    const a = MAGMA[i], b = MAGMA[i + 1];
-    return `rgb(${(a[0] + (b[0] - a[0]) * f) | 0},${(a[1] + (b[1] - a[1]) * f) | 0},${(a[2] + (b[2] - a[2]) * f) | 0})`;
-  }
 
   function drawTrail(coords, color) {
     if (coords.length < 2) return;
@@ -82,36 +70,40 @@ export function renderScatter(canvas, dpr, state) {
     ctx.restore();
   }
 
-  // When `values` (0..1 per point) is given, each point is filled by colormap
-  // instead of the flat source colour — used for Typicality / Query colouring.
-  function drawCirclesEmpty(coords, color, values) {
+  // When `colors` (a CSS colour string per point) is given, each marker is
+  // stroked in its own colour — used to colour folder sources by clip/file.
+  function drawCirclesEmpty(coords, color, colors) {
     const r = 2.5 * dpr;
     ctx.save();
+    ctx.globalAlpha = colors ? 0.55 : 0.35;
     ctx.lineWidth = 1 * dpr;
+    if (!colors) ctx.strokeStyle = color;
     for (let i = 0; i < coords.length; i++) {
       const [x, y] = coords[i];
+      if (colors) ctx.strokeStyle = colors[i];
       ctx.beginPath();
       ctx.arc(toX(x), toY(y), r, 0, 2 * Math.PI);
-      if (values) { ctx.globalAlpha = 0.85; ctx.fillStyle = magma(values[i]); ctx.fill(); }
-      else        { ctx.globalAlpha = 0.35; ctx.strokeStyle = color; ctx.stroke(); }
+      ctx.stroke();
     }
     ctx.restore();
   }
 
-  function drawTrianglesEmpty(coords, color, values) {
+  function drawTrianglesEmpty(coords, color, colors) {
     const r = 3 * dpr;
     ctx.save();
+    ctx.globalAlpha = colors ? 0.55 : 0.35;
     ctx.lineWidth = 1 * dpr;
+    if (!colors) ctx.strokeStyle = color;
     for (let i = 0; i < coords.length; i++) {
       const [x, y] = coords[i];
       const px = toX(x), py = toY(y);
+      if (colors) ctx.strokeStyle = colors[i];
       ctx.beginPath();
       ctx.moveTo(px,             py - r);
       ctx.lineTo(px + r * 0.866, py + r * 0.5);
       ctx.lineTo(px - r * 0.866, py + r * 0.5);
       ctx.closePath();
-      if (values) { ctx.globalAlpha = 0.85; ctx.fillStyle = magma(values[i]); ctx.fill(); }
-      else        { ctx.globalAlpha = 0.35; ctx.strokeStyle = color; ctx.stroke(); }
+      ctx.stroke();
     }
     ctx.restore();
   }
@@ -119,8 +111,8 @@ export function renderScatter(canvas, dpr, state) {
   if (srcAEnabled) drawTrail(coordsA, '#c87800');
   if (srcBEnabled) drawTrail(coordsB, '#2090c0');
 
-  if (srcAEnabled) drawCirclesEmpty(coordsA,   '#c87800', colorValuesA);
-  if (srcBEnabled) drawTrianglesEmpty(coordsB, '#2090c0', colorValuesB);
+  if (srcAEnabled) drawCirclesEmpty(coordsA,   '#c87800', pointColorsA);
+  if (srcBEnabled) drawTrianglesEmpty(coordsB, '#2090c0', pointColorsB);
 
   // Pins drawn AFTER data points so they sit on the highest layer
   if (canvasMode === 'pins' && pinPoints.length > 0) {

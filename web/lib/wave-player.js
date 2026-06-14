@@ -197,6 +197,8 @@ export function makeWavePlayer(canvasId, waveColor, { getAudioCtx, getMasterDest
   ro.observe(cvs);
 
   return {
+    // Override the base waveform colour (e.g. to mark a folder-joined source).
+    setWaveColor(color) { waveColor = color; draw(); },
     // colorFn: optional (pos: 0..1) => CSS color string.
     // Pass null to revert to the player's default waveColor.
     // channels = 2: f32 is planar stereo (L plane, R plane).

@@ -116,24 +116,31 @@ export async function loadFolder(files, sr, maxS = MAX_S, channels = 1, maxFiles
   }
   if (!bufs.length) throw new Error('No decodable audio in folder.');
 
+  // clipStarts: per-channel sample offset where each clip begins (so callers can
+  // mark per-clip boundaries on the joined source, e.g. per-clip wheel time).
   if (channels === 2) {
     const Ts     = bufs.map(b => b.length / 2);
     const totalT = Ts.reduce((s, t) => s + t, 0);
     const out    = new Float32Array(2 * totalT);
+    const clipStarts = [];
     let off = 0;
     for (let i = 0; i < bufs.length; i++) {
       const T = Ts[i];
+      clipStarts.push(off);
       out.set(bufs[i].subarray(0, T),      off);            // L plane
       out.set(bufs[i].subarray(T, 2 * T),  totalT + off);   // R plane
       off += T;
     }
+    out.clipStarts = clipStarts;
     return out;
   }
 
   const totalT = bufs.reduce((s, b) => s + b.length, 0);
   const out = new Float32Array(totalT);
+  const clipStarts = [];
   let off = 0;
-  for (const b of bufs) { out.set(b, off); off += b.length; }
+  for (const b of bufs) { clipStarts.push(off); out.set(b, off); off += b.length; }
+  out.clipStarts = clipStarts;
   return out;
 }
 
