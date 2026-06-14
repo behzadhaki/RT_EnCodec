@@ -831,6 +831,7 @@ let ssmMetric       = 'cosine';   // 'cosine' | 'euclidean'
 let ssmImage        = null;       // { rgba:ImageData, w, h, scope, seam, pA, pB, T_A, T_B, vmin, vmax, metric }
 let ssmWorker       = null;
 let activeSSMJobId  = -1;
+let ssmPlayhead     = null;       // { src:'A'|'B', pos:0..1 } — live playback cursor on the matrix
 let wheelRadius     = 'loud';   // 'loud' | 'time' | 'atyp' — wheel-mode radius source
 let wheelAngle      = 'umap1d'; // 'umap1d' | 'pc1' — wheel-mode angle source
 let wheelScale      = 'value';  // 'value' | 'rank' — wheel-mode radius scaling
@@ -1416,7 +1417,7 @@ function renderSSM() {
     return;
   }
 
-  const { rgba, w, h, scope, seam, pA } = ssmImage;
+  const { rgba, w, h, scope, seam, pA, pB } = ssmImage;
 
   // Stage the matrix into an offscreen canvas at native resolution.
   if (!ssmOffscreen) ssmOffscreen = document.createElement('canvas');
@@ -1452,6 +1453,40 @@ function renderSSM() {
     ctx.moveTo(fx, dy); ctx.lineTo(fx, dy + dh);
     ctx.moveTo(dx, fy); ctx.lineTo(dx + dw, fy);
     ctx.stroke();
+  }
+
+  // Live playback cursor. The playing source maps to a matrix index; for
+  // joint/self that index is on BOTH axes (crosshair on the diagonal), for
+  // cross it's the row (A) or column (B) only. The lit row/col reads as "how
+  // similar this instant is to every other moment".
+  if (ssmPlayhead) {
+    const { src, pos } = ssmPlayhead;
+    let row = -1, col = -1;
+    if (scope === 'cross') {
+      if (src === 'A') row = pos * pA;            // rows = A
+      else             col = pos * pB;            // cols = B
+    } else if (scope === 'self') {
+      if (ssmWhich === src) { row = col = pos * (src === 'A' ? pA : pB); }
+    } else { // joint — A block [0,pA), B block [pA,pA+pB)
+      row = col = src === 'A' ? pos * pA : pA + pos * pB;
+    }
+    if (row >= 0 || col >= 0) {
+      // Bright core over a dark casing so the cursor stays visible over any
+      // matrix colour (magma's own orange/yellow would otherwise swallow it).
+      const core = src === 'A' ? '#ffd24a' : '#7fe0ff';
+      const x = col >= 0 ? dx + Math.min(col, w) / w * dw : -1;
+      const y = row >= 0 ? dy + Math.min(row, h) / h * dh : -1;
+      const lines = () => {
+        ctx.beginPath();
+        if (x >= 0) { ctx.moveTo(x, dy); ctx.lineTo(x, dy + dh); }
+        if (y >= 0) { ctx.moveTo(dx, y); ctx.lineTo(dx + dw, y); }
+        ctx.stroke();
+      };
+      ctx.save();
+      ctx.strokeStyle = 'rgba(0,0,0,0.75)'; ctx.lineWidth = 4 * dpr; lines(); // casing
+      ctx.strokeStyle = core;               ctx.lineWidth = 1.6 * dpr; lines(); // core
+      ctx.restore();
+    }
   }
 
   // Labels.
@@ -3721,6 +3756,11 @@ function updateNotchFilters() {
 // ── Waveform players ──────────────────────────────────────────────────────────
 
 const playerA = makeWavePlayer('waveCanvA', '#c87800', { getAudioCtx, getMasterDest }, pos => {
+  if (projectionMode === 'ssm') {
+    ssmPlayhead = pos < 0 ? (ssmPlayhead?.src === 'A' ? null : ssmPlayhead) : { src: 'A', pos };
+    if (pos >= 0) playerB.setCursor(-1);
+    scheduleRender(); return;
+  }
   if (pos < 0 || !coordsA) { waveHighlight = null; scheduleRender(); return; }
   const i = Math.min(Math.floor(pos * coordsA.length), coordsA.length - 1);
   waveHighlight = { src: 'A', idx: i };
@@ -3729,6 +3769,11 @@ const playerA = makeWavePlayer('waveCanvA', '#c87800', { getAudioCtx, getMasterD
 });
 
 const playerB = makeWavePlayer('waveCanvB', '#2090c0', { getAudioCtx, getMasterDest }, pos => {
+  if (projectionMode === 'ssm') {
+    ssmPlayhead = pos < 0 ? (ssmPlayhead?.src === 'B' ? null : ssmPlayhead) : { src: 'B', pos };
+    if (pos >= 0) playerA.setCursor(-1);
+    scheduleRender(); return;
+  }
   if (pos < 0 || !coordsB) { waveHighlight = null; scheduleRender(); return; }
   const i = Math.min(Math.floor(pos * coordsB.length), coordsB.length - 1);
   waveHighlight = { src: 'B', idx: i };
