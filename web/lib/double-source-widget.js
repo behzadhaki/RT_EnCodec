@@ -24,7 +24,11 @@
  *   buildBothAudios(len, sr)    — async convenience; returns { audioA, audioB }
  */
 import { createSourcePanel } from './source-panel.js';
-import { generateSource, applyPulseGate, loadFile, loadFolder, loopToLength, getAudioFileDuration, MAX_S } from './audio-utils.js';
+import {
+  generateSource, applyPulseGate, loadFile, loadFolder, loopToLength,
+  getAudioFileDuration, probeAudioDurationSeconds, planFolderSelections,
+  MAX_S, MAX_FOLDER_TOTAL_S,
+} from './audio-utils.js';
 
 export function createDoubleSourceWidget({
   defaultDur   = 4,
@@ -36,9 +40,19 @@ export function createDoubleSourceWidget({
   defaultFreqB = 880,
   showFolder   = false,
   onChange     = () => {},
+  // Awaited when a folder's joined length exceeds MAX_FOLDER_TOTAL_S. Receives
+  // { count, totalS, budgetS } and resolves to a strategy string
+  // ('all'|'first'|'trim'|'random'|'truncate') or null/false to cancel the load.
+  // When null, the widget defaults to 'truncate'.
+  onFolderOverflow = null,
 } = {}) {
   const el = document.createElement('div');
   el.style.display = 'contents';
+
+  // Resolved folder selections, keyed by the panel's File[] reference (a fresh
+  // array each pick → auto-invalidated on re-pick). Caching keeps the overflow
+  // dialog from re-popping — and random windows stable — across recomputes.
+  const folderPlanCache = new WeakMap();
 
   // Duration section — always created so getDuration() works, but only appended
   // to the DOM when showDuration is true.
@@ -136,9 +150,23 @@ export function createDoubleSourceWidget({
     } else if (type === 'folder') {
       const files = panel.getFolder();
       if (!files) throw new Error(`No folder selected for "${panel.element.querySelector('.section-title').textContent}".`);
-      // maxS applies per file; "full file" → whole file, else trim each to trimS.
-      const maxS = panel.getLoadFull() ? Infinity : panel.getTrimS();
-      audio = await loadFolder(files, sr, maxS, channels);
+      let selections = folderPlanCache.get(files);
+      if (!selections) {
+        // Probe per-clip durations cheaply (WAV header; decode fallback) and sum.
+        const durations = await Promise.all(files.map(probeAudioDurationSeconds));
+        const totalS    = durations.reduce((a, b) => a + b, 0);
+        if (totalS <= MAX_FOLDER_TOTAL_S) {
+          selections = files.map(f => ({ file: f, startS: 0, lenS: Infinity }));
+        } else {
+          const strategy = onFolderOverflow
+            ? await onFolderOverflow({ count: files.length, totalS, budgetS: MAX_FOLDER_TOTAL_S })
+            : 'truncate';
+          if (!strategy) throw new Error('Folder load cancelled.');
+          selections = planFolderSelections(files, durations, strategy, MAX_FOLDER_TOTAL_S);
+        }
+        folderPlanCache.set(files, selections);
+      }
+      audio = await loadFolder(files, sr, channels, selections);
     } else {
       const len = Math.round(getDuration() * sr);
       audio = generateSource(type, panel.getFreq(), len / sr, sr);

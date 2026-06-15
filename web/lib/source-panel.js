@@ -1,5 +1,3 @@
-import { MAX_FOLDER_FILES } from './audio-utils.js';
-
 /**
  * createSourcePanel — builds a .section element with source controls.
  *
@@ -140,8 +138,9 @@ export function createSourcePanel({
     const loadFull = loadFullEl.checked;
     fileRow.style.display = isFile ? '' : 'none';
     if (folderRow) folderRow.style.display = isFolder ? '' : 'none';
-    loadRow.style.display = (isFile || isFolder) ? '' : 'none';
-    trimRow.style.display = ((isFile || isFolder) && !loadFull) ? '' : 'none';
+    // Folder length is governed by the total-seconds budget, not per-clip trim.
+    loadRow.style.display = isFile ? '' : 'none';
+    trimRow.style.display = (isFile && !loadFull) ? '' : 'none';
     freqRow.style.display = (isFile || isFolder || v === 'sweep' || v === 'silence') ? 'none' : '';
   }
 
@@ -203,13 +202,14 @@ export function createSourcePanel({
   // to be concatenated into one source. Prefers showDirectoryPicker (gives a
   // folder name + clean iteration); falls back to a webkitdirectory <input>.
   function setFolder(files, name) {
-    const all = [...files].filter(f => /\.wave?$/i.test(f.name))
+    // Keep every .wav, name-sorted. The joined length is bounded later by the
+    // total-seconds budget (see loadFolder / the overflow dialog), not a count.
+    const wavs = [...files].filter(f => /\.wave?$/i.test(f.name))
       .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' }));
-    const wavs = all.slice(0, MAX_FOLDER_FILES); // ≤20 files; each capped to MAX_S at load
     currentFolder     = wavs.length ? wavs : null;
     currentFolderName = name || '';
     folderBtnEl.textContent = wavs.length
-      ? `${currentFolderName || 'folder'} · ${wavs.length}${all.length > wavs.length ? '/' + all.length : ''} wav`
+      ? `${currentFolderName || 'folder'} · ${wavs.length} wav`
       : 'no .wav files found';
   }
 

@@ -131,6 +131,36 @@
   border: 1px solid var(--border); border-radius: 3px;
   padding: 1px 2px; cursor: pointer;
 }
+
+/* ── Folder overflow modal ── */
+#folderModal {
+  position: fixed; inset: 0; z-index: 210;
+  background: rgba(0,0,0,0.65);
+  display: flex; align-items: center; justify-content: center;
+}
+#folderModal.hidden { display: none; }
+#folderModalBox {
+  background: var(--surface); border: 1px solid var(--border2);
+  border-radius: 8px; padding: 16px 18px;
+  width: 460px; max-width: 95vw;
+  display: flex; flex-direction: column; gap: 10px;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.6);
+}
+#folderModalTitle {
+  font-size: 12px; font-weight: 700; letter-spacing: 0.08em;
+  text-transform: uppercase; color: var(--muted);
+}
+#folderModalMsg { font-size: 11px; color: var(--text); line-height: 1.5; }
+#folderModalMsg b { color: var(--text); }
+.folder-opt {
+  display: flex; flex-direction: column; gap: 2px; text-align: left;
+  background: var(--surface2); border: 1px solid var(--border);
+  border-radius: 5px; padding: 8px 10px; cursor: pointer; color: var(--text);
+}
+.folder-opt:hover { border-color: var(--accent, #30aadc); background: var(--bg); }
+.folder-opt .fo-title { font-size: 12px; font-weight: 600; }
+.folder-opt .fo-desc  { font-size: 10px; color: var(--muted); }
+#folderModalFooter { display: flex; justify-content: flex-end; margin-top: 2px; }
 </style>
 </head>
 <body>
@@ -264,6 +294,44 @@
   </div>
 </div>
 
+<div id="folderModal" class="hidden">
+  <div id="folderModalBox">
+    <div id="folderModalTitle">📁 Folder too long</div>
+    <div id="folderModalMsg"></div>
+    <button class="folder-opt" data-strategy="first">
+      <span class="fo-title">Keep first clips, in full</span>
+      <span class="fo-desc">Add clips in order until 10 min is reached; drop the rest (clips kept whole).</span>
+    </button>
+    <button class="folder-opt" data-strategy="trim">
+      <span class="fo-title">Trim every clip equally</span>
+      <span class="fo-desc" data-share>Use the first <b></b> of each clip so all are represented.</span>
+    </button>
+    <button class="folder-opt" data-strategy="random:2">
+      <span class="fo-title">Random 2 s per clip</span>
+      <span class="fo-desc">Use a random 2 s window from each clip (whole clip if shorter).</span>
+    </button>
+    <button class="folder-opt" data-strategy="random:5">
+      <span class="fo-title">Random 5 s per clip</span>
+      <span class="fo-desc">Use a random 5 s window from each clip (whole clip if shorter).</span>
+    </button>
+    <button class="folder-opt" data-strategy="random:10">
+      <span class="fo-title">Random 10 s per clip</span>
+      <span class="fo-desc">Use a random 10 s window from each clip (whole clip if shorter).</span>
+    </button>
+    <button class="folder-opt" data-strategy="truncate">
+      <span class="fo-title">Truncate at 10 min</span>
+      <span class="fo-desc">Concatenate in order and hard-cut at exactly 10 min (boundary clip clipped).</span>
+    </button>
+    <button class="folder-opt" data-strategy="all">
+      <span class="fo-title">Load anyway</span>
+      <span class="fo-desc">Use the whole folder past 10 min — encoding and the scatter may be slow.</span>
+    </button>
+    <div id="folderModalFooter">
+      <button class="tog" id="folderModalCancel" style="font-size:10px;padding:3px 10px">Cancel</button>
+    </div>
+  </div>
+</div>
+
 <script type="module">
 'use strict';
 
@@ -310,9 +378,43 @@ const srcWidget = createDoubleSourceWidget({
   showDuration: false,   // each file loads at its own natural length (≤ 10 s)
   showFolder:   true,    // "Folder (join WAVs)" source type — concatenate a directory of WAVs
   onChange: delay => { saveAllPanelSettings(); refreshDropdowns(); scheduleEncode(delay); },
+  onFolderOverflow: askFolderStrategy,
 });
 controls.appendChild(srcWidget.element);
 const { panelA, panelB } = srcWidget;
+
+// ── Folder overflow dialog ──────────────────────────────────────────────────
+// Resolves to a strategy string for planFolderSelections, or null on cancel.
+function askFolderStrategy({ count, totalS, budgetS }) {
+  const fmtMin = s => {
+    if (s < 60) return `${s.toFixed(1)} s`;
+    const m = Math.floor(s / 60), sec = Math.round(s % 60);
+    return sec ? `${m} min ${sec} s` : `${m} min`;
+  };
+  const modal  = document.getElementById('folderModal');
+  const msg    = document.getElementById('folderModalMsg');
+  const shareS = budgetS / Math.max(1, count);
+  msg.innerHTML = `This folder is <b>${count}</b> clips totalling <b>${fmtMin(totalS)}</b>, `
+    + `over the <b>${fmtMin(budgetS)}</b> limit. Choose how to fit it:`;
+  for (const el of modal.querySelectorAll('[data-share] b')) el.textContent = fmtMin(shareS);
+
+  return new Promise(resolve => {
+    let done = false;
+    const finish = (val) => {
+      if (done) return; done = true;
+      modal.classList.add('hidden');
+      for (const b of optBtns) b.onclick = null;
+      cancelBtn.onclick = null; modal.onclick = null;
+      resolve(val);
+    };
+    const optBtns   = [...modal.querySelectorAll('.folder-opt')];
+    const cancelBtn = document.getElementById('folderModalCancel');
+    for (const b of optBtns) b.onclick = () => finish(b.dataset.strategy);
+    cancelBtn.onclick = () => finish(null);
+    modal.onclick = e => { if (e.target === modal) finish(null); };
+    modal.classList.remove('hidden');
+  });
+}
 
 // Declared here (before use) — the `let` declarations in the state-vars section
 // below would be in the temporal dead zone at this point in execution.

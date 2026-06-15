@@ -56,23 +56,26 @@ export function applyPulseGate(audio, sr, freq, decayMs, channels = 1) {
 }
 
 // Decodes and resamples an audio File at the given sr.
-// Trims to maxS seconds at the source sample rate before resampling.
+// Takes the window [startS, startS + maxS) seconds at the source sample rate
+// before resampling (startS = 0 → from the beginning; maxS = Infinity → to end).
 // channels = 1 → mono Float32Array (all source channels averaged).
 // channels = 2 → planar stereo Float32Array(2*T), L plane then R plane
 //                (mono sources are upmixed to both planes by Web Audio).
-export async function loadFile(file, sr, maxS = MAX_S, channels = 1) {
+export async function loadFile(file, sr, maxS = MAX_S, channels = 1, startS = 0) {
   const arrBuf  = await file.arrayBuffer();
   const tmpCtx  = new OfflineAudioContext(1, 1, sr);
   const decoded = await tmpCtx.decodeAudioData(arrBuf);
-  const trimLen = Math.min(decoded.length, Math.round(maxS * decoded.sampleRate));
-  const outLen  = Math.round(trimLen / decoded.sampleRate * sr);
+  const start   = Math.min(decoded.length, Math.max(0, Math.round(startS * decoded.sampleRate)));
+  const avail   = decoded.length - start;
+  const trimLen = Math.max(0, Math.min(avail, Math.round(maxS * decoded.sampleRate)));
+  const outLen  = Math.max(1, Math.round(trimLen / decoded.sampleRate * sr));
   const offCtx  = new OfflineAudioContext(channels, outLen, sr);
   const trimBuf = new AudioBuffer({
     numberOfChannels: decoded.numberOfChannels,
-    length: trimLen, sampleRate: decoded.sampleRate,
+    length: Math.max(1, trimLen), sampleRate: decoded.sampleRate,
   });
   for (let ch = 0; ch < decoded.numberOfChannels; ch++)
-    trimBuf.copyToChannel(decoded.getChannelData(ch).slice(0, trimLen), ch);
+    trimBuf.copyToChannel(decoded.getChannelData(ch).slice(start, start + trimLen), ch);
   const src = offCtx.createBufferSource();
   src.buffer = trimBuf;
   src.connect(offCtx.destination);
@@ -95,24 +98,112 @@ export async function loadFile(file, sr, maxS = MAX_S, channels = 1) {
   return normalizePeak(mono, PEAK_TARGET);
 }
 
-export const MAX_FOLDER_FILES = 20;
+// Total seconds budget for a joined folder source. When the summed clip
+// durations exceed this, callers pick a reduction strategy (see
+// planFolderSelections) before concatenating.
+export const MAX_FOLDER_TOTAL_S = 600; // 10 minutes
 
-// Loads every file in `files`, decodes/resamples each to `sr` via loadFile,
-// and concatenates them into one source (name-sorted, natural order). At most
-// `maxFiles` files are used, and each file is capped at MAX_S seconds (so a
-// long clip contributes only its first MAX_S). channels = 2 keeps the planar
-// layout [L…|R…], concatenated per-plane so the joined stereo stays valid.
-// Unreadable files are skipped with a warning rather than aborting the whole set.
-export async function loadFolder(files, sr, maxS = MAX_S, channels = 1, maxFiles = MAX_FOLDER_FILES) {
-  if (!files || !files.length) throw new Error('No files in folder.');
-  const sorted = [...files].sort((a, b) =>
-    a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' })).slice(0, maxFiles);
+// Reads a WAV file's duration from its header alone — no decode. Walks the RIFF
+// chunks within the first 64 KB to find `fmt ` (byteRate) and `data` (size);
+// duration = dataBytes / byteRate. Returns null if it can't be determined this
+// way (non-WAV, streamed size, or metadata pushing `data` past the probe window)
+// so the caller can fall back to a full decode.
+export async function wavDurationSeconds(file) {
+  const PROBE = 1 << 16; // 64 KB — covers headers + typical LIST/INFO metadata
+  let buf;
+  try { buf = await file.slice(0, PROBE).arrayBuffer(); }
+  catch { return null; }
+  const dv = new DataView(buf);
+  if (dv.byteLength < 12) return null;
+  if (dv.getUint32(0, false) !== 0x52494646) return null; // 'RIFF'
+  if (dv.getUint32(8, false) !== 0x57415645) return null; // 'WAVE'
+  let off = 12, byteRate = 0, dataSize = 0;
+  while (off + 8 <= dv.byteLength) {
+    const id   = dv.getUint32(off, false);
+    const size = dv.getUint32(off + 4, true);
+    const body = off + 8;
+    if (id === 0x666d7420 && body + 16 <= dv.byteLength) {       // 'fmt '
+      byteRate = dv.getUint32(body + 8, true);
+    } else if (id === 0x64617461) {                             // 'data'
+      dataSize = size; break;
+    }
+    off = body + size + (size & 1); // chunks are word-aligned
+  }
+  if (byteRate > 0 && dataSize > 0 && dataSize !== 0xffffffff) return dataSize / byteRate;
+  return null;
+}
 
-  const perFileMaxS = Math.min(maxS, MAX_S); // never more than MAX_S per clip
+// Duration of an audio File in seconds (uncapped). Tries the cheap WAV-header
+// probe first, then falls back to a full decode for non-WAV / odd-header files.
+export async function probeAudioDurationSeconds(file) {
+  const fromHeader = await wavDurationSeconds(file);
+  if (fromHeader != null && isFinite(fromHeader) && fromHeader > 0) return fromHeader;
+  try {
+    const arrBuf  = await file.arrayBuffer();
+    const tmpCtx  = new OfflineAudioContext(1, 1, 44100);
+    const decoded = await tmpCtx.decodeAudioData(arrBuf);
+    return decoded.duration;
+  } catch { return 0; }
+}
+
+// Builds a list of per-file selections {file, startS, lenS} for a folder source,
+// reducing the set so the joined total fits `budgetS`. `durations[i]` is the full
+// length (s) of `files[i]` (from probeAudioDurationSeconds). Strategies:
+//   'all'        — every clip whole (no reduction; over-budget loads anyway)
+//   'first'      — keep clips whole in name order until the budget runs out
+//   'trim'       — first  budgetS/N s of every clip (equal share)
+//   'random'     — a random budgetS/N s window of every clip (equal share)
+//   'random:K'   — a random K-second window of every clip (whole clip if shorter)
+//   'truncate'   — concatenate in order, hard-cut at exactly budgetS
+export function planFolderSelections(files, durations, strategy, budgetS = MAX_FOLDER_TOTAL_S, rand = Math.random) {
+  const N = files.length;
+  const sel = [];
+  if (strategy === 'all') {
+    for (let i = 0; i < N; i++) sel.push({ file: files[i], startS: 0, lenS: Infinity });
+  } else if (strategy === 'first') {
+    let acc = 0;
+    for (let i = 0; i < N; i++) {
+      if (acc + durations[i] > budgetS) break;
+      sel.push({ file: files[i], startS: 0, lenS: Infinity });
+      acc += durations[i];
+    }
+    if (!sel.length) sel.push({ file: files[0], startS: 0, lenS: budgetS }); // 1st clip alone over budget
+  } else if (strategy === 'trim' || strategy === 'random' || strategy.startsWith('random:')) {
+    // 'random:K' → fixed K-second window; 'trim'/'random' → equal budgetS/N share.
+    const fixed   = strategy.startsWith('random:') ? parseFloat(strategy.slice(7)) : null;
+    const k       = fixed != null ? fixed : budgetS / N;
+    const isRandom = strategy === 'random' || fixed != null;
+    for (let i = 0; i < N; i++) {
+      const win   = Math.min(durations[i], k);
+      const slack = Math.max(0, durations[i] - win);
+      const startS = (isRandom && slack > 0) ? rand() * slack : 0;
+      sel.push({ file: files[i], startS, lenS: win });
+    }
+  } else { // 'truncate'
+    let acc = 0;
+    for (let i = 0; i < N && acc < budgetS; i++) {
+      const lenS = Math.min(durations[i], budgetS - acc);
+      sel.push({ file: files[i], startS: 0, lenS });
+      acc += lenS;
+    }
+  }
+  return sel;
+}
+
+// Loads a folder source and concatenates it into one joined buffer (name order).
+// `selections` is a [{file, startS, lenS}] list (see planFolderSelections); when
+// omitted, every file is loaded whole. channels = 2 keeps the planar layout
+// [L…|R…], concatenated per-plane so the joined stereo stays valid. Unreadable
+// files are skipped with a warning rather than aborting the whole set.
+export async function loadFolder(files, sr, channels = 1, selections = null) {
+  const sels = selections
+    || (files || []).map(f => ({ file: f, startS: 0, lenS: Infinity }));
+  if (!sels.length) throw new Error('No files in folder.');
+
   const bufs = [];
-  for (const f of sorted) {
-    try { bufs.push(await loadFile(f, sr, perFileMaxS, channels)); }
-    catch (e) { console.warn('loadFolder: skipping unreadable file', f.name, e); }
+  for (const s of sels) {
+    try { bufs.push(await loadFile(s.file, sr, s.lenS ?? Infinity, channels, s.startS ?? 0)); }
+    catch (e) { console.warn('loadFolder: skipping unreadable file', s.file?.name, e); }
   }
   if (!bufs.length) throw new Error('No decodable audio in folder.');
 
