@@ -4633,10 +4633,15 @@ umapCanvas.addEventListener('click', async e => {
   scheduleRender();
 
   const T = bestSrc === 'A' ? currentEmbeds.codesDimsA[2] : currentEmbeds.codesDimsB[2];
-  const framesPerSec = (bestSrc === 'A' ? coordsA.length : coordsB.length) / srcDuration(bestSrc);
-  const half       = Math.max(1, Math.round(framesPerSec * 0.5));
-  const startFrame = Math.max(0, bestIdx - half);
-  const endFrame   = Math.min(T, bestIdx + half);
+  // Grain of frames around the click. 24 kHz is causal → context is in the PAST,
+  // so take frames before the clicked one; 48 kHz is non-causal → take an equal
+  // span on each side, centring the clicked frame.
+  const is48      = mp.getModelHz() === '48k';
+  const GRAIN_MUL = 8; // frames per side = base × this
+  const before    = (is48 ? 2 : 4) * GRAIN_MUL;
+  const after     = (is48 ? 2 : 0) * GRAIN_MUL;
+  const startFrame = Math.max(0, bestIdx - before);
+  const endFrame   = Math.min(T, bestIdx + after + 1);
 
   getAudioCtx();
   playJobId = ++jobSeq;
