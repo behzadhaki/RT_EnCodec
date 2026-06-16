@@ -685,6 +685,38 @@ async function runEncodeSegment(msg) {
   }
 }
 
+// Experiment 6 parallel DECODE (stateless 48k only): decode ONE chunk of
+// trajectory latents with zero LSTM init — chunks are independent because the
+// stateless encode reset state per segment, so the decoder can too. Returns the
+// chunk's planar [2*numSamples] audio; the main thread OLA-blends the chunks
+// (same triangular window + scale envelope as the sequential decoder).
+async function runDecodeSegment(msg) {
+  const { jobId, idx, embChunk, embDims, scale, scaleDims, modelHz, bwKbps, tStart, chunk_T } = msg;
+  try {
+    await ensureSessions(modelHz, bwKbps);
+    const res = await decodeFromLatents(embChunk, embDims, scale, scaleDims, modelHz,
+                                        zeroState(1), zeroState(1), true);
+    self.postMessage({ type: 'decoded_segment', jobId, idx, tStart, chunk_T, audio: res.outAudio },
+                     [res.outAudio.buffer]);
+  } catch (err) {
+    self.postMessage({ type: 'decode_error', jobId, idx, message: err.message });
+  }
+}
+
+// Report the 48k decoder scale tensor (value + shape) from the cached captures,
+// or a safe [1,1] unit fallback, so the main thread can drive the pool decode
+// with the exact shape the decoder graph expects.
+function runGetDecodeScale(msg) {
+  const caps   = captureCache.A || captureCache.B;
+  const refCap = !caps ? null
+               : caps.mode === 'single' ? caps.cap
+               : caps.mode === 'ola24'  ? caps.chunks[0].cap
+               :                          caps.segments[0].cap;
+  const scale     = refCap?.scale     ? refCap.scale.slice()              : new Float32Array([1.0]);
+  const scaleDims = refCap?.scaleDims ? [...refCap.scaleDims].map(Number) : [1, 1];
+  self.postMessage({ type: 'decode_scale', jobId: msg.jobId, scale, scaleDims }, [scale.buffer]);
+}
+
 // Encode full audio, capture intermediate tensors, decode for display.
 // Non-streaming: single pass.  Streaming: OLA with encoder state carried.
 async function encodeAndCapture24k(audio, streaming, frameSize, jobId, skipPreview = false) {
@@ -2223,6 +2255,13 @@ self.onmessage = (e) => {
       // Experiment6 parallel pool: encode one pre-sliced 1 s segment (stateless).
       // No currentJobId — staleness is handled on the main thread.
       runEncodeSegment(msg);
+      break;
+    case 'decode_segment':
+      // Experiment6 parallel pool: decode one trajectory chunk (stateless 48k).
+      runDecodeSegment(msg);
+      break;
+    case 'get_decode_scale':
+      runGetDecodeScale(msg);
       break;
     case 'set_captures':
       // Experiment6 parallel pool: inject reassembled per-source captures so the

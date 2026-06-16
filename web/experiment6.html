@@ -339,6 +339,13 @@ const STRIDE_48_M = 43200;
 const HOP_48_M    = 320;
 const GUARD_48_M  = 16 * HOP_48_M;
 
+// Triangular OLA window for parallel decode — must match worker's TRI_WIN_48.
+const TRI_WIN_48_M = new Float32Array(SEG_48_M);
+for (let _i = 0; _i < SEG_48_M; _i++) {
+  const _t = (_i + 1) / (SEG_48_M + 1);
+  TRI_WIN_48_M[_i] = 0.5 - Math.abs(_t - 0.5);
+}
+
 // ── Controls ──────────────────────────────────────────────────────────────────
 
 const controls = document.getElementById('controls');
@@ -2576,16 +2583,7 @@ async function onWorkerMsg(e) {
   }
 
   if (msg.type === 'trajectory_audio_exp6') {
-    if (msg.jobId === playJobId) {
-      const sr = mp.getSampleRate();
-      lastRawPcm   = msg.decoded;
-      lastRawPcmSr = sr;
-      lastRawPcmCh = msg.channels ?? 1;
-      stopTrajPlayback();
-      playerG.setAudio(applyGenFade(msg.decoded, sr, lastRawPcmCh), sr, makeGenColorFn(), lastRawPcmCh);
-      updateBookmarkBtn();
-      setStatus('');
-    }
+    onTrajectoryDecoded(msg.decoded, msg.channels ?? 1, msg.jobId);
     return;
   }
 
@@ -2732,7 +2730,8 @@ function ensureEncPool() {
     const slot = { w, onResult: null };
     w.onmessage = (e) => {
       const m = e.data;
-      if (m.type === 'segment_cap' || m.type === 'segment_error') {
+      if (m.type === 'segment_cap'     || m.type === 'segment_error' ||
+          m.type === 'decoded_segment' || m.type === 'decode_error') {
         const cb = slot.onResult; slot.onResult = null; if (cb) cb(m);
       }
     };
@@ -2860,6 +2859,160 @@ async function runParallelEncode48k(audioA, audioB, channels, myRun) {
     worker.postMessage({ type: 'get_embeddings_exp6', jobId: activeJobId });
   } finally {
     release();
+  }
+}
+
+// ── Parallel 48k decode (stateless) ─────────────────────────────────────────────
+// Generation/trajectory decode mirrors the parallel encode: in stateless 48k the
+// 1 s OLA chunks are independent, so they decode concurrently across the pool and
+// the main thread OLA-blends the results (same triangular window + scale envelope
+// as the sequential worker decode). Stateful 48k / 24k still use the primary worker.
+
+// Query the 48k decoder scale tensor shape from the primary worker (cached caps).
+function getDecodeScale() {
+  return new Promise((resolve) => {
+    const jid = ++jobSeq;
+    const h = (e) => {
+      if (e.data.type === 'decode_scale' && e.data.jobId === jid) {
+        worker.removeEventListener('message', h);
+        resolve({ scale: e.data.scale, scaleDims: e.data.scaleDims });
+      }
+    };
+    worker.addEventListener('message', h);
+    worker.postMessage({ type: 'get_decode_scale', jobId: jid });
+  });
+}
+
+// Stream decode chunks across the pool in the given job order, calling
+// onChunk(result) as each lands. Resolves when all complete (always drains every
+// dispatched job so the shared pool lock never releases with workers still busy).
+function doPoolDecodeStreaming(jobs, onChunk) {
+  const { slots } = ensureEncPool();
+  let next = 0, done = 0, settled = false;
+  return new Promise((resolve, reject) => {
+    const pump = (slot) => {
+      if (settled || next >= jobs.length) return;
+      const job = jobs[next++];
+      slot.onResult = (m) => {
+        if (settled) return;
+        if (m.type === 'decode_error') { settled = true; reject(new Error(m.message)); return; }
+        try { onChunk(m); } catch (_) {}
+        done++;
+        if (done === jobs.length) { settled = true; resolve(); }
+        else pump(slot);
+      };
+      slot.w.postMessage({ type: 'decode_segment', ...job }, [job.embChunk.buffer]);
+    };
+    slots.forEach(pump);
+  });
+}
+
+// Decode a whole trajectory (embQuant [1,D,N]) by fanning its 1 s chunks across
+// the pool, then OLA-blend to planar stereo once all are in. Parallel decode is
+// fast enough that the full generation is ready almost immediately — no need to
+// stream/schedule chunks. Returns the decoded Float32Array, or null if superseded.
+async function runParallelDecode48k(embQuant, D, N, frameScales, isCurrent) {
+  const modelHz = '48k', bwKbps = mp.getBwKbps();
+  const CHUNK_F  = SEG_48_M / HOP_48_M;     // 150 frames per chunk
+  const STRIDE_F = STRIDE_48_M / HOP_48_M;  // 135 frames per stride (10% overlap)
+
+  const { scale: refScale, scaleDims } = await getDecodeScale();
+  if (!isCurrent()) return null;
+  // With frameScales, decode at unit scale and apply the gain envelope after OLA
+  // (matches the sequential decoder); otherwise use the real per-segment scale.
+  const decodeScale = frameScales ? new Float32Array(refScale.length).fill(1.0) : refScale;
+
+  const numChunks    = Math.ceil(N / STRIDE_F);
+  const totalSamples = N * HOP_48_M;
+  const outBuf = new Float32Array(2 * totalSamples);  // OLA accumulator
+  const wgtBuf = new Float32Array(totalSamples);
+
+  const jobs = [];
+  for (let seg = 0; seg < numChunks; seg++) {
+    const tStart  = seg * STRIDE_F;
+    const tEnd    = Math.min(tStart + CHUNK_F, N);
+    const chunk_T = tEnd - tStart;
+    const embChunk = new Float32Array(D * chunk_T);
+    for (let d = 0; d < D; d++)
+      for (let i = 0; i < chunk_T; i++)
+        embChunk[d * chunk_T + i] = embQuant[d * N + tStart + i];
+    jobs.push({ idx: seg, embChunk, embDims: [1, D, chunk_T],
+                scale: decodeScale, scaleDims, modelHz, bwKbps, tStart, chunk_T });
+  }
+
+  // OLA-accumulate each chunk as it lands (planar L|R, channel-independent window).
+  const onChunk = (m) => {
+    const numSamples = m.chunk_T * HOP_48_M, off = m.tStart * HOP_48_M, a = m.audio;
+    for (let i = 0; i < numSamples; i++) {
+      const w = TRI_WIN_48_M[i];
+      outBuf[off + i]                += w * a[i];
+      outBuf[totalSamples + off + i] += w * a[numSamples + i];
+      wgtBuf[off + i]                += w;
+    }
+  };
+
+  // Serialise on the shared pool lock (never overlap encode/decode batches).
+  const prev = encodeBatchPromise;
+  let release;
+  encodeBatchPromise = new Promise(r => { release = r; });
+  try {
+    try { await prev; } catch (_) {}
+    if (!isCurrent()) return null;
+    setStatus(`Decoding ${numChunks} chunks in parallel…`);
+    await doPoolDecodeStreaming(jobs, onChunk);
+  } catch (err) {
+    destroyEncPool();   // a failed chunk may leave workers busy — rebuild clean
+    if (isCurrent()) setStatus('Parallel decode failed: ' + err.message, true);
+    return null;
+  } finally { release(); }
+  if (!isCurrent()) return null;
+
+  for (let i = 0; i < totalSamples; i++) {
+    if (wgtBuf[i] > 0) { outBuf[i] /= wgtBuf[i]; outBuf[totalSamples + i] /= wgtBuf[i]; }
+  }
+  // Per-sample gain envelope from the per-frame scales (linear interp).
+  if (frameScales) {
+    for (let s = 0; s < totalSamples; s++) {
+      const t  = s / HOP_48_M;
+      const t0 = Math.min(N - 1, Math.floor(t));
+      const t1 = Math.min(N - 1, t0 + 1);
+      const g  = frameScales[t0] * (1 - (t - t0)) + frameScales[t1] * (t - t0);
+      outBuf[s]                *= g;
+      outBuf[totalSamples + s] *= g;
+    }
+  }
+  return outBuf;
+}
+
+// Hand a decoded trajectory to the Generated player. Shared by the parallel path
+// and the primary-worker `trajectory_audio_exp6` message.
+function onTrajectoryDecoded(decoded, channels, jobId) {
+  if (jobId !== playJobId) return;
+  const sr = mp.getSampleRate();
+  lastRawPcm = decoded; lastRawPcmSr = sr; lastRawPcmCh = channels;
+  stopTrajPlayback();
+  playerG.setAudio(applyGenFade(decoded, sr, channels), sr, makeGenColorFn(), channels);
+  updateBookmarkBtn();
+  setStatus('');
+}
+
+// Decode dispatcher: stateless 48k fans out across the pool; everything else
+// (stateful 48k, 24k) goes to the primary worker. playJobId is set by the caller.
+function decodeTrajectory(embQuant, D, N, frameScales) {
+  const modelHz = mp.getModelHz();
+  const myJobId = playJobId;
+  if (modelHz === '48k' && !statefulOla) {
+    runParallelDecode48k(embQuant, D, N, frameScales, () => playJobId === myJobId)
+      .then(decoded => { if (decoded) onTrajectoryDecoded(decoded, 2, myJobId); })
+      .catch(e => { if (playJobId === myJobId) setStatus('Decode failed: ' + e.message, true); });
+  } else {
+    const xfers = [embQuant.buffer];
+    if (frameScales) xfers.push(frameScales.buffer);
+    worker.postMessage({
+      type: 'decode_trajectory_exp6', jobId: myJobId,
+      embQuant, dims: [1, D, N], frameScales: frameScales || undefined,
+      modelHz, bwKbps: mp.getBwKbps(),
+    }, xfers);
   }
 }
 
@@ -4871,14 +5024,7 @@ async function playTrajectory() {
     const dirLabel = { forward: 'fwd', backward: 'bwd', pingpong: 'ping' }[trajDir];
     setStatus(`Decoding code/${dirLabel} (${N} frames, ${(N / fps).toFixed(1)} s)…`);
     const codeScales = makeFrameScales(genPlaySeq, currentEmbeds);
-    const codeXfers  = [blended.buffer];
-    if (codeScales) codeXfers.push(codeScales.buffer);
-    worker.postMessage({
-      type: 'decode_trajectory_exp6', jobId: playJobId,
-      embQuant: blended, dims: [1, D, N],
-      frameScales: codeScales || undefined,
-      modelHz: mp.getModelHz(), bwKbps: mp.getBwKbps(),
-    }, codeXfers);
+    decodeTrajectory(blended, D, N, codeScales || null);
     return;
   }
 
@@ -4899,14 +5045,7 @@ async function playTrajectory() {
     const snapLabel = { k_frames: 'K frames', equal: 'equal', proportional: 'proportional' }[snapMode];
     setStatus(`Decoding snap/${snapLabel} (${N} frames, ${(N / fps).toFixed(1)} s)…`);
     const snapScales = makeFrameScales(seq, currentEmbeds);
-    const snapXfers  = [blended.buffer];
-    if (snapScales) snapXfers.push(snapScales.buffer);
-    worker.postMessage({
-      type: 'decode_trajectory_exp6', jobId: playJobId,
-      embQuant: blended, dims: [1, D, N],
-      frameScales: snapScales || undefined,
-      modelHz: mp.getModelHz(), bwKbps: mp.getBwKbps(),
-    }, snapXfers);
+    decodeTrajectory(blended, D, N, snapScales || null);
     return;
   }
 
@@ -4984,14 +5123,7 @@ async function playTrajectory() {
   playJobId = ++jobSeq;
   setStatus(`Decoding ${N} frames (${duration} s)…`);
 
-  const drawXfers = [blended.buffer];
-  if (drawScales) drawXfers.push(drawScales.buffer);
-  worker.postMessage({
-    type: 'decode_trajectory_exp6', jobId: playJobId,
-    embQuant: blended, dims: [1, D, N],
-    frameScales: drawScales || undefined,
-    modelHz: mp.getModelHz(), bwKbps: mp.getBwKbps(),
-  }, drawXfers);
+  decodeTrajectory(blended, D, N, drawScales || null);
 }
 
 // ── Hover help ────────────────────────────────────────────────────────────────
