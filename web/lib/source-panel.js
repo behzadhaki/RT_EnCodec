@@ -130,6 +130,7 @@ export function createSourcePanel({
   let currentFileHandle = null;   // FileSystemFileHandle when available (null on Firefox)
   let currentFolder     = null;   // Array<File> of .wav files, name-sorted (folder mode)
   let currentFolderName = '';
+  let currentDirHandle  = null;   // FileSystemDirectoryHandle (showDirectoryPicker only; null on the input fallback)
 
   function updateVisibility() {
     const v        = typeEl.value;
@@ -217,12 +218,15 @@ export function createSourcePanel({
     folderBtnEl.addEventListener('click', async () => {
       if ('showDirectoryPicker' in window) {
         let dirHandle;
-        try { dirHandle = await window.showDirectoryPicker(); }
+        // Request readwrite at pick time (inside this gesture) so code sidecars can
+        // be written later, after the debounced encode, without a fresh prompt.
+        try { dirHandle = await window.showDirectoryPicker({ mode: 'readwrite' }); }
         catch (err) { if (err.name !== 'AbortError') throw err; return; }
         const files = [];
         for await (const entry of dirHandle.values()) {
           if (entry.kind === 'file' && /\.wave?$/i.test(entry.name)) files.push(await entry.getFile());
         }
+        currentDirHandle = dirHandle;   // writable → enables code sidecars next to each wav
         setFolder(files, dirHandle.name);
         onChange(0);
       } else {
@@ -233,6 +237,7 @@ export function createSourcePanel({
     folderInputEl.addEventListener('change', () => {
       const files = [...folderInputEl.files];
       if (!files.length) return;
+      currentDirHandle = null;        // <input webkitdirectory> gives no writable handle
       const name = files[0].webkitRelativePath?.split('/')[0] || 'folder';
       setFolder(files, name);
       onChange(0);
@@ -263,6 +268,7 @@ export function createSourcePanel({
     getFile:         () => currentFile,
     getFileHandle:   () => currentFileHandle,
     getFolder:       () => currentFolder,   // Array<File> | null (folder mode)
+    getDirHandle:    () => currentDirHandle, // FileSystemDirectoryHandle | null (writable folder)
     /** Silently restore a file (+ optional handle) without firing callbacks.
      *  Call onFilePicked / onChange separately if needed. */
     setFile(file, handle = null) {
@@ -286,6 +292,7 @@ export function createSourcePanel({
         fileName: currentFile ? fileBtnEl.textContent : null,
         folder: currentFolder,
         folderName: currentFolderName,
+        dirHandle: currentDirHandle,
         folderLabel: folderBtnEl ? folderBtnEl.textContent : null,
         loadFull: loadFullEl.checked,
         trimS:    parseFloat(trimSEl.value) || 10,
@@ -303,6 +310,7 @@ export function createSourcePanel({
       fileBtnEl.textContent = s.fileName || 'choose file…';
       currentFolder     = s.folder ?? null;   // in-memory File[] (survives swap, not localStorage)
       currentFolderName = s.folderName ?? '';
+      currentDirHandle  = s.dirHandle ?? null;
       if (folderBtnEl) folderBtnEl.textContent = s.folderLabel || 'choose folder…';
       if (s.loadFull !== undefined) loadFullEl.checked = s.loadFull;
       if (s.trimS   !== undefined) trimSEl.value = s.trimS;

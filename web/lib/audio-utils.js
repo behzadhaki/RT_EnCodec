@@ -155,7 +155,19 @@ export async function probeAudioDurationSeconds(file) {
 //   'random'     — a random budgetS/N s window of every clip (equal share)
 //   'random:K'   — a random K-second window of every clip (whole clip if shorter)
 //   'truncate'   — concatenate in order, hard-cut at exactly budgetS
-export function planFolderSelections(files, durations, strategy, budgetS = MAX_FOLDER_TOTAL_S, rand = Math.random) {
+//
+// Random offsets are deterministic per clip (seeded from name+size+index), so the
+// same folder reproduces the same windows across reloads — which lets persisted
+// per-clip code sidecars be reused instead of re-encoded. Pass `rand` to override
+// (e.g. in tests) with a function taking the clip index.
+function clipSeedFrac(file, i) {
+  const str = `${file?.name ?? ''}:${file?.size ?? 0}:${i}`;
+  let h = 2166136261 >>> 0;                 // FNV-1a
+  for (let k = 0; k < str.length; k++) { h ^= str.charCodeAt(k); h = Math.imul(h, 16777619) >>> 0; }
+  return h / 4294967296;                     // [0, 1)
+}
+
+export function planFolderSelections(files, durations, strategy, budgetS = MAX_FOLDER_TOTAL_S, rand = null) {
   const N = files.length;
   const sel = [];
   if (strategy === 'all') {
@@ -176,7 +188,8 @@ export function planFolderSelections(files, durations, strategy, budgetS = MAX_F
     for (let i = 0; i < N; i++) {
       const win   = Math.min(durations[i], k);
       const slack = Math.max(0, durations[i] - win);
-      const startS = (isRandom && slack > 0) ? rand() * slack : 0;
+      const frac  = rand ? rand(i) : clipSeedFrac(files[i], i);
+      const startS = (isRandom && slack > 0) ? frac * slack : 0;
       sel.push({ file: files[i], startS, lenS: win });
     }
   } else { // 'truncate'

@@ -167,6 +167,9 @@ export function createDoubleSourceWidget({
         folderPlanCache.set(files, selections);
       }
       audio = await loadFolder(files, sr, channels, selections);
+      // Carry the resolved per-clip windows so the caller can key code sidecars
+      // (one per clip × model × window) next to each wav.
+      audio.folderSelections = selections;
     } else {
       const len = Math.round(getDuration() * sr);
       audio = generateSource(type, panel.getFreq(), len / sr, sr);
@@ -178,10 +181,12 @@ export function createDoubleSourceWidget({
       }
     }
     const clipStarts = audio.clipStarts || null; // folder boundaries (vol/gate keep length)
+    const folderSelections = audio.folderSelections || null;
     const vol = panel.getVolume();
     if (vol !== 1) audio = audio.map(x => x * vol);
     if (panel.isGateEnabled()) audio = applyPulseGate(audio, sr, panel.getGateFreq(), panel.getGateDecay(), channels);
     if (clipStarts) audio.clipStarts = clipStarts;
+    if (folderSelections) audio.folderSelections = folderSelections;
     return audio;
   }
 

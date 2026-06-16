@@ -161,6 +161,27 @@
 .folder-opt .fo-title { font-size: 12px; font-weight: 600; }
 .folder-opt .fo-desc  { font-size: 10px; color: var(--muted); }
 #folderModalFooter { display: flex; justify-content: flex-end; margin-top: 2px; }
+
+/* ── One-shot notice modal (e.g. sidecar save result) ── */
+#noticeModal {
+  position: fixed; inset: 0; z-index: 220;
+  background: rgba(0,0,0,0.6);
+  display: flex; align-items: center; justify-content: center;
+}
+#noticeModal.hidden { display: none; }
+#noticeModalBox {
+  background: var(--surface); border: 1px solid var(--border2);
+  border-radius: 8px; padding: 16px 18px;
+  width: 420px; max-width: 92vw;
+  display: flex; flex-direction: column; gap: 10px;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.6);
+}
+#noticeModalTitle {
+  font-size: 12px; font-weight: 700; letter-spacing: 0.08em;
+  text-transform: uppercase; color: var(--muted);
+}
+#noticeModalMsg { font-size: 12px; color: var(--text); line-height: 1.55; }
+#noticeModalMsg code { font-size: 11px; background: var(--surface2); padding: 1px 4px; border-radius: 3px; }
 </style>
 </head>
 <body>
@@ -332,6 +353,16 @@
   </div>
 </div>
 
+<div id="noticeModal" class="hidden">
+  <div id="noticeModalBox">
+    <div id="noticeModalTitle"></div>
+    <div id="noticeModalMsg"></div>
+    <div style="display:flex;justify-content:flex-end">
+      <button class="tog" id="noticeModalOk" style="font-size:11px;padding:4px 14px">OK</button>
+    </div>
+  </div>
+</div>
+
 <script type="module">
 'use strict';
 
@@ -360,6 +391,14 @@ import {
   cacheDelete,
   cacheClear,
 } from './lib/encodec-cache.js';
+import {
+  windowKey,
+  serializeSidecar,
+  readSidecar,
+  writeSidecar,
+  sidecarMatches,
+  ensureRWPermission,
+} from './lib/encodec-sidecar.js';
 
 const MODELS_BASE = new URL('../serialization/encodec_onnx_exports', location.href).href;
 
@@ -377,7 +416,7 @@ const srcWidget = createDoubleSourceWidget({
   defaultDur:   4,
   showDuration: false,   // each file loads at its own natural length (≤ 10 s)
   showFolder:   true,    // "Folder (join WAVs)" source type — concatenate a directory of WAVs
-  onChange: delay => { saveAllPanelSettings(); refreshDropdowns(); scheduleEncode(delay); },
+  onChange: delay => { saveAllPanelSettings(); refreshDropdowns(); maybeWarnFolderSupport(); scheduleEncode(delay); },
   onFolderOverflow: askFolderStrategy,
 });
 controls.appendChild(srcWidget.element);
@@ -414,6 +453,36 @@ function askFolderStrategy({ count, totalS, budgetS }) {
     modal.onclick = e => { if (e.target === modal) finish(null); };
     modal.classList.remove('hidden');
   });
+}
+
+// True when the browser can write files into a user-chosen local folder
+// (Chrome/Edge/Chromium; Brave needs the File System Access API flag enabled).
+const FS_ACCESS_OK = 'showDirectoryPicker' in window;
+
+// Warn once (when a Folder source is in use) if this browser can't save sidecars.
+function maybeWarnFolderSupport() {
+  if (FS_ACCESS_OK || folderSupportWarned) return;
+  if (panelA.getType() !== 'folder' && panelB.getType() !== 'folder') return;
+  folderSupportWarned = true;
+  showNotice('📁 Saving codes needs Chrome or Edge',
+    `Folders still load for analysis, but this browser can’t write the <code>.encodec</code> ` +
+    `code files next to your wavs — it lacks the File System Access API. To save/skip-encode ` +
+    `codes, open this page in <b>Chrome</b> or <b>Edge</b> (or a Chromium browser with that API ` +
+    `enabled — in Brave: <code>brave://flags/#file-system-access-api</code> → Enabled).`, true);
+}
+
+// One-shot informational modal (persists until dismissed, unlike the status bar).
+function showNotice(title, html, isError = false) {
+  const modal = document.getElementById('noticeModal');
+  const t = document.getElementById('noticeModalTitle');
+  t.textContent = title;
+  t.style.color = isError ? 'var(--red)' : 'var(--muted)';
+  document.getElementById('noticeModalMsg').innerHTML = html;
+  const ok = document.getElementById('noticeModalOk');
+  const close = () => { modal.classList.add('hidden'); ok.onclick = null; modal.onclick = null; };
+  ok.onclick = close;
+  modal.onclick = e => { if (e.target === modal) close(); };
+  modal.classList.remove('hidden');
 }
 
 // Declared here (before use) — the `let` declarations in the state-vars section
@@ -1061,6 +1130,10 @@ let encCache         = null;   // IDBDatabase handle, or null if disabled / not 
 let cachingEnabled   = false;
 let pendingCacheKeyA = null;   // set before encoding; used to save result after
 let pendingCacheKeyB = null;
+let pendingSidecarA  = null;   // { panel, audio, modelOpts } — folder code sidecars to write post-encode
+let pendingSidecarB  = null;
+let lastSidecarNoticeKey = null;  // de-dupes the one-shot sidecar popup (re-shows only on a changed outcome)
+let folderSupportWarned  = false; // one-shot "needs Chrome/Edge" notice for folder code-saving
 
 
 // ── Panel state persistence ────────────────────────────────────────────────────
@@ -2902,6 +2975,36 @@ function onWorkerMsg(e) {
         .catch(e => console.warn('Cache save failed:', e));
     }
 
+    // ── Save folder code sidecars next to each wav (best-effort) ───────────────
+    if (pendingSidecarA || pendingSidecarB) {
+      const sA = pendingSidecarA, sB = pendingSidecarB;
+      pendingSidecarA = pendingSidecarB = null;
+      Promise.all([
+        sA ? writeFolderSidecars(sA.panel, sA.audio, sA.modelOpts, msg.codesA, msg.codesDimsA, msg.scalesA ?? null) : Promise.resolve(null),
+        sB ? writeFolderSidecars(sB.panel, sB.audio, sB.modelOpts, msg.codesB, msg.codesDimsB, msg.scalesB ?? null) : Promise.resolve(null),
+      ]).then(results => {
+        const ok     = results.filter(r => r && r.ok);
+        const failed = results.filter(r => r && !r.ok);
+        const wrote  = ok.reduce((a, r) => a + r.count, 0);
+        if (wrote) setStatus(`Codes saved next to wavs ✓ (${wrote} .encodec files)`);
+        else if (failed.length) setStatus('Codes not saved: ' + failed[0].reason, true);
+        if (failed.length) console.warn('Sidecar not written:', failed.map(r => r.reason));
+        // Persistent popup, shown once per distinct outcome (the status bar flashes by).
+        const key = wrote ? `ok:${wrote}` : (failed.length ? `err:${failed[0].reason}` : null);
+        if (key && key !== lastSidecarNoticeKey) {
+          lastSidecarNoticeKey = key;
+          if (wrote)
+            showNotice('📁 Codes saved',
+              `Wrote <b>${wrote}</b> <code>.encodec</code> file(s) next to your wavs. ` +
+              `Re-loading the same folder with the same model will skip encoding.`);
+          // On browsers that can't save at all, the upfront "needs Chrome/Edge"
+          // notice already explained it — don't pop a second time after every encode.
+          else if (FS_ACCESS_OK)
+            showNotice('📁 Codes not saved', failed[0].reason, true);
+        }
+      }).catch(e => console.warn('Sidecar save failed:', e));
+    }
+
   } else if (msg.type === 'error') {
     progWrap.style.display = 'none';
     setStatus(msg.message, true);
@@ -3081,6 +3184,127 @@ async function runParallelEncode48k(audioA, audioB, channels, myRun) {
   }
 }
 
+// ── Folder code sidecars ────────────────────────────────────────────────────
+// A folder source's codes are the concatenation of its clips. We store one
+// sidecar per clip (next to its wav: <clip>.encodec.<hz>.<bw>) holding codes for
+// the deterministic window selected. On reload, if every clip's current window is
+// present we assemble the joined codes and skip encoding. Windows are sliced from
+// the concat encode; near clip seams codes reflect neighbour context, which is
+// reproduced exactly as long as the folder/strategy/model are unchanged.
+
+// Frame boundaries [0, …, T] for a folder's clips, mapped from per-channel clip
+// start samples (proportional — robust to the exact hop/OLA geometry).
+function clipFrameBounds(clipStarts, totalSamplesPerCh, T) {
+  const fb = clipStarts.map(s => Math.min(T, Math.max(0, Math.round(s / totalSamplesPerCh * T))));
+  fb.push(T);
+  return fb;
+}
+
+// Slice [f0,f1) frames out of a [1,K,T] codes array (+ optional [T] scales).
+function sliceClipCodes(codes, codesDims, scales, f0, f1) {
+  const K = codesDims[1], T = codesDims[2], t = f1 - f0;
+  const out = new Int32Array(K * t);
+  for (let k = 0; k < K; k++) out.set(codes.subarray(k * T + f0, k * T + f1), k * t);
+  return { codes: out, codesDims: [1, K, t], scales: scales ? scales.subarray(f0, f1).slice() : null };
+}
+
+// Join per-clip codes (each [1,K,t_i], same K) into one [1,K,ΣT] array.
+function joinClipCodes(clips) {
+  const K = clips[0].codesDims[1];
+  const T = clips.reduce((a, c) => a + c.codesDims[2], 0);
+  const codes = new Int32Array(K * T);
+  const scales = clips.every(c => c.scales) ? new Float32Array(T) : null;
+  let off = 0;
+  for (const c of clips) {
+    const t = c.codesDims[2];
+    for (let k = 0; k < K; k++) codes.set(c.codes.subarray(k * t, (k + 1) * t), k * T + off);
+    if (scales) scales.set(c.scales, off);
+    off += t;
+  }
+  return { codes, codesDims: [1, K, T], scales };
+}
+
+// Assemble a folder source's codes from disk if every clip window is cached in a
+// valid sidecar; else null. Read-only.
+async function readFolderSidecars(panel, audio, modelOpts) {
+  const dir  = panel.getDirHandle?.();
+  const sels = audio.folderSelections;
+  if (!dir || !sels || !sels.length) return null;
+  if (!(await ensureRWPermission(dir))) return null;
+  const { modelHz, bwKbps, sampleRate, channels, ola } = modelOpts;
+  const byFile = new Map();   // File → parsed sidecar | null (read once)
+  const clips  = [];
+  for (const sel of sels) {
+    if (!byFile.has(sel.file)) {
+      let parsed = await readSidecar(dir, sel.file.name, modelHz, bwKbps);
+      const crc  = await crc32FromFile(sel.file);
+      if (parsed && !sidecarMatches(parsed.header,
+            { fileSize: sel.file.size, crc32: crc, modelHz, bwKbps, sampleRate, channels, ola })) parsed = null;
+      byFile.set(sel.file, parsed);
+    }
+    const parsed = byFile.get(sel.file);
+    const entry  = parsed && parsed.entries.get(windowKey(sel.startS, sel.lenS));
+    if (!entry) return null;
+    clips.push(entry);
+  }
+  return joinClipCodes(clips);
+}
+
+// Slice the just-encoded concat codes per clip and merge into each clip's sidecar
+// (preserving previously cached windows). Best-effort; failures are non-fatal.
+// Returns { ok, reason?, count? }. Best-effort: per-file write errors are logged
+// but don't abort the rest.
+async function writeFolderSidecars(panel, audio, modelOpts, codes, codesDims, scales) {
+  const dir  = panel.getDirHandle?.();
+  const sels = audio.folderSelections;
+  if (!sels || !sels.length || !audio.clipStarts) return { ok: false, reason: 'not a folder source' };
+  if (!dir) return { ok: false, reason: 'no writable folder — pick the folder with “choose folder…” in Chrome/Edge (Firefox/Safari can’t write)' };
+  if (!(await ensureRWPermission(dir))) return { ok: false, reason: 'write permission for the folder was not granted' };
+  const { modelHz, bwKbps, sampleRate, channels, ola } = modelOpts;
+  const fb = clipFrameBounds(audio.clipStarts, audio.length / channels, codesDims[2]);
+  const perFile = new Map();  // File → { crc, slices: Map<key, slice> }
+  for (let i = 0; i < sels.length; i++) {
+    const sel = sels[i];
+    if (!perFile.has(sel.file)) perFile.set(sel.file, { crc: await crc32FromFile(sel.file), slices: new Map() });
+    perFile.get(sel.file).slices.set(windowKey(sel.startS, sel.lenS),
+      sliceClipCodes(codes, codesDims, scales, fb[i], fb[i + 1]));
+  }
+  let count = 0;
+  for (const [file, g] of perFile) {
+    try {
+      const meta = { filename: file.name, fileSize: file.size, crc32: g.crc,
+                     modelHz, bwKbps, sampleRate, channels, ola };
+      const existing = await readSidecar(dir, file.name, modelHz, bwKbps);
+      const merged = new Map();
+      if (existing && sidecarMatches(existing.header, meta))
+        for (const [k, v] of existing.entries) merged.set(k, v);
+      for (const [k, v] of g.slices) merged.set(k, v);
+      await writeSidecar(dir, file.name, modelHz, bwKbps, serializeSidecar(meta, merged));
+      count++;
+    } catch (e) { console.warn('sidecar write failed for', file.name, e); }
+  }
+  return count ? { ok: true, count } : { ok: false, reason: 'all file writes failed (see console)' };
+}
+
+// Inject a fully-resolved A/B codes pair (from sidecars) as currentEmbeds —
+// mirrors the IndexedDB full-hit path. A/B = { codes, codesDims, scales }.
+async function injectCodesPair(A, B) {
+  const cb  = await ensureCodebooks();
+  const T_A = A.codesDims[A.codesDims.length - 1];
+  const T_B = B.codesDims[B.codesDims.length - 1];
+  currentEmbeds = {
+    type: 'embeddings_exp6',
+    embEncA: null, embEncDimsA: null, embEncB: null, embEncDimsB: null,
+    embQuantA: reconstructEmbQuant(cb, A.codes, A.codesDims), embQuantDimsA: [1, cb.dim, T_A],
+    codesA: A.codes, codesDimsA: A.codesDims, scalesA: A.scales,
+    embQuantB: reconstructEmbQuant(cb, B.codes, B.codesDims), embQuantDimsB: [1, cb.dim, T_B],
+    codesB: B.codes, codesDimsB: B.codesDims, scalesB: B.scales,
+  };
+  populateLevelSelect(currentEmbeds.codesDimsA[1]);
+  progWrap.style.display = 'none';
+  markDirty('COORDS', 'WAYPOINTS', 'AUDIO', 'RENDER');
+}
+
 async function startEncode() {
   if (!worker) initWorker();
 
@@ -3135,10 +3359,16 @@ async function startEncode() {
   // legacy dual-mono ones (2T vs T); channels is stored for display.
   // Stateless 48k OLA produces different embeddings than the cached (stateful)
   // ones and has no key disambiguator, so it bypasses the cache entirely.
-  const modelOpts = { modelHz, bwKbps, sampleRate: sr, channels: srcCh };
+  const modelOpts = {
+    modelHz, bwKbps, sampleRate: sr, channels: srcCh,
+    // 48k codes differ between OLA modes — record it so sidecars don't mix them.
+    ola: modelHz === '48k' ? (statefulOla ? 'stateful' : 'stateless') : null,
+  };
   const cacheable  = modelHz !== '48k' || statefulOla;
   pendingCacheKeyA = null;
   pendingCacheKeyB = null;
+  pendingSidecarA  = null;
+  pendingSidecarB  = null;
 
   if (crcA && crcB && cacheable) {
     const keyA = makeCacheKey(fileA, crcA, modelOpts, audioA.length);
@@ -3188,6 +3418,38 @@ async function startEncode() {
     // Cache miss — store keys so we can save after encoding completes
     pendingCacheKeyA = keyA;
     pendingCacheKeyB = keyB;
+  }
+
+  // ── Folder code sidecars ──────────────────────────────────────────────────────
+  // True next-to-the-wav cache for folder sources (writable directory handle).
+  // If BOTH sources are folders and every clip's window is on disk, assemble and
+  // skip the encode. Otherwise, schedule a post-encode write for any folder source.
+  // Sidecars are separate files written into a folder the user explicitly granted
+  // write access to, so they're independent of the IndexedDB "Analysis cache"
+  // toggle and (keyed by OLA mode) work for 48k stateless too.
+  const isFolderA = panelA.getType() === 'folder';
+  const isFolderB = panelB.getType() === 'folder';
+  if (isFolderA || isFolderB) {
+    if (isFolderA && isFolderB) {
+      setStatus('Checking sidecars…');
+      try {
+        const [A, B] = await Promise.all([
+          readFolderSidecars(panelA, audioA, modelOpts),
+          readFolderSidecars(panelB, audioB, modelOpts),
+        ]);
+        if (stale()) return;
+        if (A && B) {
+          setStatus('Loading codebooks…');
+          await injectCodesPair(A, B);
+          if (stale()) return;
+          setStatus('Loaded from sidecars ✓');
+          return;
+        }
+      } catch (e) { console.warn('Sidecar read failed:', e); }
+    }
+    // Miss (or mixed) — write sidecars for folder sources once encoding finishes.
+    if (isFolderA) pendingSidecarA = { panel: panelA, audio: audioA, modelOpts };
+    if (isFolderB) pendingSidecarB = { panel: panelB, audio: audioB, modelOpts };
   }
 
   // ── Parallel path: 48k stateless segments are independent → encode in a pool ──
