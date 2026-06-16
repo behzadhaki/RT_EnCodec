@@ -89,7 +89,7 @@ export function createSourcePanel({
       <input type="range" class="vol-slider src-vol" min="0" max="1" step="0.01" value="${defaultVol}">
     </div>` : ''}
     ${showGate ? `
-    <div class="row">
+    <div class="row src-gate-row">
       <span class="lbl">Gate</span>
       <button class="tog src-gate-tog">Off</button>
     </div>
@@ -119,6 +119,7 @@ export function createSourcePanel({
   const trimRow     = section.querySelector('.src-trim-row');
   const trimSEl     = section.querySelector('.src-trim-s');
   const volEl       = section.querySelector('.src-vol');
+  const gateRow     = section.querySelector('.src-gate-row');
   const gateTogEl   = section.querySelector('.src-gate-tog');
   const gateRateRow = section.querySelector('.src-gate-rate-row');
   const gateDecRow  = section.querySelector('.src-gate-decay-row');
@@ -143,6 +144,13 @@ export function createSourcePanel({
     loadRow.style.display = isFile ? '' : 'none';
     trimRow.style.display = (isFile && !loadFull) ? '' : 'none';
     freqRow.style.display = (isFile || isFolder || v === 'sweep' || v === 'silence') ? 'none' : '';
+    // Gate only makes sense for synth sources — hide it for file/folder.
+    const gateAllowed = !(isFile || isFolder);
+    if (gateRow) {
+      gateRow.style.display = gateAllowed ? '' : 'none';
+      if (gateRateRow) gateRateRow.style.display = (gateAllowed && gateEnabled) ? '' : 'none';
+      if (gateDecRow)  gateDecRow.style.display  = (gateAllowed && gateEnabled) ? '' : 'none';
+    }
   }
 
   typeEl.addEventListener('change',   () => { updateVisibility(); onChange(0); });
@@ -280,7 +288,8 @@ export function createSourcePanel({
     getLoadFull:   () => loadFullEl.checked,
     getTrimS:      () => parseFloat(trimSEl.value) || 10,
     getVolume:     () => volEl ? parseFloat(volEl.value) : 1,
-    isGateEnabled: () => gateEnabled,
+    // Gate applies to synth sources only — never to file/folder.
+    isGateEnabled: () => gateEnabled && typeEl.value !== 'file' && typeEl.value !== 'folder',
     getGateFreq:   () => gateFreqEl ? (parseFloat(gateFreqEl.value) || 4)  : 4,
     getGateDecay:  () => gateDecEl  ? (parseFloat(gateDecEl.value)  || 0)  : 0,
     getState() {
