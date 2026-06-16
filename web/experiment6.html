@@ -86,52 +86,6 @@
 #segCtxMenu .seg-ctx-item.danger { color: #e06060; }
 #segCtxMenu .seg-ctx-sep { height: 1px; background: #333; margin: 3px 0; }
 
-/* ── Cache manager modal ── */
-#cacheModal {
-  position: fixed; inset: 0; z-index: 200;
-  background: rgba(0,0,0,0.65);
-  display: flex; align-items: center; justify-content: center;
-}
-#cacheModal.hidden { display: none; }
-#cacheModalBox {
-  background: var(--surface); border: 1px solid var(--border2);
-  border-radius: 8px; padding: 16px 18px;
-  width: 520px; max-width: 95vw; max-height: 75vh;
-  display: flex; flex-direction: column; gap: 10px;
-  box-shadow: 0 8px 32px rgba(0,0,0,0.6);
-}
-#cacheModalTitle {
-  font-size: 12px; font-weight: 700; letter-spacing: 0.08em;
-  text-transform: uppercase; color: var(--muted);
-  display: flex; align-items: center; justify-content: space-between;
-}
-#cacheModalList {
-  flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 4px;
-  min-height: 40px;
-}
-.cache-entry {
-  display: flex; align-items: center; gap: 6px;
-  background: var(--surface2); border: 1px solid var(--border);
-  border-radius: 4px; padding: 5px 8px; font-size: 11px;
-}
-.cache-entry-name { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--text); }
-.cache-entry-meta { color: var(--muted); white-space: nowrap; }
-.cache-entry-del {
-  background: none; border: 1px solid var(--border2); color: var(--muted);
-  border-radius: 3px; width: 18px; height: 18px; cursor: pointer;
-  font-size: 10px; display: flex; align-items: center; justify-content: center;
-  flex-shrink: 0;
-}
-.cache-entry-del:hover { border-color: var(--red); color: var(--red); }
-#cacheModalFooter { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
-#cacheModalEmpty { font-size: 11px; color: var(--muted); text-align: center; padding: 10px 0; }
-.src-cache-row select {
-  flex: 1; font-size: 10px;
-  background: var(--bg); color: var(--text);
-  border: 1px solid var(--border); border-radius: 3px;
-  padding: 1px 2px; cursor: pointer;
-}
-
 /* ── Folder overflow modal ── */
 #folderModal {
   position: fixed; inset: 0; z-index: 210;
@@ -301,19 +255,6 @@
   <div class="seg-ctx-item danger" id="segCtxDelete">Delete</div>
 </div>
 
-<div id="cacheModal" class="hidden">
-  <div id="cacheModalBox">
-    <div id="cacheModalTitle">
-      <span>💾 Cached analyses</span>
-      <button class="tog" id="cacheModalClose" style="font-size:9px;padding:2px 8px">✕ Close</button>
-    </div>
-    <div id="cacheModalList"></div>
-    <div id="cacheModalFooter">
-      <span id="cacheModalStats" style="font-size:11px;color:var(--muted)"></span>
-      <button class="tog danger" id="cacheModalClearAll" style="font-size:10px;padding:3px 10px;color:var(--red)">Clear all</button>
-    </div>
-  </div>
-</div>
 
 <div id="folderModal" class="hidden">
   <div id="folderModalBox">
@@ -381,17 +322,7 @@ import {
   makeFrameScales,
 } from './lib/trajectory-utils.js';
 import {
-  openEncodecDB,
   crc32FromFile,
-  makeCacheKey,
-  cacheGet,
-
-  cachePut,
-  cacheList,
-  cacheDelete,
-  cacheClear,
-} from './lib/encodec-cache.js';
-import {
   windowKey,
   serializeSidecar,
   readSidecar,
@@ -416,7 +347,7 @@ const srcWidget = createDoubleSourceWidget({
   defaultDur:   4,
   showDuration: false,   // each file loads at its own natural length (≤ 10 s)
   showFolder:   true,    // "Folder (join WAVs)" source type — concatenate a directory of WAVs
-  onChange: delay => { saveAllPanelSettings(); refreshDropdowns(); maybeWarnFolderSupport(); scheduleEncode(delay); },
+  onChange: delay => { saveAllPanelSettings(); maybeWarnFolderSupport(); scheduleEncode(delay); },
   onFolderOverflow: askFolderStrategy,
 });
 controls.appendChild(srcWidget.element);
@@ -485,39 +416,6 @@ function showNotice(title, html, isError = false) {
   modal.classList.remove('hidden');
 }
 
-// Declared here (before use) — the `let` declarations in the state-vars section
-// below would be in the temporal dead zone at this point in execution.
-let cacheDropRowA, cacheDropSelA, cacheDropRowB, cacheDropSelB;
-
-// Inject per-panel cache dropdowns (hidden until matching entries exist).
-({ rowEl: cacheDropRowA, selEl: cacheDropSelA } = injectCacheDropdown(panelA));
-({ rowEl: cacheDropRowB, selEl: cacheDropSelB } = injectCacheDropdown(panelB));
-
-// Selecting a cached version: apply its model/trim settings and trigger encode.
-// Only acts when the correct file is already loaded in the panel.
-function wireCacheDropdown(selEl, panel) {
-  selEl.addEventListener('change', () => {
-    if (!selEl.value) return;
-    const { segEnd, sampleRate, modelHz, bwKbps, filename } = JSON.parse(selEl.value);
-    selEl.value = '';   // reset — not sticky
-
-    const currentFile = panel.getFile();
-    if (!currentFile || currentFile.name !== filename) {
-      setStatus(`Load "${filename}" to use this cached version`, true);
-      return;
-    }
-
-    // Correct file loaded — apply model settings, set trim, trigger encode.
-    mp.setModelHz(modelHz);
-    mp.setBwKbps(bwKbps);
-    const trimS = parseFloat((segEnd / sampleRate).toFixed(3));
-    panel.setState({ ...panel.getState(), loadFull: false, trimS });
-    scheduleEncode(0);
-  });
-}
-wireCacheDropdown(cacheDropSelA, panelA);
-wireCacheDropdown(cacheDropSelB, panelB);
-
 // Restore settings + files from the previous session (async; fires after all
 // sync setup so workers, mp, etc. are already initialised).
 restoreSession();
@@ -525,7 +423,7 @@ restoreSession();
 const mp = createModelPanel({
   defaultModel: '48k',
   defaultBw:    24,
-  onChange: () => { currentEmbeds = null; refreshDropdowns(); updateEncOptVisibility(); scheduleEncode(0); },
+  onChange: () => { currentEmbeds = null; updateEncOptVisibility(); scheduleEncode(0); },
 });
 controls.appendChild(mp.modelSection);
 controls.appendChild(mp.modeSection);
@@ -759,155 +657,6 @@ librarySection.innerHTML = `
 `.trim();
 controls.appendChild(librarySection);
 
-// ── Analysis cache prompt ─────────────────────────────────────────────────────
-// Shown once; preference persisted in localStorage.
-const CACHE_PREF_KEY = 'encodec_cache_enabled';
-
-const cacheSection = document.createElement('div');
-cacheSection.className = 'section';
-cacheSection.id = 'cacheSection';
-
-function renderCacheSection() {
-  const pref = localStorage.getItem(CACHE_PREF_KEY);
-  if (pref === null) {
-    // First visit — show prompt
-    cacheSection.innerHTML = `
-      <div class="section-title" style="color:var(--accent)">Analysis Cache</div>
-      <div style="font-size:11px;color:var(--muted);margin-bottom:6px;line-height:1.5">
-        Save analysis to browser storage?<br>Avoids re-encoding the same files.
-      </div>
-      <div style="display:flex;gap:4px">
-        <button class="tog" id="cacheYesBtn" style="flex:1">Enable</button>
-        <button class="tog" id="cacheNoBtn"  style="flex:1">Skip</button>
-      </div>
-    `.trim();
-    cacheSection.querySelector('#cacheYesBtn').addEventListener('click', () => {
-      localStorage.setItem(CACHE_PREF_KEY, '1');
-      initCache();
-      renderCacheSection();
-    });
-    cacheSection.querySelector('#cacheNoBtn').addEventListener('click', () => {
-      localStorage.setItem(CACHE_PREF_KEY, '0');
-      renderCacheSection();
-    });
-  } else {
-    const on = pref === '1';
-    cacheSection.innerHTML = `
-      <div style="display:flex;align-items:center;justify-content:space-between;gap:4px">
-        <span style="font-size:11px;color:var(--muted)">
-          💾 Cache: <strong style="color:${on ? 'var(--accent)' : 'var(--muted)'}">${on ? 'on' : 'off'}</strong>
-        </span>
-        <div style="display:flex;gap:3px">
-          ${on ? '<button class="tog" id="cacheManageBtn" style="font-size:9px;padding:2px 6px">Manage</button>' : ''}
-          <button class="tog" id="cacheToggleBtn" style="font-size:9px;padding:2px 6px">
-            ${on ? 'Disable' : 'Enable'}
-          </button>
-        </div>
-      </div>
-    `.trim();
-    cacheSection.querySelector('#cacheToggleBtn').addEventListener('click', () => {
-      const newVal = on ? '0' : '1';
-      localStorage.setItem(CACHE_PREF_KEY, newVal);
-      if (newVal === '1') initCache(); else { cachingEnabled = false; }
-      renderCacheSection();
-    });
-    cacheSection.querySelector('#cacheManageBtn')?.addEventListener('click', openCacheModal);
-  }
-}
-
-async function initCache() {
-  try {
-    encCache       = await openEncodecDB();
-    cachingEnabled = true;
-    refreshDropdowns();   // show dropdowns for any already-selected files
-  } catch (e) {
-    console.warn('Could not open encodec cache DB:', e);
-    cachingEnabled = false;
-  }
-}
-
-// ── Cache manager modal ───────────────────────────────────────────────────────
-
-function fmtBytes(n) {
-  if (n < 1024)        return n + ' B';
-  if (n < 1024 * 1024) return (n / 1024).toFixed(0) + ' KB';
-  return (n / (1024 * 1024)).toFixed(1) + ' MB';
-}
-function fmtDate(ts) {
-  const d = new Date(ts);
-  return d.toLocaleDateString() + ' ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-}
-
-/** Rebuild the cache modal list. No-op if the modal is closed or cache is off. */
-async function refreshCacheModal() {
-  const modal    = document.getElementById('cacheModal');
-  if (!encCache || !modal || modal.classList.contains('hidden')) return;
-
-  const list     = document.getElementById('cacheModalList');
-  const stats    = document.getElementById('cacheModalStats');
-  const clearBtn = document.getElementById('cacheModalClearAll');
-
-  list.innerHTML = '';
-  const entries = await cacheList(encCache);
-  if (entries.length === 0) {
-    list.innerHTML = '<div id="cacheModalEmpty">No cached analyses.</div>';
-    stats.textContent = '';
-    clearBtn.disabled = true;
-    return;
-  }
-  clearBtn.disabled = false;
-  const totalBytes = entries.reduce((s, e) => s + e.approxBytes, 0);
-  stats.textContent = `${entries.length} entr${entries.length === 1 ? 'y' : 'ies'} · ~${fmtBytes(totalBytes)}`;
-
-  const byFile = {};
-  for (const e of entries) (byFile[e.filename] ??= []).push(e);
-  for (const [fname, group] of Object.entries(byFile)) {
-    for (const e of group) {
-      const durS = ((e.segEnd - e.segStart) / (e.channels ?? 1) / e.sampleRate).toFixed(1);
-      const row  = document.createElement('div');
-      row.className = 'cache-entry';
-      row.innerHTML = `
-        <span class="cache-entry-name" title="${fname}">${fname}</span>
-        <span class="cache-entry-meta">${e.modelHz} · ${e.bwKbps}k · ${durS}s · ${fmtBytes(e.approxBytes)}</span>
-        <span class="cache-entry-meta" style="min-width:90px;text-align:right">${fmtDate(e.timestamp)}</span>
-        <button class="cache-entry-del" title="Delete">✕</button>
-      `.trim();
-      row.querySelector('.cache-entry-del').addEventListener('click', async () => {
-        await cacheDelete(encCache, e.id);
-        refreshCacheModal();
-        refreshDropdowns();
-      });
-      list.appendChild(row);
-    }
-  }
-}
-
-async function openCacheModal() {
-  if (!encCache) return;
-  const modal    = document.getElementById('cacheModal');
-  const clearBtn = document.getElementById('cacheModalClearAll');
-
-  modal.classList.remove('hidden');
-
-  clearBtn.onclick = async () => {
-    if (!confirm('Delete all cached analyses?')) return;
-    await cacheClear(encCache);
-    refreshCacheModal();
-    refreshDropdowns();
-  };
-
-  document.getElementById('cacheModalClose').onclick = () => modal.classList.add('hidden');
-  modal.onclick = e => { if (e.target === modal) modal.classList.add('hidden'); };
-
-  refreshCacheModal();
-}
-
-renderCacheSection();
-controls.appendChild(cacheSection);
-
-// Auto-init cache if previously enabled
-if (localStorage.getItem(CACHE_PREF_KEY) === '1') initCache();
-
 // ── DOM refs ──────────────────────────────────────────────────────────────────
 
 const umapCanvas    = document.getElementById('umapCanvas');
@@ -1125,13 +874,11 @@ function refreshPointColors() {
 let durA         = null;   // actual loaded duration (s) for source A
 let durB         = null;   // actual loaded duration (s) for source B
 
-// ── Analysis cache (IndexedDB) ────────────────────────────────────────────────
-let encCache         = null;   // IDBDatabase handle, or null if disabled / not yet open
-let cachingEnabled   = false;
-let pendingCacheKeyA = null;   // set before encoding; used to save result after
-let pendingCacheKeyB = null;
+// ── Folder code sidecar state ─────────────────────────────────────────────────
 let pendingSidecarA  = null;   // { panel, audio, modelOpts } — folder code sidecars to write post-encode
 let pendingSidecarB  = null;
+let pendingResolvedA = null;   // {codes,codesDims,scales} loaded from cache — skips that source's real encode
+let pendingResolvedB = null;
 let lastSidecarNoticeKey = null;  // de-dupes the one-shot sidecar popup (re-shows only on a changed outcome)
 let folderSupportWarned  = false; // one-shot "needs Chrome/Edge" notice for folder code-saving
 
@@ -1300,7 +1047,7 @@ async function restoreSession() {
         console.warn('Could not restore file from handle:', e);
       }
     }
-    if (anyRestored) { refreshDropdowns(); scheduleEncode(0); }
+    if (anyRestored) { scheduleEncode(0); }
   }
 
   if (!needsGesture) {
@@ -1309,83 +1056,6 @@ async function restoreSession() {
     showRestoreNotice(applyHandles);
   }
 }
-
-// ── Cache-source dropdown helpers ─────────────────────────────────────────────
-
-/** Inject a hidden "↳ cached" row directly after the file-button row in a panel. */
-function injectCacheDropdown(panel) {
-  const fileRow = panel.element.querySelector('.src-file-row');
-  const rowEl   = document.createElement('div');
-  rowEl.className = 'row src-cache-row';
-  rowEl.style.display = 'none';
-  rowEl.innerHTML = `
-    <span class="lbl" style="color:var(--muted);font-style:italic">cached</span>
-    <select><option value="">— versions —</option></select>
-  `.trim();
-  fileRow.insertAdjacentElement('afterend', rowEl);
-  return { rowEl, selEl: rowEl.querySelector('select') };
-}
-
-/** Repopulate the cache dropdown for one panel.
- *  Visible whenever caching is enabled and there are ANY cached entries, even
- *  before a file is selected — so users can discover what's in the cache and
- *  trigger a file-picker for the right file in one step.
- *
- *  • No file loaded → show all entries; label includes filename.
- *  • File loaded    → filter to that file; label is model/bw/dur only.
- */
-async function updateCacheDropdown(panel, rowEl, selEl) {
-  if (!rowEl) return;
-  if (!cachingEnabled || !encCache || panel.getType() !== 'file' || !panel.getFile()) {
-    rowEl.style.display = 'none'; return;
-  }
-
-  const all = await cacheList(encCache);
-  if (all.length === 0) { rowEl.style.display = 'none'; return; }
-
-  const file = panel.getFile();
-  let matching;
-  if (file) {
-    const crc = await crc32FromFile(file);
-    matching = all.filter(e =>
-      e.filename === file.name &&
-      e.fileSize === file.size &&
-      e.crc32    === crc
-    );
-    // Fall back to full list when the loaded file has no entries yet.
-    if (matching.length === 0) matching = all;
-  } else {
-    matching = all;
-  }
-
-  // Preserve current selection across refreshes
-  const prevVal = selEl.value;
-  selEl.innerHTML = '<option value="">— cached —</option>';
-  for (const e of matching) {
-    const durS  = (e.segEnd / (e.channels ?? 1) / e.sampleRate).toFixed(2);
-    const srLbl = e.sampleRate === 24000 ? '24kHz' : '48kHz';
-    const opt   = document.createElement('option');
-    opt.value = JSON.stringify({
-      id: e.id, segEnd: e.segEnd, sampleRate: e.sampleRate,
-      modelHz: e.modelHz, bwKbps: e.bwKbps, filename: e.filename,
-    });
-    // When the loaded file already matches, omit filename to keep it compact.
-    const showName = !file || file.name !== e.filename;
-    opt.textContent = showName
-      ? `${e.filename} · ${srLbl} · ${e.bwKbps}kbps · ${durS}s`
-      : `${srLbl} · ${e.bwKbps}kbps · ${durS}s`;
-    selEl.appendChild(opt);
-  }
-  selEl.value = prevVal; // restore if still present
-  rowEl.style.display = '';
-}
-
-/** Refresh both dropdowns (no-op if not yet initialised). */
-function refreshDropdowns() {
-  updateCacheDropdown(panelA, cacheDropRowA, cacheDropSelA).catch(() => {});
-  updateCacheDropdown(panelB, cacheDropRowB, cacheDropSelB).catch(() => {});
-}
-
 
 function pinCoords() {
   if (!coordsA || !coordsB) return [];
@@ -2887,7 +2557,7 @@ function updateBookmarkBtn() {
   btn.style.cursor  = has ? 'pointer' : 'default';
 }
 
-function onWorkerMsg(e) {
+async function onWorkerMsg(e) {
   const msg = e.data;
 
   if (msg.type === 'frame_audio_exp6') {
@@ -2952,28 +2622,37 @@ function onWorkerMsg(e) {
       return;
     }
 
-    currentEmbeds = msg;
-    populateLevelSelect(msg.codesDimsA[1]);
+    // Merge cache-resolved source(s) (whose real encode was skipped) with the
+    // freshly-encoded one(s). reconstructEmbQuant rebuilds embQuant from codes.
+    const jobAtMsg = activeJobId;
+    const rA = pendingResolvedA, rB = pendingResolvedB;
+    pendingResolvedA = pendingResolvedB = null;
+
+    let embeds = msg;
+    if (rA || rB) {
+      const cb = await ensureCodebooks();
+      if (activeJobId !== jobAtMsg) return;   // superseded during the await
+      const pick = (res, codes, codesDims, embQuant, embQuantDims, scales) => res
+        ? { codes: res.codes, codesDims: res.codesDims,
+            embQuant: reconstructEmbQuant(cb, res.codes, res.codesDims),
+            embQuantDims: [1, cb.dim, res.codesDims[res.codesDims.length - 1]],
+            scales: res.scales }
+        : { codes, codesDims, embQuant, embQuantDims, scales };
+      const A = pick(rA, msg.codesA, msg.codesDimsA, msg.embQuantA, msg.embQuantDimsA, msg.scalesA);
+      const B = pick(rB, msg.codesB, msg.codesDimsB, msg.embQuantB, msg.embQuantDimsB, msg.scalesB);
+      embeds = {
+        type: 'embeddings_exp6',
+        embEncA: rA ? null : msg.embEncA, embEncDimsA: rA ? null : msg.embEncDimsA,
+        embEncB: rB ? null : msg.embEncB, embEncDimsB: rB ? null : msg.embEncDimsB,
+        embQuantA: A.embQuant, embQuantDimsA: A.embQuantDims, codesA: A.codes, codesDimsA: A.codesDims, scalesA: A.scales,
+        embQuantB: B.embQuant, embQuantDimsB: B.embQuantDims, codesB: B.codes, codesDimsB: B.codesDims, scalesB: B.scales,
+      };
+    }
+
+    currentEmbeds = embeds;
+    populateLevelSelect(embeds.codesDimsA[1]);
     progWrap.style.display = 'none';
     markDirty('COORDS', 'WAYPOINTS', 'AUDIO', 'RENDER');
-
-    // ── Save to cache if keys were prepared ────────────────────────────────────
-    if (cachingEnabled && encCache && pendingCacheKeyA && pendingCacheKeyB) {
-      const kA = pendingCacheKeyA, kB = pendingCacheKeyB;
-      pendingCacheKeyA = pendingCacheKeyB = null;
-      // Fire-and-forget; errors are non-fatal
-      Promise.all([
-        cachePut(encCache, kA, {
-          codes: msg.codesA, codesDims: msg.codesDimsA,
-          scales: msg.scalesA ?? null,
-        }),
-        cachePut(encCache, kB, {
-          codes: msg.codesB, codesDims: msg.codesDimsB,
-          scales: msg.scalesB ?? null,
-        }),
-      ]).then(() => { setStatus('Analysis saved to cache ✓'); refreshCacheModal(); refreshDropdowns(); })
-        .catch(e => console.warn('Cache save failed:', e));
-    }
 
     // ── Save folder code sidecars next to each wav (best-effort) ───────────────
     if (pendingSidecarA || pendingSidecarB) {
@@ -3286,8 +2965,25 @@ async function writeFolderSidecars(panel, audio, modelOpts, codes, codesDims, sc
   return count ? { ok: true, count } : { ok: false, reason: 'all file writes failed (see console)' };
 }
 
-// Inject a fully-resolved A/B codes pair (from sidecars) as currentEmbeds —
-// mirrors the IndexedDB full-hit path. A/B = { codes, codesDims, scales }.
+// Resolve a source's codes from cache without encoding, for the current model.
+// Folder → its per-clip sidecars (if all present); anything else → null (encode).
+// Returns { codes, codesDims, scales } or null.
+async function resolveSourceCodes(panel, audio, modelOpts) {
+  try {
+    if (panel.getType() === 'folder') return await readFolderSidecars(panel, audio, modelOpts);
+  } catch (e) { console.warn('Cache resolve failed:', e); }
+  return null;
+}
+
+// Smallest valid encode input — a silent placeholder fed to the encoder for a
+// cache-resolved source so the joint A+B pipeline stays intact; its real codes
+// are merged back from cache in the embeddings handler.
+function dummyEncodeAudio(channels) {
+  return new Float32Array(2048 * channels);
+}
+
+// Inject a fully-resolved A/B codes pair (from cache) as currentEmbeds, skipping
+// the worker entirely. A/B = { codes, codesDims, scales }.
 async function injectCodesPair(A, B) {
   const cb  = await ensureCodebooks();
   const T_A = A.codesDims[A.codesDims.length - 1];
@@ -3320,12 +3016,6 @@ async function startEncode() {
   const modelHz  = mp.getModelHz();
   const bwKbps   = mp.getBwKbps();
 
-  // ── Pre-compute CRCs for file sources (cheap: WeakMap-cached after first call)
-  const fileA = panelA.getFile(), fileB = panelB.getFile();
-  const crcA  = (cachingEnabled && encCache && fileA) ? await crc32FromFile(fileA) : null;
-  const crcB  = (cachingEnabled && encCache && fileB) ? await crc32FromFile(fileB) : null;
-  if (stale()) return;
-
   // ── Load audio ────────────────────────────────────────────────────────────────
   // 48k model is natively stereo — load files as planar stereo (L plane, R plane)
   // so the encoder sees real L/R. 24k stays mono.
@@ -3354,112 +3044,56 @@ async function startEncode() {
   playerA.setAudio(rawAudioA, sr, folderClipFracsA ? folderColorFn(folderClipFracsA) : null, srcCh);
   playerB.setAudio(rawAudioB, sr, folderClipFracsB ? folderColorFn(folderClipFracsB) : null, srcCh);
 
-  // ── Cache lookup (only when both sources are files with valid CRCs) ───────────
-  // segEnd is the planar array length, so stereo entries never collide with
-  // legacy dual-mono ones (2T vs T); channels is stored for display.
-  // Stateless 48k OLA produces different embeddings than the cached (stateful)
-  // ones and has no key disambiguator, so it bypasses the cache entirely.
   const modelOpts = {
     modelHz, bwKbps, sampleRate: sr, channels: srcCh,
     // 48k codes differ between OLA modes — record it so sidecars don't mix them.
     ola: modelHz === '48k' ? (statefulOla ? 'stateful' : 'stateless') : null,
   };
-  const cacheable  = modelHz !== '48k' || statefulOla;
-  pendingCacheKeyA = null;
-  pendingCacheKeyB = null;
-  pendingSidecarA  = null;
-  pendingSidecarB  = null;
 
-  if (crcA && crcB && cacheable) {
-    const keyA = makeCacheKey(fileA, crcA, modelOpts, audioA.length);
-    const keyB = makeCacheKey(fileB, crcB, modelOpts, audioB.length);
-
-    setStatus('Checking cache…');
-    const [hitA, hitB] = await Promise.all([
-      cacheGet(encCache, keyA),
-      cacheGet(encCache, keyB),
-    ]);
-    if (stale()) return;
-
-    if (hitA && hitB) {
-      // ── Full cache hit — reconstruct embQuant then inject, skip worker ────
-      setStatus('Loading codebooks…');
-      const cb = await ensureCodebooks();
-      if (stale()) return;
-
-      // embQuant = sum of codebook vectors across all quantiser levels.
-      // Layout: [dim × T], dims stored as [1, dim, T].
-      const T_A = hitA.codesDims[hitA.codesDims.length - 1];
-      const T_B = hitB.codesDims[hitB.codesDims.length - 1];
-      const embQuantA    = reconstructEmbQuant(cb, hitA.codes, hitA.codesDims);
-      const embQuantB    = reconstructEmbQuant(cb, hitB.codes, hitB.codesDims);
-      const embQuantDimsA = [1, cb.dim, T_A];
-      const embQuantDimsB = [1, cb.dim, T_B];
-
-      currentEmbeds = {
-        type:         'embeddings_exp6',
-        // embEncA/B intentionally absent — re-computed on demand when Pre-VQ tab is used
-        embEncA:      null, embEncDimsA:   null,
-        embEncB:      null, embEncDimsB:   null,
-        embQuantA,          embQuantDimsA,
-        codesA:       hitA.codes,    codesDimsA:    hitA.codesDims,
-        scalesA:      hitA.scales,
-        embQuantB,          embQuantDimsB,
-        codesB:       hitB.codes,    codesDimsB:    hitB.codesDims,
-        scalesB:      hitB.scales,
-      };
-      populateLevelSelect(currentEmbeds.codesDimsA[1]);
-      progWrap.style.display = 'none';
-      setStatus('Loaded from cache ✓');
-      markDirty('COORDS', 'WAYPOINTS', 'AUDIO', 'RENDER');
-      return;
-    }
-
-    // Cache miss — store keys so we can save after encoding completes
-    pendingCacheKeyA = keyA;
-    pendingCacheKeyB = keyB;
-  }
-
-  // ── Folder code sidecars ──────────────────────────────────────────────────────
-  // True next-to-the-wav cache for folder sources (writable directory handle).
-  // If BOTH sources are folders and every clip's window is on disk, assemble and
-  // skip the encode. Otherwise, schedule a post-encode write for any folder source.
-  // Sidecars are separate files written into a folder the user explicitly granted
-  // write access to, so they're independent of the IndexedDB "Analysis cache"
-  // toggle and (keyed by OLA mode) work for 48k stateless too.
+  // ── Per-source code resolution ──────────────────────────────────────────────
+  // Each source independently loads cached codes (folder → its per-clip sidecars)
+  // or, on a miss, is encoded. The win: a cached source skips its encode even when
+  // the other source must be encoded (e.g. cached 295-clip folder + a Sine).
+  pendingSidecarA = pendingSidecarB = null;
+  pendingResolvedA = pendingResolvedB = null;
   const isFolderA = panelA.getType() === 'folder';
   const isFolderB = panelB.getType() === 'folder';
-  if (isFolderA || isFolderB) {
-    if (isFolderA && isFolderB) {
-      setStatus('Checking sidecars…');
-      try {
-        const [A, B] = await Promise.all([
-          readFolderSidecars(panelA, audioA, modelOpts),
-          readFolderSidecars(panelB, audioB, modelOpts),
-        ]);
-        if (stale()) return;
-        if (A && B) {
-          setStatus('Loading codebooks…');
-          await injectCodesPair(A, B);
-          if (stale()) return;
-          setStatus('Loaded from sidecars ✓');
-          return;
-        }
-      } catch (e) { console.warn('Sidecar read failed:', e); }
-    }
-    // Miss (or mixed) — write sidecars for folder sources once encoding finishes.
-    if (isFolderA) pendingSidecarA = { panel: panelA, audio: audioA, modelOpts };
-    if (isFolderB) pendingSidecarB = { panel: panelB, audio: audioB, modelOpts };
+
+  setStatus('Checking caches…');
+  const [resA, resB] = await Promise.all([
+    resolveSourceCodes(panelA, audioA, modelOpts),
+    resolveSourceCodes(panelB, audioB, modelOpts),
+  ]);
+  if (stale()) return;
+
+  if (resA && resB) {
+    // Both cached — assemble and skip the worker entirely.
+    setStatus('Loading codebooks…');
+    await injectCodesPair(resA, resB);
+    if (stale()) return;
+    setStatus('Loaded from cache ✓');
+    return;
   }
+
+  // Write sidecars after encoding for any folder source that wasn't resolved.
+  if (isFolderA && !resA) pendingSidecarA = { panel: panelA, audio: audioA, modelOpts };
+  if (isFolderB && !resB) pendingSidecarB = { panel: panelB, audio: audioB, modelOpts };
+
+  // A resolved source skips its real encode (a placeholder keeps the joint A+B
+  // pipeline intact); its codes are merged back in the embeddings handler.
+  pendingResolvedA = resA;
+  pendingResolvedB = resB;
+  const encAudioA = resA ? dummyEncodeAudio(srcCh) : audioA;
+  const encAudioB = resB ? dummyEncodeAudio(srcCh) : audioB;
 
   // ── Parallel path: 48k stateless segments are independent → encode in a pool ──
   if (modelHz === '48k' && !statefulOla) {
-    runParallelEncode48k(audioA, audioB, srcCh, myRun);
+    runParallelEncode48k(encAudioA, encAudioB, srcCh, myRun);
     return;
   }
 
   // ── Sequential encode via the primary worker (24k, or 48k stateful) ───────────
-  pendingAudioB = audioB;
+  pendingAudioB = encAudioB;
   encodePhase   = 'A';
   activeJobId   = ++jobSeq;
 
@@ -3469,7 +3103,7 @@ async function startEncode() {
 
   worker.postMessage({
     type: 'encode', source: 'A', jobId: activeJobId,
-    audio:     audioA.slice(),
+    audio:     encAudioA.slice(),
     channels:  srcCh,
     modelHz,
     bwKbps,
@@ -5473,10 +5107,8 @@ initHelpTips({
   '#notchFreqInput': 'Notch comb fundamental frequency in Hz.',
   '#notchQInput':    'Notch sharpness (Q). Higher = narrower cuts.',
 
-  // Library + cache
+  // Library
   '#libDownloadAll': 'Download every bookmark as one ZIP of WAVs.',
-  '#cacheToggleBtn': 'Store encoder outputs in browser storage so re-loading the same file + model skips encoding entirely.',
-  '#cacheManageBtn': 'Inspect and delete cached analyses.',
 });
 </script>
 </body>
