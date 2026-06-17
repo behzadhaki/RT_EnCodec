@@ -133,11 +133,29 @@ export async function wavDurationSeconds(file) {
   return null;
 }
 
-// Duration of an audio File in seconds (uncapped). Tries the cheap WAV-header
-// probe first, then falls back to a full decode for non-WAV / odd-header files.
+// Reads an audio File's duration in seconds from container metadata only (no full
+// decode) via a media element — cheap for mp3/m4a/mp4/etc. Returns null if the
+// duration can't be read this way (streamed/unknown).
+function mediaElementDurationSeconds(file) {
+  return new Promise((resolve) => {
+    let url;
+    try { url = URL.createObjectURL(file); } catch { resolve(null); return; }
+    const a = new Audio();
+    a.preload = 'metadata';
+    const done = (v) => { try { URL.revokeObjectURL(url); } catch {} a.removeAttribute('src'); resolve(v); };
+    a.onloadedmetadata = () => done(isFinite(a.duration) && a.duration > 0 ? a.duration : null);
+    a.onerror = () => done(null);
+    a.src = url;
+  });
+}
+
+// Duration of an audio File in seconds (uncapped). Cheapest path first: WAV header
+// → container metadata (mp3/m4a/…) → full decode as a last resort.
 export async function probeAudioDurationSeconds(file) {
   const fromHeader = await wavDurationSeconds(file);
   if (fromHeader != null && isFinite(fromHeader) && fromHeader > 0) return fromHeader;
+  const fromMeta = await mediaElementDurationSeconds(file);
+  if (fromMeta != null) return fromMeta;
   try {
     const arrBuf  = await file.arrayBuffer();
     const tmpCtx  = new OfflineAudioContext(1, 1, 44100);

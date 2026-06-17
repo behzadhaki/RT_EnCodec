@@ -207,19 +207,21 @@ export function createSourcePanel({
     onChange(0);
   });
 
-  // Folder picker — collects every .wav in the chosen directory, name-sorted,
+  // Folder picker — collects every audio file in the chosen directory, name-sorted,
   // to be concatenated into one source. Prefers showDirectoryPicker (gives a
   // folder name + clean iteration); falls back to a webkitdirectory <input>.
+  // Any browser-decodable container is accepted (wav/mp3/m4a/mp4/flac/ogg/aiff/…).
+  const FOLDER_AUDIO_RE = /\.(wav|wave|mp3|m4a|m4b|mp4|aac|flac|ogg|oga|opus|aif|aiff|aifc|caf|webm)$/i;
   function setFolder(files, name) {
-    // Keep every .wav, name-sorted. The joined length is bounded later by the
+    // Keep every audio file, name-sorted. The joined length is bounded later by the
     // total-seconds budget (see loadFolder / the overflow dialog), not a count.
-    const wavs = [...files].filter(f => /\.wave?$/i.test(f.name))
+    const audios = [...files].filter(f => FOLDER_AUDIO_RE.test(f.name))
       .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' }));
-    currentFolder     = wavs.length ? wavs : null;
+    currentFolder     = audios.length ? audios : null;
     currentFolderName = name || '';
-    folderBtnEl.textContent = wavs.length
-      ? `${currentFolderName || 'folder'} · ${wavs.length} wav`
-      : 'no .wav files found';
+    folderBtnEl.textContent = audios.length
+      ? `${currentFolderName || 'folder'} · ${audios.length} file${audios.length === 1 ? '' : 's'}`
+      : 'no audio files found';
   }
 
   if (folderBtnEl) {
@@ -232,7 +234,7 @@ export function createSourcePanel({
         catch (err) { if (err.name !== 'AbortError') throw err; return; }
         const files = [];
         for await (const entry of dirHandle.values()) {
-          if (entry.kind === 'file' && /\.wave?$/i.test(entry.name)) files.push(await entry.getFile());
+          if (entry.kind === 'file' && FOLDER_AUDIO_RE.test(entry.name)) files.push(await entry.getFile());
         }
         currentDirHandle = dirHandle;   // writable → enables code sidecars next to each wav
         setFolder(files, dirHandle.name);
