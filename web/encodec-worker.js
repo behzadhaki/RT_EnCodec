@@ -2085,38 +2085,44 @@ function getCapForFrame(caps, frameIdx) {
 // ---------------------------------------------------------------------------
 
 async function runPlayFrameExp6(msg) {
-  const { jobId, source, startFrame, endFrame, bestIdx, modelHz, bwKbps } = msg;
+  const { jobId, source, startFrame, endFrame, bestIdx, modelHz, bwKbps, codes, codesDims, scaleValue } = msg;
   try {
     await ensureSessions(modelHz, bwKbps);
 
-    const caps = captureCache[source];
-    if (!caps) throw new Error('No capture for source ' + source);
+    let K, nFrames, codes64, scale = null, scaleDims = null;
 
-    const flat    = flattenCaps(caps);
-    const K       = Number(flat.codesDims[1]);
-    const T       = Number(flat.codesDims[2]);
-    const nFrames = endFrame - startFrame;
-
-    // Extract window and convert to BigInt64 (decode_codes expects int64)
-    const codes64 = new BigInt64Array(K * nFrames);
-    for (let k = 0; k < K; k++)
-      for (let t = 0; t < nFrames; t++) {
-        const v = flat.codes[k * T + startFrame + t];
-        codes64[k * nFrames + t] = typeof v === 'bigint' ? v : BigInt(v);
+    if (codes) {
+      // Codes window supplied directly by the main thread (from currentEmbeds).
+      // Works for sources resolved from cache/sidecars, which have no captures.
+      K = Number(codesDims[1]); nFrames = Number(codesDims[2]);
+      codes64 = new BigInt64Array(K * nFrames);
+      for (let i = 0; i < codes.length; i++) codes64[i] = BigInt(codes[i]);
+      if (modelHz === '48k') { scale = new Float32Array([scaleValue ?? 1.0]); scaleDims = [1, 1]; }
+    } else {
+      // Legacy path: extract the window from the worker's cached captures.
+      const caps = captureCache[source];
+      if (!caps) throw new Error('No capture for source ' + source);
+      const flat = flattenCaps(caps);
+      K = Number(flat.codesDims[1]);
+      const T = Number(flat.codesDims[2]);
+      nFrames = endFrame - startFrame;
+      codes64 = new BigInt64Array(K * nFrames);
+      for (let k = 0; k < K; k++)
+        for (let t = 0; t < nFrames; t++) {
+          const v = flat.codes[k * T + startFrame + t];
+          codes64[k * nFrames + t] = typeof v === 'bigint' ? v : BigInt(v);
+        }
+      if (modelHz === '48k') {
+        const segCap = getCapForFrame(caps, bestIdx);
+        scale     = segCap.scale;
+        scaleDims = segCap.scaleDims ? [...segCap.scaleDims].map(Number) : null;
       }
+    }
 
     const codesTensor = new ort.Tensor('int64', codes64, [1, K, nFrames]);
     const decOut  = await sessions.decCodes.run({ codes: codesTensor });
     const emb     = new Float32Array(decOut.emb.data);
     const dims    = [...decOut.emb.dims].map(Number);
-
-    // For 48k, retrieve scale from the segment containing the clicked frame.
-    let scale = null, scaleDims = null;
-    if (modelHz === '48k') {
-      const segCap = getCapForFrame(caps, bestIdx);
-      scale     = segCap.scale;
-      scaleDims = segCap.scaleDims ? [...segCap.scaleDims].map(Number) : null;
-    }
 
     const stereoOut = modelHz === '48k';
     const result  = await decodeFromLatents(emb, dims, scale, scaleDims, modelHz, zeroState(1), zeroState(1), stereoOut);

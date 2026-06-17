@@ -14,7 +14,8 @@
  *
  * A sidecar holds one or more *window entries* — codes for a [startS, lenS)
  * slice of the clip — keyed by "<startMs>-<lenMs>". Picking a new random window
- * adds an entry; an already-seen window is read back instead of re-encoded.
+ * adds an entry; an already-seen window is read back instead of re-encoded. The
+ * whole-file workflow stores a single "0-full" entry and slices windows from it.
  *
  * Binary layout (all integers little-endian):
  *     "ENCSIDE1"                       8-byte magic
@@ -27,6 +28,7 @@
  *   v: 1,
  *   filename, fileSize, crc32,         // identity of the source wav (validated on read)
  *   modelHz, bwKbps, sampleRate, channels,
+ *   ola,                               // 48k OLA mode ('stateful'|'stateless') | null
  *   entries: [{
  *     key,                             // "<startMs>-<lenMs>"
  *     codesDims,                       // e.g. [1, nCodebooks, nFrames]
@@ -95,7 +97,7 @@ function utf8Decode(buf) { return new TextDecoder().decode(buf); }
 
 /**
  * Serialize a full sidecar from metadata + a map of window entries.
- * @param meta    { filename, fileSize, crc32, modelHz, bwKbps, sampleRate, channels }
+ * @param meta    { filename, fileSize, crc32, modelHz, bwKbps, sampleRate, channels, ola }
  * @param entries Map|object  key → { codes (Int16Array|Int32Array), codesDims, scales (Float32Array|null) }
  * @returns ArrayBuffer
  */

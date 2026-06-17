@@ -162,7 +162,10 @@ export function createDoubleSourceWidget({
             ? await onFolderOverflow({ count: files.length, totalS, budgetS: MAX_FOLDER_TOTAL_S })
             : 'truncate';
           if (!strategy) throw new Error('Folder load cancelled.');
-          selections = planFolderSelections(files, durations, strategy, MAX_FOLDER_TOTAL_S);
+          // Salt the random seed per source so the SAME folder in A and B picks
+          // different windows (still deterministic per source → sidecar-cacheable).
+          const salt = panel === panelA ? 'A' : 'B';
+          selections = planFolderSelections(files, durations, strategy, MAX_FOLDER_TOTAL_S, salt);
         }
         folderPlanCache.set(files, selections);
       }

@@ -174,18 +174,19 @@ export async function probeAudioDurationSeconds(file) {
 //   'random:K'   — a random K-second window of every clip (whole clip if shorter)
 //   'truncate'   — concatenate in order, hard-cut at exactly budgetS
 //
-// Random offsets are deterministic per clip (seeded from name+size+index), so the
-// same folder reproduces the same windows across reloads — which lets persisted
-// per-clip code sidecars be reused instead of re-encoded. Pass `rand` to override
-// (e.g. in tests) with a function taking the clip index.
-function clipSeedFrac(file, i) {
-  const str = `${file?.name ?? ''}:${file?.size ?? 0}:${i}`;
+// Random offsets are deterministic per clip (seeded from salt+name+size+index), so
+// the same folder reproduces the same windows across reloads — which lets persisted
+// per-clip code sidecars be reused instead of re-encoded. The `salt` distinguishes
+// sources (e.g. 'A'/'B') so the SAME folder loaded into both gets different random
+// windows rather than identical ones. Pass `rand` to override (e.g. in tests).
+function clipSeedFrac(file, i, salt = '') {
+  const str = `${salt}:${file?.name ?? ''}:${file?.size ?? 0}:${i}`;
   let h = 2166136261 >>> 0;                 // FNV-1a
   for (let k = 0; k < str.length; k++) { h ^= str.charCodeAt(k); h = Math.imul(h, 16777619) >>> 0; }
   return h / 4294967296;                     // [0, 1)
 }
 
-export function planFolderSelections(files, durations, strategy, budgetS = MAX_FOLDER_TOTAL_S, rand = null) {
+export function planFolderSelections(files, durations, strategy, budgetS = MAX_FOLDER_TOTAL_S, salt = '', rand = null) {
   const N = files.length;
   const sel = [];
   if (strategy === 'all') {
@@ -206,7 +207,7 @@ export function planFolderSelections(files, durations, strategy, budgetS = MAX_F
     for (let i = 0; i < N; i++) {
       const win   = Math.min(durations[i], k);
       const slack = Math.max(0, durations[i] - win);
-      const frac  = rand ? rand(i) : clipSeedFrac(files[i], i);
+      const frac  = rand ? rand(i) : clipSeedFrac(files[i], i, salt);
       const startS = (isRandom && slack > 0) ? frac * slack : 0;
       sel.push({ file: files[i], startS, lenS: win });
     }

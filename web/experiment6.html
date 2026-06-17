@@ -308,6 +308,7 @@
 'use strict';
 
 import { createDoubleSourceWidget } from './lib/double-source-widget.js';
+import { loadFile }                 from './lib/audio-utils.js';
 import { createModelPanel }         from './lib/model-panel.js';
 import { makeWavePlayer }           from './lib/wave-player.js';
 import { renderScatter as _renderScatter } from './lib/scatter-renderer.js';
@@ -852,31 +853,38 @@ let folderClipFracsA = null; // [0..1] clip-start fractions when A is a folder s
 let folderClipFracsB = null;
 
 // Distinct colour per folder clip/file — shared by the waveform and the maps.
-function clipColor(k, n) {
-  const hue = n > 1 ? Math.round((k / n) * 320 + 20) % 360 : 200;
-  return `hsl(${hue}, 70%, 58%)`;
+// Each source gets its own hue band (A warm, B cool) so folders from A and B stay
+// visually distinct even with many clips; within a band the hue ramps per clip.
+const CLIP_BANDS = {
+  A: { h0: 18,  span: 92,  sat: 78, lum: 55 },   // red-orange → yellow → green
+  B: { h0: 172, span: 122, sat: 66, lum: 60 },   // cyan → blue → violet
+};
+function clipColor(k, n, source = 'A') {
+  const b = CLIP_BANDS[source] || CLIP_BANDS.A;
+  const hue = n > 1 ? b.h0 + (k / (n - 1)) * b.span : b.h0 + b.span / 2;
+  return `hsl(${Math.round(hue) % 360}, ${b.sat}%, ${b.lum}%)`;
 }
 // Waveform per-pixel colour fn: pos∈[0,1] → the colour of the clip it falls in.
-function folderColorFn(fracs) {
+function folderColorFn(fracs, source = 'A') {
   const n = fracs.length;
   return pos => {
     let k = 0;
     for (let i = 1; i < n; i++) { if (pos >= fracs[i]) k = i; else break; }
-    return clipColor(k, n);
+    return clipColor(k, n, source);
   };
 }
 // Per-frame clip colours for the scatter (T markers → clip colour each).
-function clipColorsFor(T, fracs) {
+function clipColorsFor(T, fracs, source = 'A') {
   const n = fracs.length, out = new Array(T);
   const fb = fracs.map(f => Math.min(T, Math.max(0, Math.round(f * T)))); fb.push(T);
-  for (let k = 0; k < n; k++) { const c = clipColor(k, n); for (let i = fb[k]; i < fb[k + 1]; i++) out[i] = c; }
+  for (let k = 0; k < n; k++) { const c = clipColor(k, n, source); for (let i = fb[k]; i < fb[k + 1]; i++) out[i] = c; }
   return out;
 }
 // Cached per-point scatter colours (recomputed only when the coords array changes).
 let pointColorsA = null, pointColorsB = null, _pcCoordsA = null, _pcCoordsB = null;
 function refreshPointColors() {
-  if (coordsA !== _pcCoordsA) { _pcCoordsA = coordsA; pointColorsA = (folderClipFracsA && coordsA) ? clipColorsFor(coordsA.length, folderClipFracsA) : null; }
-  if (coordsB !== _pcCoordsB) { _pcCoordsB = coordsB; pointColorsB = (folderClipFracsB && coordsB) ? clipColorsFor(coordsB.length, folderClipFracsB) : null; }
+  if (coordsA !== _pcCoordsA) { _pcCoordsA = coordsA; pointColorsA = (folderClipFracsA && coordsA) ? clipColorsFor(coordsA.length, folderClipFracsA, 'A') : null; }
+  if (coordsB !== _pcCoordsB) { _pcCoordsB = coordsB; pointColorsB = (folderClipFracsB && coordsB) ? clipColorsFor(coordsB.length, folderClipFracsB, 'B') : null; }
 }
 let durA         = null;   // actual loaded duration (s) for source A
 let durB         = null;   // actual loaded duration (s) for source B
@@ -2656,10 +2664,13 @@ async function onWorkerMsg(e) {
     if (pendingSidecarA || pendingSidecarB) {
       const sA = pendingSidecarA, sB = pendingSidecarB;
       pendingSidecarA = pendingSidecarB = null;
-      Promise.all([
-        sA ? writeFolderSidecars(sA.panel, sA.audio, sA.modelOpts, msg.codesA, msg.codesDimsA, msg.scalesA ?? null) : Promise.resolve(null),
-        sB ? writeFolderSidecars(sB.panel, sB.audio, sB.modelOpts, msg.codesB, msg.codesDimsB, msg.scalesB ?? null) : Promise.resolve(null),
-      ]).then(results => {
+      // Serialise A then B: when both sources are the SAME folder they target the
+      // same sidecar files, so a concurrent read-merge-write would lose one window.
+      (async () => {
+        const rA = sA ? await writeFolderSidecars(sA.panel, sA.audio, sA.modelOpts, msg.codesA, msg.codesDimsA, msg.scalesA ?? null) : null;
+        const rB = sB ? await writeFolderSidecars(sB.panel, sB.audio, sB.modelOpts, msg.codesB, msg.codesDimsB, msg.scalesB ?? null) : null;
+        return [rA, rB];
+      })().then(results => {
         const ok     = results.filter(r => r && r.ok);
         const failed = results.filter(r => r && !r.ok);
         const wrote  = ok.reduce((a, r) => a + r.count, 0);
@@ -3118,13 +3129,138 @@ async function writeFolderSidecars(panel, audio, modelOpts, codes, codesDims, sc
   return count ? { ok: true, count } : { ok: false, reason: 'all file writes failed (see console)' };
 }
 
-// Resolve a source's codes from cache without encoding, for the current model.
-// Folder → its per-clip sidecars (if all present); anything else → null (encode).
-// Returns { codes, codesDims, scales } or null.
-async function resolveSourceCodes(panel, audio, modelOpts) {
+// ── Whole-file folder encoding (48k) ──────────────────────────────────────────
+// "Encode each clip in full, then sample windows by slicing codes." A clip's full
+// codes are encoded once (cached on disk as the `0-full` sidecar entry and in
+// memory), so re-sampling a window, the same folder in A vs B, or a reload all
+// become free code-slices instead of re-encodes.
+
+const _fullCodesCache = new Map();  // `${name}:${size}:${hz}:${bw}:${ola}` → {codes,codesDims,scales}
+
+// Serialise a pool batch on the shared lock (never overlap encode/decode batches).
+async function withPoolLock(fn) {
+  const prev = encodeBatchPromise;
+  let release;
+  encodeBatchPromise = new Promise(r => { release = r; });
+  try { try { await prev; } catch (_) {} return await fn(); }
+  finally { release(); }
+}
+
+// Reassemble a clip's full codes + scales from its per-segment encode captures
+// (main-thread mirror of the worker's flattenCaps/flattenScales — codes only;
+// embQuant is reconstructed from codes downstream).
+function reassembleClipCodes(segResults) {
+  const segs = segResults.slice().sort((a, b) => a.segIdx - b.segIdx);
+  const keep = segs.map(s => {
+    const T = Number(s.cap.codesDims[2]);
+    return Math.min(T, Math.max(0, Math.round((s.validEnd - s.offset) / HOP_48_M)));
+  });
+  const K = Number(segs[0].cap.codesDims[1]);
+  const totalT = keep.reduce((a, b) => a + b, 0);
+  const codes  = new Int32Array(K * totalT);
+  const scales = segs[0].cap.scale ? new Float32Array(totalT) : null;
+  let tOff = 0;
+  for (let ci = 0; ci < segs.length; ci++) {
+    const cap = segs[ci].cap, T_i = Number(cap.codesDims[2]), n = keep[ci];
+    const big = cap.codesType === 'int64', cc = cap.codes;
+    for (let k = 0; k < K; k++)
+      for (let t = 0; t < n; t++)
+        codes[k * totalT + tOff + t] = big ? Number(cc[k * T_i + t]) : cc[k * T_i + t];
+    if (scales) scales.fill(cap.scale[0], tOff, tOff + n);
+    tOff += n;
+  }
+  return { codes, codesDims: [1, K, totalT], scales };
+}
+
+// Encode ONE clip's full audio → its full code sequence (48k OLA via the pool).
+async function encodeClipFullCodes(file, sr, channels, modelHz, bwKbps) {
+  const audio = await loadFile(file, sr, Infinity, channels);   // whole clip
+  const { segs } = sliceSegments48k(audio, channels);
+  const jobs = segs.map(s => ({ ...s, source: 'C', modelHz, bwKbps }));
+  const caps = await withPoolLock(() => doParallelBatch(jobs));
+  return reassembleClipCodes(caps);
+}
+
+// Get a clip's full codes: in-memory cache → `0-full` sidecar → encode (+ cache both).
+async function getClipFullCodes(file, modelOpts, dir) {
+  const { modelHz, bwKbps, sampleRate, channels, ola } = modelOpts;
+  const key = `${file.name}:${file.size}:${modelHz}:${bwKbps}:${ola}`;
+  if (_fullCodesCache.has(key)) return _fullCodesCache.get(key);
+
+  const FULL     = windowKey(0, Infinity);          // "0-full"
+  const canWrite = dir && await ensureRWPermission(dir);
+  const meta = { filename: file.name, fileSize: file.size, crc32: 0,
+                 modelHz, bwKbps, sampleRate, channels, ola };
+
+  let full = null;
+  if (canWrite) {
+    const parsed = await readSidecar(dir, file.name, modelHz, bwKbps);
+    if (parsed) {
+      meta.crc32 = await crc32FromFile(file);
+      if (sidecarMatches(parsed.header, meta)) full = parsed.entries.get(FULL) || null;
+    }
+  }
+  if (!full) {
+    full = await encodeClipFullCodes(file, sampleRate, channels, modelHz, bwKbps);
+    if (canWrite) {
+      try {
+        if (!meta.crc32) meta.crc32 = await crc32FromFile(file);
+        const existing = await readSidecar(dir, file.name, modelHz, bwKbps);
+        const merged = new Map();
+        if (existing && sidecarMatches(existing.header, meta))
+          for (const [k, v] of existing.entries) merged.set(k, v);
+        merged.set(FULL, full);
+        await writeSidecar(dir, file.name, modelHz, bwKbps, serializeSidecar(meta, merged));
+      } catch (e) { console.warn('full-codes sidecar write failed for', file.name, e); }
+    }
+  }
+  _fullCodesCache.set(key, full);
+  return full;
+}
+
+// 48k folder source: encode each clip in full (cached), then sample each clip's
+// selected window by slicing its full codes. Returns {codes,codesDims,scales}|null.
+async function encodeFolderSampledCodes(panel, audio, modelOpts, isCurrent) {
+  const sels = audio.folderSelections;
+  if (!sels || !sels.length) return null;
+  const fps = modelOpts.sampleRate / HOP_48_M;   // 150 at 48k
+  const dir = panel.getDirHandle?.();
+
+  // 1. Full codes per distinct clip (cached or encoded), with progress.
+  const distinct = [...new Set(sels.map(s => s.file))];
+  const fullByFile = new Map();
+  for (let i = 0; i < distinct.length; i++) {
+    if (isCurrent && !isCurrent()) return null;
+    setStatus(`Encoding clip ${i + 1}/${distinct.length}…`);
+    fullByFile.set(distinct[i], await getClipFullCodes(distinct[i], modelOpts, dir));
+  }
+  if (isCurrent && !isCurrent()) return null;
+
+  // 2. Slice each clip's window from its full codes, then concatenate.
+  const clips = sels.map(sel => {
+    const full = fullByFile.get(sel.file);
+    const T   = full.codesDims[2];
+    const f0  = Math.min(T, Math.max(0, Math.round(sel.startS * fps)));
+    const len = isFinite(sel.lenS) ? Math.round(sel.lenS * fps) : (T - f0);
+    const f1  = Math.min(T, f0 + len);
+    return sliceClipCodes(full.codes, full.codesDims, full.scales, f0, f1);
+  });
+  return joinClipCodes(clips);
+}
+
+// Resolve a source's codes, for the current model. Returns {codes,codesDims,scales}
+// or null (→ the source is encoded via the worker path).
+//   48k folder → encode each clip in full (cached) and sample windows by slicing
+//                codes — so this always resolves (it does the encoding itself).
+//   24k / 48k-stateful folder → read the per-window sidecars (null → worker encode).
+//   non-folder → null (encoded via the worker).
+async function resolveSourceCodes(panel, audio, modelOpts, isCurrent) {
   try {
-    if (panel.getType() === 'folder') return await readFolderSidecars(panel, audio, modelOpts);
-  } catch (e) { console.warn('Cache resolve failed:', e); }
+    if (panel.getType() !== 'folder') return null;
+    if (modelOpts.modelHz === '48k' && !statefulOla)
+      return await encodeFolderSampledCodes(panel, audio, modelOpts, isCurrent);
+    return await readFolderSidecars(panel, audio, modelOpts);
+  } catch (e) { console.warn('Folder code resolve failed:', e); }
   return null;
 }
 
@@ -3194,8 +3330,8 @@ async function startEncode() {
   folderClipFracsA = audioA.clipStarts ? audioA.clipStarts.map(s => s / totA) : null;
   folderClipFracsB = audioB.clipStarts ? audioB.clipStarts.map(s => s / totB) : null;
   // Folder sources colour their waveform per clip; the scatter matches via pointColors.
-  playerA.setAudio(rawAudioA, sr, folderClipFracsA ? folderColorFn(folderClipFracsA) : null, srcCh);
-  playerB.setAudio(rawAudioB, sr, folderClipFracsB ? folderColorFn(folderClipFracsB) : null, srcCh);
+  playerA.setAudio(rawAudioA, sr, folderClipFracsA ? folderColorFn(folderClipFracsA, 'A') : null, srcCh);
+  playerB.setAudio(rawAudioB, sr, folderClipFracsB ? folderColorFn(folderClipFracsB, 'B') : null, srcCh);
 
   const modelOpts = {
     modelHz, bwKbps, sampleRate: sr, channels: srcCh,
@@ -3213,10 +3349,13 @@ async function startEncode() {
   const isFolderB = panelB.getType() === 'folder';
 
   setStatus('Checking caches…');
-  const [resA, resB] = await Promise.all([
-    resolveSourceCodes(panelA, audioA, modelOpts),
-    resolveSourceCodes(panelB, audioB, modelOpts),
-  ]);
+  // Sequential (not Promise.all): a 48k folder source encodes its clips on the
+  // shared pool, and the in-memory full-codes cache lets B reuse A's clips when
+  // both are the same folder — so A must finish before B resolves.
+  const isCurrent = () => !stale();
+  const resA = await resolveSourceCodes(panelA, audioA, modelOpts, isCurrent);
+  if (stale()) return;
+  const resB = await resolveSourceCodes(panelB, audioB, modelOpts, isCurrent);
   if (stale()) return;
 
   if (resA && resB) {
@@ -4797,11 +4936,24 @@ umapCanvas.addEventListener('click', async e => {
   getAudioCtx();
   playJobId = ++jobSeq;
   setStatus(`Decoding frame ${bestIdx} (${bestSrc})…`);
+  // Send the codes window straight from currentEmbeds (always present), so this
+  // works for sources resolved from cache/sidecars too — which have no captures
+  // in the worker. 48k carries the clicked frame's scale.
+  const codesSrc  = bestSrc === 'A' ? currentEmbeds.codesA     : currentEmbeds.codesB;
+  const codesDimsSrc = bestSrc === 'A' ? currentEmbeds.codesDimsA : currentEmbeds.codesDimsB;
+  const scalesSrc = bestSrc === 'A' ? currentEmbeds.scalesA    : currentEmbeds.scalesB;
+  const K  = codesDimsSrc[1];
+  const nF = endFrame - startFrame;
+  const codesWin = new Int32Array(K * nF);
+  for (let k = 0; k < K; k++)
+    for (let t = 0; t < nF; t++) codesWin[k * nF + t] = codesSrc[k * T + startFrame + t];
+  const scaleValue = scalesSrc ? scalesSrc[Math.min(scalesSrc.length - 1, bestIdx)] : null;
   worker.postMessage({
     type: 'play_frame_exp6', jobId: playJobId,
-    source: bestSrc, bestIdx, startFrame, endFrame,
+    source: bestSrc, bestIdx,
     modelHz: mp.getModelHz(), bwKbps: mp.getBwKbps(),
-  });
+    codes: codesWin, codesDims: [1, K, nF], scaleValue,
+  }, [codesWin.buffer]);
 });
 
 // ── Trajectory playback ───────────────────────────────────────────────────────
