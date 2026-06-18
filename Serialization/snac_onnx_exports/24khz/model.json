@@ -1,0 +1,18 @@
+{
+  "model": "24khz",
+  "sampling_rate": 24000,
+  "hop_length": 512,
+  "frame_rate": 46.875,
+  "latent_dim": 768,
+  "n_codebooks": 3,
+  "vq_strides": [
+    4,
+    2,
+    1
+  ],
+  "codebook_size": 4096,
+  "codebook_dim": 8,
+  "attn_window_size": null,
+  "preprocess_pad": 2048,
+  "noise": false
+}
