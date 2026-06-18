@@ -26,11 +26,14 @@ statefulOla          // 48k: carry LSTM state across OLA segments (false = reset
 encPool              // persistent pool of encode workers for parallel 48k-stateless segments
 durA, durB               // actual loaded duration (s) per source; null until first encode
 
-// Analysis cache (IndexedDB via encodec-cache.js)
-encCache             // IDBDatabase | null  — null if disabled or not yet opened
-cachingEnabled       // bool — true once DB is open and user opted in
-pendingCacheKeyA/B   // cache key objects held between startEncode and embeddings_exp6;
-                     // null means no save is pending (synth source or cache disabled)
+// Folder sources + code sidecars (see "Folder sources, code sidecars…" below)
+folderClipFracsA/B   // [0..1] per-clip start fractions when a source is a folder (null otherwise)
+pendingResolvedA/B   // {codes,codesDims,scales} resolved from cache for a source whose real encode
+                     //   is skipped — a placeholder is sent instead, merged back in onWorkerMsg
+pendingSidecarA/B    // {panel,audio,modelOpts} — per-window sidecars to write post-encode
+                     //   (24k / 48k-stateful only; 48k whole-file writes 0-full entries inline)
+_fullCodesCache      // Map "name:size:hz:bw:ola" → {codes,codesDims,scales}: in-memory full-clip
+                     //   codes so re-sampling / A-vs-B / reloads are free within a session
 
 // EMBEDS (async)
 currentEmbeds        // {embEncA/B, embEncDimsA/B, embQuantA/B, embQuantDimsA/B,
@@ -467,9 +470,9 @@ function applyGenFade(pcm, sr) {
 
 ## playTrajectory() — reads from state
 
-The code/snap branches read `genPlaySeq` (already set by `computeWaypoints()`), extract embeddings column-wise into a `Float32Array`, and dispatch to the worker. The draw branch interpolates between the two nearest enabled-source frames inline. On worker reply (`trajectory_audio_exp6`), `lastRawPcm` is stored and `applyGenFade` is applied before `playerG.setAudio`.
+The code/snap branches read `genPlaySeq` (already set by `computeWaypoints()`), extract embeddings column-wise into a `Float32Array`, and call `decodeTrajectory()` — which dispatches to the parallel pool (`runParallelDecode48k`) on 48k-stateless, or the primary worker otherwise (see "Parallel decode" above). The draw branch interpolates between the two nearest enabled-source frames inline. The decoded buffer is handed to `onTrajectoryDecoded`, which stores `lastRawPcm` and applies `applyGenFade` before `playerG.setAudio`.
 
-**48k loudness (worker, `runDecodeTrajectoryExp6`)**: when `frameScales` are supplied, every chunk decodes at scale = 1 and a per-SAMPLE gain envelope (linear interp between per-frame scales) is applied after OLA. Scale is a linear post-multiply in the decoder graph, so this is exact — and it removes the loudness steps the old per-chunk mean scale produced when loud and quiet grains mixed within one 150-frame chunk. Without `frameScales` the old per-segment fallback scale applies.
+**48k loudness** (`runParallelDecode48k` on the main thread, or the worker's `runDecodeTrajectoryExp6`): when `frameScales` are supplied, every chunk decodes at scale = 1 and a per-SAMPLE gain envelope (linear interp between per-frame scales) is applied after OLA. Scale is a linear post-multiply in the decoder graph, so this is exact — and it removes the loudness steps the old per-chunk mean scale produced when loud and quiet grains mixed within one 150-frame chunk. Without `frameScales` the old per-segment fallback scale applies.
 
 ## Channels — 48k stereo, 24k mono
 
@@ -479,7 +482,7 @@ The 48k model is natively stereo (C=2, joint embedding for the pair); the 24k mo
 - **Encode** (`encodeAndCapture48k` / `encodeCapture` with `channels`): segment chunks are sliced per plane and fed as real `[1, 2, T]` — no more dual-mono duplication. One embedding per frame still describes both channels (incl. the stereo image), so the map / grains / UMAP pipeline are untouched.
 - **Decode** (`decodeFromLatents(..., stereoOut)` / `runDecodeTrajectoryExp6`): stereo OLA with planar accumulators (mono weight buffer — the triangular window is channel-independent); the loudness envelope applies to both planes. `trajectory_audio_exp6` / `frame_audio_exp6` messages carry `channels`.
 - **Playback & post**: `wave-player.setAudio(..., channels)` (peaks span both planes, real stereo `AudioBuffer`), `applyFade` / `applyNotchOffline` / `encodeWav` are planar-aware; bookmarks store `ch` and download as stereo WAVs.
-- **Cache**: `segEnd` is the planar length, so stereo entries (2T) never collide with legacy dual-mono entries (T); `channels` is stored per record and duration displays divide by it.
+- **Sidecars**: codes/scales are stored planar-aware; `channels` is part of the sidecar header identity so a stereo (48k) entry never matches a mono (24k) one.
 - **Consequence**: grain concatenation splices stereo images too — two timbrally similar grains with opposite panning are *different* latents and may sit apart on the map. Panning is part of the granular texture now.
 
 `durA`/`durB` and all FPS math use frames (`audio.length / srcCh / sr`). The 24k path is byte-identical to before (channels = 1 defaults everywhere).
@@ -492,7 +495,7 @@ Two encode-message flags, both 48k-relevant:
 
 - **`skipPreview`** (exp6 always sends `true`): the per-segment `decodeFromLatents` in `encodeAndCapture48k`/`24k` produces a decoded *preview* (`outBuf`) that exp6's `'result'` handler discards — only the captures (codes/embQuant/scales) are used. Skipping it removes a full decoder conv stack per segment plus the decoder LSTM chain: **measured 1.86× faster** 48k encode (the decode was ~46% of encode time). Default `false`, so experiments 2–5 keep their preview.
 
-- **`statefulOLA`** (UI toggle "48k OLA", shown only on 48k, default `false` = "Stateless"): controls whether the encoder/decoder LSTM state is carried across the 1 s OLA segments (`if (statefulOLA) { hEnc = cap.hEncNew; ... }`) or reset to zero per segment. Stateful = the fork's cross-boundary continuity (sequential); **Stateless** (default) makes segments independent and closer to stock EnCodec, at the cost of faint boundary seams (guard frames still warm the conv stack). It changes the embeddings — chunk 0 is identical between modes (both start zero-state), divergence begins after the first segment boundary (measured ~2% on later frames). Toggling re-encodes (`currentEmbeds = null; scheduleEncode`). **Stateless bypasses the analysis cache** (`cacheable = modelHz !== '48k' || statefulOla`) since it has no key disambiguator against the stateful entries.
+- **`statefulOLA`** (UI toggle "48k OLA", shown only on 48k, default `false` = "Stateless"): controls whether the encoder/decoder LSTM state is carried across the 1 s OLA segments (`if (statefulOLA) { hEnc = cap.hEncNew; ... }`) or reset to zero per segment. Stateful = the fork's cross-boundary continuity (sequential); **Stateless** (default) makes segments independent and closer to stock EnCodec, at the cost of faint boundary seams (guard frames still warm the conv stack). It changes the embeddings — chunk 0 is identical between modes (both start zero-state), divergence begins after the first segment boundary (measured ~2% on later frames). Toggling re-encodes (`currentEmbeds = null; scheduleEncode`). The OLA mode is recorded in the sidecar header (`ola: 'stateful' | 'stateless'`) and validated on read, so stateful and stateless codes never collide; the whole-file folder path (which is stateless-only) and the per-window sidecars both cache correctly.
 
 ### Parallel encode (48k stateless)
 
@@ -501,11 +504,19 @@ Because stateless segments are independent, the 1 s chunks encode concurrently a
 1. `startEncode` branches to `runParallelEncode48k` when `modelHz === '48k' && !statefulOla`.
 2. `sliceSegments48k` cuts each source's planar audio into the exact same guarded chunks as `encodeAndCapture48k` (must match — same geometry constants `SEG_48_M/STRIDE_48_M/HOP_48_M/GUARD_48_M`).
 3. All A+B segment chunks dispatch across the pool (`doParallelBatch`); each pool worker runs `encode_segment` → `encodeCapture` with zero state and returns the cap (chunk transferred in).
-4. Main thread reassembles per-source `{mode:'ola48', totalLen, segments}`, ships them to the **primary** worker via `set_captures`, then sends the usual `get_embeddings_exp6`. So `captureCache`, `get_embeddings_exp6`, decode, and explore-click all work **unchanged** — the caps just arrive pre-computed.
+4. Main thread reassembles per-source `{mode:'ola48', totalLen, segments}`, ships them to the **primary** worker via `set_captures`, then sends the usual `get_embeddings_exp6`. The caps arrive pre-computed.
 
-Batches are serialised (`encodeBatchPromise`) so two never overlap on the pool (no stale-slot reuse); a superseded run is discarded via the `myRun`/`encodeRunSeq` guard before results are applied; a segment error rebuilds the pool clean. **Output is bit-identical to the sequential stateless path** (same chunks, zero state each — verified: early/late embedding checksums match to full float precision). Measured: clean sequential 2-source encode 8.1 s → parallel end-to-end ~3.0 s (encode-only speedup higher; bounded by the segment-wave count over the pool size).
+Batches are serialised on a shared pool lock (`encodeBatchPromise` / `withPoolLock`) so encode/decode/clip-encode batches never overlap (no stale-slot reuse); a superseded run is discarded via the `myRun`/`encodeRunSeq` guard before results are applied; a segment error rebuilds the pool clean. **Output is bit-identical to the sequential stateless path** (same chunks, zero state each — verified: early/late embedding checksums match to full float precision). Measured: clean sequential 2-source encode 8.1 s → parallel end-to-end ~3.0 s.
+
+The same pool also encodes **whole folder clips** (`encodeClipFullCodes`, see "Folder sources") and **decodes trajectories** in parallel.
 
 24k and 48k-stateful keep the sequential primary-worker path.
+
+### Parallel decode + explore playback (48k stateless)
+
+Trajectory generation decode mirrors the parallel encode: `decodeTrajectory` routes 48k-stateless to `runParallelDecode48k`, which slices the trajectory `embQuant` into 150-frame / 135-stride chunks, decodes them concurrently across the pool (`decode_segment` worker message → stateless `decodeFromLatents`), and **OLA-blends on the main thread** (same triangular window + per-sample loudness envelope as the sequential decoder). The scale tensor shape comes from `get_decode_scale` (cached caps, or the `[1,1]` unit fallback). The whole generation is handed to `playerG` once all chunks are in (`onTrajectoryDecoded`). 24k / 48k-stateful still decode via the primary worker (`runDecodeTrajectoryExp6`).
+
+**Explore-click playback** (`play_frame_exp6`) sends the codes window **straight from `currentEmbeds`** (always populated) rather than relying on the worker's `captureCache` — so it works for sources resolved from cache/sidecars (which have no captures). The worker decodes from the supplied codes (+ the clicked frame's scale on 48k), falling back to `captureCache` only when no codes are sent.
 
 ---
 
@@ -533,6 +544,8 @@ The generated waveform is color-coded per pixel by the source of the correspondi
 
 `makeGenColorFn()` builds a `(pos: 0..1) → CSS color` closure over `genPlaySeq`. It is passed to `playerG.setAudio()` as the third argument and re-passed whenever fade is re-applied.
 
+**Folder per-clip colors.** Folder sources tint each clip distinctly (waveform + scatter points) via `clipColor(k, n, source)` over `folderClipFracsA/B`. Each source uses its own hue **band** so A and B stay distinguishable with many files: **A = warm** (hue ≈ 18–110, orange→yellow→green), **B = cool** (hue ≈ 172–294, cyan→blue→violet); within a band the hue ramps across clips. `makeGenColorFn` reuses these per-frame point colors (`pointColorsA/B`) so a folder clip's color carries through to the generated signal.
+
 ---
 
 ## Full trigger chains
@@ -541,15 +554,18 @@ The generated waveform is color-coded per pixel by the source of the correspondi
 SOURCE / MODEL CHANGE
   └─► scheduleEncode() [debounced]
         └─► startEncode()
-              ├─ crc32FromFile(fileA/B) — CRC-32 of raw file bytes (WeakMap-cached)
-              ├─ buildAudioAuto(panelA/B, sr) — loads per panel's "load full" / trim setting
-              │     sets durA / durB = audio.length / sr (A and B may differ)
-              ├─ [if cachingEnabled && both files] cacheGet(keyA) + cacheGet(keyB)
-              │     CACHE HIT  → inject currentEmbeds directly, skip worker entirely
-              │                  → markDirty('COORDS','WAYPOINTS','AUDIO','RENDER')
-              │     CACHE MISS → store pendingCacheKeyA/B, fall through to worker
-              ├─ worker: encode A → encode B → get_embeddings_exp6
-              │     on embeddings_exp6: cachePut(A) + cachePut(B) [fire-and-forget]
+              ├─ buildAudioAuto(panelA/B, sr) — loads each source (folder → windowed display audio
+              │     + folderSelections); sets durA / durB = audio.length / srcCh / sr
+              ├─ resolveSourceCodes(panelA) then (panelB)  — sequential, see "Per-source resolution"
+              │     48k folder → encodeFolderSampledCodes (full-clip encode + slice; always resolves)
+              │     24k/stateful folder → readFolderSidecars (per-window cache; null on miss)
+              │     file / synth → null
+              ├─ BOTH resolved  → injectCodesPair → currentEmbeds, skip worker entirely
+              │                   → markDirty('COORDS','WAYPOINTS','AUDIO','RENDER')
+              ├─ ONE/NONE       → resolved source gets a dummyEncodeAudio placeholder; the worker
+              │                   encodes the rest: encode A → encode B → get_embeddings_exp6
+              │     on embeddings_exp6 (onWorkerMsg): merge any pendingResolvedA/B, then write any
+              │     pendingSidecar (24k/stateful per-window). 48k whole-file writes 0-full inline.
               └─► markDirty('COORDS', 'WAYPOINTS', 'AUDIO', 'RENDER')
                     └─► runEffects()
                           └─► triggerProjection()
@@ -596,35 +612,76 @@ PAN / ZOOM / PLAYBACK TICK
 
 ---
 
-## Analysis cache — `lib/encodec-cache.js`
+## Folder sources, code sidecars, and whole-file encoding
 
-Opt-in IndexedDB cache that stores per-source encoder outputs so repeated loads of the same file+model combination skip the worker entirely.
+A source can be a **folder** ("Folder (join WAVs)") whose clips are concatenated into one source.
+Any browser-decodable container is accepted (wav/wave/mp3/m4a/m4b/mp4/aac/flac/ogg/opus/aif/aiff/
+aifc/caf/webm), name-sorted. *(This replaces the old opt-in IndexedDB analysis cache, which is
+removed — `lib/encodec-cache.js` is deleted; its `crc32`/`crc32FromFile` moved into
+`encodec-sidecar.js`.)*
 
-### Cache key
-`(filename, fileSize, crc32, modelHz, bwKbps, sampleRate, segStart=0, segEnd)`
+### Length budget + sampling — `planFolderSelections`
+The joined source is capped at `MAX_FOLDER_TOTAL_S = 600` (10 min). Durations are probed cheaply
+(`probeAudioDurationSeconds`: WAV header → media-element metadata → full decode as last resort).
+When the sum exceeds the budget, an overflow modal (`askFolderStrategy`) picks a per-clip **sample
+window** `{file, startS, lenS}`:
 
-`crc32` is computed over the raw file `ArrayBuffer` and WeakMap-cached per File object.
-`segEnd` is `audio.length` after resampling to `sampleRate`, so changing the trim setting produces a different key and correctly misses.
+- `first` — keep whole clips in name order until the budget runs out
+- `trim` — first 600/N s of every clip
+- `random` / `random:K` — a random window of every clip (K ∈ {2, 5, 10} s, or 600/N for the equal share)
+- `truncate` — concatenate and hard-cut at 600 s
+- `all` — load past the budget anyway
 
-### Stored per record
-| Field | Type | Description |
-|---|---|---|
-| `embEncData` | `ArrayBuffer` (Float32) | Pre-VQ encoder embeddings |
-| `embEncDims` | `number[]` | Shape of embEnc |
-| `embQuantData` | `ArrayBuffer` (Float32) | Post-VQ quantised embeddings |
-| `embQuantDims` | `number[]` | Shape of embQuant |
-| `codesData` | `ArrayBuffer` (Int32) | VQ codebook indices |
-| `codesDims` | `number[]` | Shape of codes |
-| `scalesData` | `ArrayBuffer` (Float32) \| `null` | Per-frame scales (48 kHz model; null for 24 kHz) |
-| `timestamp` | `number` | `Date.now()` at save time |
+Random offsets are **deterministic**, seeded from `salt:name:size:index`; `salt` is the source
+('A'/'B'), so the SAME folder loaded into both A and B samples *different* windows, yet each is
+reproducible across reloads (cache-stable). The modal picks the SAMPLE window, not what is encoded
+(48k always encodes full clips — see below).
 
-Storing `embQuant` + `codes` alongside `embEnc` means a cache hit requires **zero additional inference** — `currentEmbeds` is assembled directly from the stored buffers.
+### Whole-file encoding + code sampling (48k stateless) — `encodeFolderSampledCodes`
+`resolveSourceCodes` for a 48k-stateless folder **encodes each clip in full once** and samples
+windows by **slicing codes** (not audio):
 
-### Preference
-Stored in `localStorage` under key `encodec_cache_enabled` (`'1'` / `'0'`). A first-visit prompt in the controls sidebar lets the user opt in or out; the toggle is always visible for later changes.
+- `getClipFullCodes(file)` → in-memory `_fullCodesCache` → the clip's `0-full` sidecar entry →
+  else `encodeClipFullCodes` (load full clip, pool-encode its 1 s segments via `doParallelBatch`
+  under `withPoolLock`, reassemble the full code sequence on the main thread with
+  `reassembleClipCodes` — a mirror of the worker's `flattenCaps`/`flattenScales`, codes + scales only).
+- Sample: `sliceClipCodes(full, round(startS·fps), round((startS+lenS)·fps))` (fps = 150) per clip,
+  then `joinClipCodes`. `embQuant` is reconstructed from codes downstream (`reconstructEmbQuant`).
 
-### Partial hits
-If only one source is a file, or if one source misses, the full encode pipeline runs for **both** sources (no partial injection). This keeps the worker's internal capture state consistent.
+Consequence: re-rolling a window, the same folder in A vs B, a model revisit, or a reload are all
+**free code-slices** — no re-encode. First load encodes everything (cached after), processed
+per-clip so memory stays bounded. Codes carry full-clip context (cleaner than the old
+windowed-concat encode). 24k / 48k-stateful folders keep the older per-window path
+(`readFolderSidecars` → worker encode on miss → `writeFolderSidecars` per window).
+
+### Code sidecars — `lib/encodec-sidecar.js`
+Codes are persisted in a file **next to each clip** so reloads (and other tools, e.g. a Max/MSP
+patch) can reuse them. One sidecar per (wav × model × bandwidth):
+
+    <clip>.encodec.<hz>.<bw>      e.g.  break01.wav.encodec.48.24
+
+Binary: `"ENCSIDE1"` magic + `uint32 headerLen` + JSON header + raw Int16 codes + Float32 scales.
+The header carries `filename/fileSize/crc32/modelHz/bwKbps/sampleRate/channels/ola` (all validated
+on read via `sidecarMatches`) and one or more **window entries** keyed `<startMs>-<lenMs>` (`0-full`
+for the whole-file workflow). Writing needs a writable `FileSystemDirectoryHandle`, so sidecars
+work for **folder sources in Chromium only** (`showDirectoryPicker({ mode: 'readwrite' })` at pick
+time). `FS_ACCESS_OK` is feature-detected; unsupported browsers (Brave **default** — gated behind
+`brave://flags/#file-system-access-api`; Firefox/Safari) get a one-shot "needs Chrome/Edge" notice
+and fall back to the in-memory `_fullCodesCache` (re-sampling still free within a session). The save
+outcome is shown in a persistent `#noticeModal`. Single FILE sources are not cached (no writable
+parent directory).
+
+### Per-source resolution — `resolveSourceCodes`
+A and B resolve **independently** (any type combination):
+
+- 48k folder → `encodeFolderSampledCodes` (always resolves — it encodes/samples itself)
+- 24k / 48k-stateful folder → `readFolderSidecars` (per-window cache; `null` → worker encode)
+- file / synth → `null` (encoded via the worker)
+
+Both resolved → `injectCodesPair` assembles `currentEmbeds` and **skips the worker entirely**. When
+exactly **one** source resolves (e.g. a cached folder + a Sine), the resolved source's real encode
+is **skipped** via a silent placeholder (`dummyEncodeAudio`); the worker encodes only the other
+source, and `onWorkerMsg` (now async) merges the resolved codes back, rebuilding `embQuant`.
 
 ---
 
@@ -638,7 +695,7 @@ If only one source is a file, or if one source misses, the full encode pipeline 
 6. **Pins survive UMAP/PCA changes** — `pinPoints` stores `{src, idx}` (frame identity). `pinCoords()` derives `[x,y]` live from `coordsA`/`coordsB`, so pins auto-remap when projection changes. Draw trajectories are cleared on projection result since they have no frame-index backing.
 7. **Pingpong same duration** — code mode: K auto-halves via 2× waypoint list. Snap k_frames: ceil/floor split. Snap equal/prop: half-duration `snapCtxArg` keeps all waypoints within each half.
 8. **Per-source durations** — `buildAudioAuto` loads each file at its own natural length (or trimmed by panel setting); A and B need not be the same length. `durA` / `durB` track the actual loaded durations. All FPS calculations use `srcDuration(src)` which returns `durA`/`durB` with a `defaultDur` fallback before first encode. The Duration panel is not shown in experiment 6 (`showDuration: false` in `createDoubleSourceWidget`).
-9. **Analysis cache** — `encodec-cache.js` stores per-source embeddings in IndexedDB keyed by `(filename, fileSize, crc32, modelHz, bwKbps, sampleRate, segStart, segEnd)`. A full cache hit (both sources) skips the worker entirely and injects `currentEmbeds` directly. Cache is opt-in; preference stored in `localStorage`. CRC-32 is computed from raw file bytes and WeakMap-cached per File object so large files are only hashed once per session.
+9. **Per-source resolution + whole-file folder caching** — A and B resolve independently (`resolveSourceCodes`). 48k folders encode each clip in full once (cached as `0-full` sidecars next to the wav + in-memory `_fullCodesCache`) and sample windows by slicing codes, so re-rolling a window / A-vs-B / reload are free. A source resolved from cache skips its real encode (placeholder + merge). Replaces the old opt-in IndexedDB analysis cache (deleted).
 10. **Multi-segment independence** — each draw stroke is sampled independently in `computeSnapWaypoints`; the renderer inserts `moveTo` gaps so no connecting line is drawn or traversed.
 11. **Source disable is non-destructive** — `pinPoints` is never modified; disabling a source re-snaps pins at `computeWaypoints()` time; re-enabling restores the original snapping automatically.
 12. **Fade is post-processing** — `lastRawPcm` stores the unmodified decoded audio. Changing fade values re-applies to the stored PCM instantly without touching the WAYPOINTS/AUDIO pipeline.
