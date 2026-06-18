@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>SNAC · in-browser round-trip + per-level audition</title>
+<style>
+  :root {
+    --bg: #0e1116; --panel: #171b22; --line: #262c36; --fg: #e6e9ef;
+    --muted: #8b95a5; --accent: #5db0ff; --accent2: #ffcf5d; --bad: #ff6b6b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    padding: 24px; max-width: 880px; margin: 0 auto;
+  }
+  h1 { font-size: 19px; margin: 0 0 2px; }
+  .sub { color: var(--muted); margin: 0 0 20px; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px; margin-bottom: 16px; }
+  .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  label.fld { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+  select, button, input[type=file]::file-selector-button {
+    background: #20262f; color: var(--fg); border: 1px solid var(--line);
+    border-radius: 7px; padding: 8px 12px; font-size: 13px; cursor: pointer;
+  }
+  button.primary { background: var(--accent); color: #06243f; border-color: var(--accent); font-weight: 600; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  input[type=file] { color: var(--muted); font-size: 13px; }
+  .status { color: var(--muted); font-size: 13px; min-height: 18px; }
+  .bar { height: 4px; background: #20262f; border-radius: 3px; overflow: hidden; margin-top: 8px; }
+  .bar > i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .15s; }
+  canvas { width: 100%; height: 72px; background: #0b0e13; border: 1px solid var(--line); border-radius: 7px; display: block; }
+  .wave-label { color: var(--muted); font-size: 12px; margin: 10px 0 4px; }
+  table { width: 100%; border-collapse: collapse; margin-top: 4px; }
+  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line); font-size: 13px; }
+  th { color: var(--muted); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+  td.preview { color: var(--muted); font-family: ui-monospace, Menlo, monospace; font-size: 11px; }
+  .lv-on { color: var(--accent2); }
+  .meta { color: var(--muted); font-size: 12px; }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 6px; }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+  <h1>SNAC — in-browser round-trip</h1>
+  <p class="sub">Encode audio → multi-scale codes → decode, all via the exported ONNX graphs (onnxruntime-web / wasm). Mute or solo individual codebook levels to hear the coarse-to-fine hierarchy.</p>
+
+  <div class="panel">
+    <div class="row">
+      <label class="fld">Model</label>
+      <select id="model">
+        <option value="24khz">snac_24khz — 3 levels, 46.9 Hz</option>
+        <option value="32khz">snac_32khz — 4 levels, 83.3 Hz</option>
+        <option value="44khz">snac_44khz — 4 levels, 114.8 Hz</option>
+      </select>
+      <input type="file" id="file" accept="audio/*" />
+      <button id="useTest">Use test_24k.wav</button>
+      <button id="encodeBtn" class="primary" disabled>Encode</button>
+    </div>
+
+    <div class="row" style="margin-top:12px; padding-top:12px; border-top:1px solid var(--line)">
+      <label class="fld">Processing</label>
+      <select id="procMode">
+        <option value="whole">Whole file (one pass)</option>
+        <option value="chunked">Chunked</option>
+      </select>
+      <span id="chunkOpts" style="display:none">
+        <label class="fld">Chunk</label>
+        <input type="number" id="chunkSec" value="1.0" min="0.1" step="0.1" style="width:64px"> s
+        <label style="margin-left:10px"><input type="checkbox" id="olaChk"> OLA</label>
+        <span id="olaOpts" style="display:none">
+          <label class="fld" style="margin-left:6px">overlap</label>
+          <input type="number" id="olaSec" value="0.2" min="0" step="0.05" style="width:64px"> s
+        </span>
+      </span>
+    </div>
+    <div class="hint" id="procHint">Whole file: exact, memory grows with length. Chunked: each chunk is an independent encode→decode unit; SNAC convs are non-causal so chunk edges lack context → seam artifacts. OLA overlaps chunks and crossfades them to smooth the seams. Chunk/overlap snap to 2048-sample boundaries.</div>
+
+    <div class="bar"><i id="prog"></i></div>
+    <div class="status" id="status">Pick a model and an audio file.</div>
+  </div>
+
+  <div class="panel" id="result" style="display:none">
+    <div class="meta" id="metaLine"></div>
+
+    <div class="wave-label">Original (mono, resampled to model rate)</div>
+    <canvas id="waveOrig" width="1600" height="72"></canvas>
+
+    <div class="wave-label">Reconstruction</div>
+    <canvas id="waveRecon" width="1600" height="72"></canvas>
+
+    <div class="row" style="margin-top:14px">
+      <button id="playOrig">▶ Original</button>
+      <button id="playRecon" class="primary" disabled>▶ Reconstruction</button>
+      <span class="meta" id="reconInfo"></span>
+    </div>
+
+    <h3 style="margin:18px 0 4px; font-size:13px; color:var(--muted); text-transform:uppercase; letter-spacing:.04em">Codebook levels</h3>
+    <table id="levels">
+      <thead><tr><th>Keep</th><th>Level</th><th>Stride</th><th>Tokens</th><th>First codes</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <div class="hint">Toggle levels then press <b>Decode</b>. Level 0 is the coarsest (largest stride); the last is full base-rate. Decoding is instant — only the kept levels are re-summed and run through <code>decode_audio</code> (no re-encode).</div>
+    <div class="row" style="margin-top:10px">
+      <button id="decodeBtn" class="primary">Decode selected levels</button>
+      <button id="selAll">All</button>
+      <button id="selCoarse">Coarsest only</button>
+    </div>
+  </div>
+
+<script>
+const SR = { '24khz': 24000, '32khz': 32000, '44khz': 44100 };
+
+const $ = (id) => document.getElementById(id);
+let worker, jobId = 0, pending = {};
+let audioMono = null;        // Float32 @ model SR
+let encoded = null;          // { sampleRate, frameRate, origLen, nLevels, levels }
+let reconBuf = null;         // last decoded Float32
+let playCtx = null;
+
+// ---- worker plumbing ----
+function initWorker() {
+  worker = new Worker('snac-worker.js?v=' + Date.now());
+  worker.onmessage = (e) => {
+    const m = e.data;
+    if (m.type === 'ready') return;
+    if (m.type === 'progress') {
+      $('prog').style.width = Math.round((m.value || 0) * 100) + '%';
+      if (m.status) $('status').textContent = m.status;
+      return;
+    }
+    const job = pending[m.jobId];
+    if (m.type === 'error') {
+      $('status').textContent = '⚠ ' + m.message;
+      $('status').style.color = 'var(--bad)';
+      if (job) { job.reject(new Error(m.message)); delete pending[m.jobId]; }
+      return;
+    }
+    if (job && (m.type === 'encoded' || m.type === 'result')) {
+      job.resolve(m); delete pending[m.jobId];
+    }
+  };
+  worker.postMessage({ type: 'init' });
+}
+function send(msg, transfer) {
+  const id = ++jobId;
+  return new Promise((resolve, reject) => {
+    pending[id] = { resolve, reject };
+    worker.postMessage({ ...msg, jobId: id }, transfer || []);
+  });
+}
+
+// ---- audio load / resample / play ----
+async function loadAudio(arrayBuf, targetSR) {
+  const tmp = new (window.AudioContext || window.webkitAudioContext)();
+  const decoded = await tmp.decodeAudioData(arrayBuf.slice(0));
+  tmp.close();
+  const frames = Math.ceil(decoded.duration * targetSR);
+  const off = new OfflineAudioContext(1, frames, targetSR);
+  const src = off.createBufferSource();
+  src.buffer = decoded;            // OfflineAudioContext(1, …) downmixes to mono
+  src.connect(off.destination);
+  src.start();
+  const rendered = await off.startRendering();
+  return rendered.getChannelData(0).slice();
+}
+function play(float32, sr) {
+  if (playCtx) playCtx.close();
+  playCtx = new (window.AudioContext || window.webkitAudioContext)();
+  const buf = playCtx.createBuffer(1, float32.length, sr);
+  buf.getChannelData(0).set(float32);
+  const src = playCtx.createBufferSource();
+  src.buffer = buf; src.connect(playCtx.destination); src.start();
+}
+
+// ---- waveform draw ----
+function drawWave(canvas, data, color) {
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height, mid = H / 2;
+  ctx.clearRect(0, 0, W, H);
+  ctx.strokeStyle = color;
+  ctx.beginPath();
+  const step = Math.max(1, Math.floor(data.length / W));
+  for (let x = 0; x < W; x++) {
+    let min = 1, max = -1;
+    const start = x * step, end = Math.min(data.length, start + step);
+    for (let i = start; i < end; i++) { const v = data[i]; if (v < min) min = v; if (v > max) max = v; }
+    ctx.moveTo(x + 0.5, mid - max * mid);
+    ctx.lineTo(x + 0.5, mid - min * mid);
+  }
+  ctx.stroke();
+}
+
+// ---- UI flow ----
+function setStatus(t, bad) { $('status').textContent = t; $('status').style.color = bad ? 'var(--bad)' : 'var(--muted)'; }
+
+async function handleFile(arrayBuf, name) {
+  const model = $('model').value;
+  setStatus(`Decoding & resampling “${name}” to ${SR[model]} Hz…`);
+  try {
+    audioMono = await loadAudio(arrayBuf, SR[model]);
+    $('encodeBtn').disabled = false;
+    setStatus(`Loaded ${(audioMono.length / SR[model]).toFixed(2)} s @ ${SR[model]} Hz. Press Encode.`);
+  } catch (err) {
+    setStatus('Could not decode audio: ' + err.message, true);
+  }
+}
+
+function chunkConfig() {
+  if ($('procMode').value !== 'chunked') return null;
+  return {
+    lenSec: parseFloat($('chunkSec').value) || 1.0,
+    olaSec: $('olaChk').checked ? (parseFloat($('olaSec').value) || 0) : 0,
+  };
+}
+
+async function doEncode() {
+  if (!audioMono) return;
+  const model = $('model').value;
+  $('encodeBtn').disabled = true;
+  // worker may transfer-consume the buffer, so send a copy
+  const copy = audioMono.slice();
+  const info = await send({ type: 'encode', audio: copy, model, chunk: chunkConfig() }, [copy.buffer]);
+  encoded = info;
+  renderEncoded();
+  $('encodeBtn').disabled = false;
+  await doDecode(); // immediately decode all levels
+}
+
+function renderEncoded() {
+  $('result').style.display = 'block';
+  const totalTokens = encoded.levels.reduce((s, l) => s + l.T, 0);
+  const dur = encoded.origLen / encoded.sampleRate;
+  const ch = encoded.chunking;
+  const chTxt = ch.mode === 'whole'
+    ? 'whole file'
+    : `${ch.nChunks} chunks of ${(ch.chunkSamples / encoded.sampleRate).toFixed(2)}s` +
+      (ch.olaSamples ? `, OLA ${(ch.olaSamples / encoded.sampleRate).toFixed(2)}s` : ', no OLA');
+  $('metaLine').textContent =
+    `${encoded.model} · ${encoded.sampleRate} Hz · base ${encoded.frameRate.toFixed(3)} Hz · ` +
+    `${encoded.nLevels} levels · ${totalTokens} tokens for ${dur.toFixed(2)} s ` +
+    `(${(totalTokens / dur).toFixed(1)} tok/s) · ${chTxt}`;
+  drawWave($('waveOrig'), audioMono, '#5db0ff');
+
+  const tb = $('levels').querySelector('tbody');
+  tb.innerHTML = '';
+  encoded.levels.forEach((l) => {
+    const tr = document.createElement('tr');
+    tr.innerHTML =
+      `<td><input type="checkbox" class="lvchk" data-i="${l.index}" checked></td>` +
+      `<td>L${l.index}${l.index === 0 ? ' (coarsest)' : (l.index === encoded.nLevels - 1 ? ' (finest)' : '')}</td>` +
+      `<td>×${l.stride}</td><td>${l.T}</td>` +
+      `<td class="preview">${l.preview.join(' ')}…</td>`;
+    tb.appendChild(tr);
+  });
+  $('playRecon').disabled = true;
+}
+
+function keepMask() {
+  const mask = new Array(encoded.nLevels).fill(false);
+  document.querySelectorAll('.lvchk').forEach((c) => { mask[+c.dataset.i] = c.checked; });
+  return mask;
+}
+
+async function doDecode() {
+  if (!encoded) return;
+  $('decodeBtn').disabled = true;
+  const keep = keepMask();
+  const res = await send({ type: 'decode', keep });
+  reconBuf = res.decoded;
+  drawWave($('waveRecon'), reconBuf, '#ffcf5d');
+  const kept = keep.map((k, i) => k ? i : null).filter((x) => x !== null);
+  $('reconInfo').textContent = 'levels kept: ' + (kept.length ? kept.map((i) => 'L' + i).join(', ') : 'none (silence)');
+  $('playRecon').disabled = false;
+  $('decodeBtn').disabled = false;
+}
+
+// ---- events ----
+$('file').addEventListener('change', (e) => {
+  const f = e.target.files[0];
+  if (f) f.arrayBuffer().then((b) => handleFile(b, f.name));
+});
+$('useTest').addEventListener('click', async () => {
+  setStatus('Fetching /test_24k.wav…');
+  try {
+    const b = await (await fetch('/test_24k.wav')).arrayBuffer();
+    handleFile(b, 'test_24k.wav');
+  } catch (err) { setStatus('Could not fetch test file: ' + err.message, true); }
+});
+$('model').addEventListener('change', () => {
+  // model SR changed → require re-load + re-encode
+  if (audioMono) setStatus('Model changed — reload the file (sample rate differs).');
+  audioMono = null; encoded = null; $('encodeBtn').disabled = true; $('result').style.display = 'none';
+});
+// processing controls
+function syncProcUI() {
+  $('chunkOpts').style.display = $('procMode').value === 'chunked' ? 'inline' : 'none';
+  $('olaOpts').style.display = $('olaChk').checked ? 'inline' : 'none';
+}
+function procChanged() {
+  syncProcUI();
+  // chunking is an encode-time decision → mark stale, require re-encode
+  if (audioMono && encoded) setStatus('Processing options changed — press Encode to apply.');
+}
+['procMode', 'olaChk', 'chunkSec', 'olaSec'].forEach((id) =>
+  $(id).addEventListener('change', procChanged));
+
+$('encodeBtn').addEventListener('click', doEncode);
+$('decodeBtn').addEventListener('click', doDecode);
+$('selAll').addEventListener('click', () => { document.querySelectorAll('.lvchk').forEach((c) => c.checked = true); doDecode(); });
+$('selCoarse').addEventListener('click', () => { document.querySelectorAll('.lvchk').forEach((c) => c.checked = (+c.dataset.i === 0)); doDecode(); });
+$('playOrig').addEventListener('click', () => audioMono && play(audioMono, encoded ? encoded.sampleRate : SR[$('model').value]));
+$('playRecon').addEventListener('click', () => reconBuf && play(reconBuf, encoded.sampleRate));
+
+syncProcUI();
+initWorker();
+</script>
+</body>
+</html>
