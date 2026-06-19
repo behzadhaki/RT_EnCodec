@@ -331,8 +331,12 @@ import {
   sidecarMatches,
   ensureRWPermission,
 } from './lib/encodec-sidecar.js';
+import {
+  crcOfAudio as snacCrc, snacCacheMatches, readSnacCache, writeSnacCache,
+} from './lib/snac-sidecar.js';
 
 const MODELS_BASE = new URL('../serialization/encodec_onnx_exports', location.href).href;
+const SNAC_BASE   = new URL('../serialization/snac_onnx_exports', location.href).href;
 
 // 48k OLA segment geometry — must match encodec-worker.js encodeAndCapture48k.
 const SEG_48_M    = 48000;
@@ -431,6 +435,7 @@ restoreSession();
 const mp = createModelPanel({
   defaultModel: '48k',
   defaultBw:    24,
+  enableSnac:   true,
   onChange: () => { currentEmbeds = null; updateEncOptVisibility(); scheduleEncode(0); },
 });
 controls.appendChild(mp.modelSection);
@@ -894,6 +899,8 @@ let pendingSidecarA  = null;   // { panel, audio, modelOpts } — folder code si
 let pendingSidecarB  = null;
 let pendingResolvedA = null;   // {codes,codesDims,scales} loaded from cache — skips that source's real encode
 let pendingResolvedB = null;
+let pendingSnacCacheA = null;  // { dir, crc, model, sampleRate } — SNAC code cache to write post-encode
+let pendingSnacCacheB = null;
 let lastSidecarNoticeKey = null;  // de-dupes the one-shot sidecar popup (re-shows only on a changed outcome)
 let folderSupportWarned  = false; // one-shot "needs Chrome/Edge" notice for folder code-saving
 
@@ -1577,11 +1584,23 @@ new ResizeObserver(resizeCanvas).observe(umapCanvas.parentElement);
 
 // ── Workers ───────────────────────────────────────────────────────────────────
 
-function initWorker() {
+let workerCodec = null;   // 'encodec' | 'snac' — which worker script is live
+
+function initWorker(codec = 'encodec') {
   if (worker) worker.terminate();
-  worker = new Worker('encodec-worker.js?v=' + Date.now());
-  worker.postMessage({ type: 'init', modelsBaseUrl: MODELS_BASE });
+  const script = codec === 'snac' ? 'snac-worker.js' : 'encodec-worker.js';
+  const base   = codec === 'snac' ? SNAC_BASE : MODELS_BASE;
+  worker = new Worker(script + '?v=' + Date.now());
+  worker.postMessage({ type: 'init', modelsBaseUrl: base });
   worker.onmessage = onWorkerMsg;
+  worker.onerror = e => { progWrap.style.display = 'none'; setStatus('Worker error: ' + (e.message || 'crashed'), true); };
+  workerCodec = codec;
+}
+
+// Recreate the primary worker if the selected codec changed (encodec ⇄ snac).
+function ensureWorkerForCodec() {
+  const codec = mp.getCodec();
+  if (codec !== workerCodec) initWorker(codec);
 }
 
 function initUMAPWorker() {
@@ -2660,6 +2679,28 @@ async function onWorkerMsg(e) {
     progWrap.style.display = 'none';
     markDirty('COORDS', 'WAYPOINTS', 'AUDIO', 'RENDER');
 
+    // ── Save SNAC code cache for folder sources (best-effort) ──────────────────
+    if (msg.rawLevelsA && (pendingSnacCacheA || pendingSnacCacheB)) {
+      const pA = pendingSnacCacheA, pB = pendingSnacCacheB;
+      const rawA = msg.rawLevelsA, rawB = msg.rawLevelsB;
+      const fr = msg.frameRate, vqs = msg.vqStrides;
+      pendingSnacCacheA = pendingSnacCacheB = null;
+      (async () => {
+        const { serializeSnacCache } = await import('./lib/snac-sidecar.js');
+        let wrote = 0;
+        for (const [p, raw] of [[pA, rawA], [pB, rawB]]) {
+          if (!p) continue;
+          try {
+            const buf = serializeSnacCache(
+              { model: p.model, crc32: p.crc, sampleRate: p.sampleRate, frameRate: fr, vqStrides: vqs }, raw);
+            await writeSnacCache(p.dir, p.model, p.crc, buf);
+            wrote++;
+          } catch (e) { console.warn('SNAC cache not written:', e.message); }
+        }
+        if (wrote) setStatus(`SNAC codes cached ✓ (${wrote} folder${wrote > 1 ? 's' : ''})`);
+      })();
+    }
+
     // ── Save folder code sidecars next to each wav (best-effort) ───────────────
     if (pendingSidecarA || pendingSidecarB) {
       const sA = pendingSidecarA, sB = pendingSidecarB;
@@ -3012,6 +3053,15 @@ function onTrajectoryDecoded(decoded, channels, jobId) {
 function decodeTrajectory(embQuant, D, N, frameScales) {
   const modelHz = mp.getModelHz();
   const myJobId = playJobId;
+
+  // SNAC: decode the trajectory in parallel across the pool (much faster for the
+  // heavy 32k/44k decoder). Falls back to the primary worker if no pool exists.
+  if (mp.getCodec() === 'snac' && snacPool && snacPool.length) {
+    decodeTrajectorySnacParallel(embQuant, D, N, mp.getSnacModel(), snacPool)
+      .then(audio => { if (playJobId === myJobId) onTrajectoryDecoded(audio, 1, myJobId); })
+      .catch(e => { if (playJobId === myJobId) setStatus('Decode failed: ' + e.message, true); });
+    return;
+  }
   if (modelHz === '48k' && !statefulOla) {
     runParallelDecode48k(embQuant, D, N, frameScales, () => playJobId === myJobId)
       .then(decoded => { if (decoded) onTrajectoryDecoded(decoded, 2, myJobId); })
@@ -3022,7 +3072,7 @@ function decodeTrajectory(embQuant, D, N, frameScales) {
     worker.postMessage({
       type: 'decode_trajectory_exp6', jobId: myJobId,
       embQuant, dims: [1, D, N], frameScales: frameScales || undefined,
-      modelHz, bwKbps: mp.getBwKbps(),
+      modelHz, bwKbps: mp.getBwKbps(), model: mp.getSnacModel(),
     }, xfers);
   }
 }
@@ -3290,8 +3340,234 @@ async function injectCodesPair(A, B) {
   markDirty('COORDS', 'WAYPOINTS', 'AUDIO', 'RENDER');
 }
 
+// ── SNAC parallel chunked encode (worker pool) ──────────────────────────────
+// Whole-file encode of a long folder OOMs one worker, so chunked is the default
+// for SNAC: split each source into chunks, encode them across a pool, and
+// concatenate the central region of each (dropping OLA context frames).
+let snacMetaCache = {};
+async function getSnacMeta(model) {
+  if (snacMetaCache[model]) return snacMetaCache[model];
+  return (snacMetaCache[model] = await (await fetch(`${SNAC_BASE}/${model}/model.json`)).json());
+}
+
+let snacPool = null;
+function ensureSnacPool() {
+  if (snacPool) return snacPool;
+  const M = Math.max(2, Math.min(3, (navigator.hardwareConcurrency || 4) - 1));
+  snacPool = [];
+  for (let i = 0; i < M; i++) {
+    const w = new Worker('snac-worker.js?pool=' + i + '_' + Date.now());
+    w.postMessage({ type: 'init', modelsBaseUrl: SNAC_BASE });
+    snacPool.push(w);
+  }
+  return snacPool;
+}
+
+function runSnacWindow(w, audio, model, idx) {
+  return new Promise((resolve, reject) => {
+    const onMsg = e => {
+      const m = e.data;
+      if (m.type === 'window_snac' && m.idx === idx) { w.removeEventListener('message', onMsg); resolve(m); }
+      else if (m.type === 'error') { w.removeEventListener('message', onMsg); reject(new Error(m.message)); }
+    };
+    w.addEventListener('message', onMsg);
+    w.postMessage({ type: 'encode_window_snac', model, idx, audio }, [audio.buffer]);
+  });
+}
+
+// Encode one source in parallel chunks → concatenated central embeddings + codes.
+async function encodeSnacSourceChunked(audio, model, chunkCfg, sr, pool, onProg) {
+  const meta = await getSnacMeta(model);
+  const padTo = meta.preprocess_pad, hop = meta.hop_length, N = meta.n_codebooks;
+  const strides = meta.vq_strides, D = meta.latent_dim;
+  const snap = x => Math.max(padTo, Math.round(x / padTo) * padTo);
+  const paddedLen = Math.ceil(audio.length / padTo) * padTo;
+  const chunkSamples = (chunkCfg && chunkCfg.lenSec > 0) ? Math.min(paddedLen, snap(chunkCfg.lenSec * sr)) : paddedLen;
+  const ola = (chunkCfg && chunkCfg.olaSec > 0) ? Math.min(chunkSamples - padTo, Math.round(chunkCfg.olaSec * sr / padTo) * padTo) : 0;
+
+  const plan = [];
+  for (let s = 0; s < paddedLen; s += chunkSamples) {
+    const centralEnd = Math.min(s + chunkSamples, paddedLen);
+    plan.push({ s, centralEnd, ctxStart: Math.max(0, s - ola), ctxEnd: Math.min(paddedLen, centralEnd + ola) });
+  }
+  const items = plan.map(p => {
+    const win = new Float32Array(p.ctxEnd - p.ctxStart);
+    const srcEnd = Math.min(p.ctxEnd, audio.length);
+    if (p.ctxStart < audio.length) win.set(audio.subarray(p.ctxStart, srcEnd));
+    return win;
+  });
+
+  const results = new Array(plan.length);
+  let next = 0, done = 0;
+  await Promise.all(pool.map(async w => {
+    while (next < plan.length) {
+      const i = next++;
+      results[i] = await runSnacWindow(w, items[i], model, i);
+      if (onProg) onProg(++done, plan.length);
+    }
+  }));
+
+  const totalFrames = paddedLen / hop;
+  const zFull = new Float32Array(D * totalFrames);
+  const zqFull = new Float32Array(D * totalFrames);
+  const rawFull = strides.map(st => new Int32Array(totalFrames / st));
+  let foff = 0;
+  plan.forEach((p, ci) => {
+    const r = results[ci], Wf = r.zDims[2];
+    const trimL = (p.s - p.ctxStart) / hop;
+    const centralFrames = (p.centralEnd - p.s) / hop;
+    for (let d = 0; d < D; d++)
+      for (let t = 0; t < centralFrames; t++) {
+        zFull[d * totalFrames + foff + t]  = r.z[d * Wf + trimL + t];
+        zqFull[d * totalFrames + foff + t] = r.zq[d * Wf + trimL + t];
+      }
+    for (let i = 0; i < N; i++) {
+      const st = strides[i], lv = r.rawLevels[i], dstBase = foff / st;
+      const trimLl = trimL / st, cfl = centralFrames / st;
+      for (let t = 0; t < cfl; t++) rawFull[i][dstBase + t] = lv[trimLl + t];
+    }
+    foff += centralFrames;
+  });
+
+  const codes = new Int32Array(N * totalFrames);
+  for (let i = 0; i < N; i++) { const st = strides[i]; for (let t = 0; t < totalFrames; t++) codes[i * totalFrames + t] = rawFull[i][Math.floor(t / st)]; }
+
+  return { z: zFull, zDims: [1, D, totalFrames], zq: zqFull, zqDims: [1, D, totalFrames],
+           rawLevels: rawFull, codes, codesDims: [1, N, totalFrames], frameRate: meta.frame_rate, vqStrides: strides };
+}
+
+function decodeSnacWindow(w, embFlat, dims, model, idx) {
+  return new Promise((resolve, reject) => {
+    const onMsg = e => {
+      const m = e.data;
+      if (m.type === 'decode_window_done' && m.idx === idx) { w.removeEventListener('message', onMsg); resolve(m.audio); }
+      else if (m.type === 'error') { w.removeEventListener('message', onMsg); reject(new Error(m.message)); }
+    };
+    w.addEventListener('message', onMsg);
+    w.postMessage({ type: 'decode_window_snac', model, idx, embQuant: embFlat, dims }, [embFlat.buffer]);
+  });
+}
+
+// Decode a trajectory embedding [1,D,N] across the pool: split into aw-aligned
+// chunks with ±aw context, decode in parallel, trim each to its central audio.
+async function decodeTrajectorySnacParallel(embQuant, D, N, model, pool) {
+  const meta = await getSnacMeta(model);
+  const aw = meta.attn_window_size || 1, hop = meta.hop_length;
+  const target = Math.max(aw * 2, Math.ceil(N / pool.length / aw) * aw);
+  const ctx = aw;
+  const chunks = [];
+  for (let s = 0; s < N; s += target) {
+    const e = Math.min(s + target, N);
+    chunks.push({ s, e, cs: Math.max(0, s - ctx), ce: Math.min(N, e + ctx) });
+  }
+  const results = new Array(chunks.length);
+  let next = 0;
+  await Promise.all(pool.map(async w => {
+    while (next < chunks.length) {
+      const i = next++, c = chunks[i], Wf = c.ce - c.cs;
+      const win = new Float32Array(D * Wf);
+      for (let d = 0; d < D; d++)
+        for (let t = 0; t < Wf; t++) win[d * Wf + t] = embQuant[d * N + c.cs + t];
+      results[i] = await decodeSnacWindow(w, win, [1, D, Wf], model, i);
+    }
+  }));
+  const out = new Float32Array(N * hop);
+  chunks.forEach((c, i) => {
+    const a = results[i], trimL = (c.s - c.cs) * hop, len = (c.e - c.s) * hop;
+    out.set(a.subarray(trimL, trimL + len), c.s * hop);
+  });
+  return out;
+}
+
+// SNAC embeddings path for exp6: mono; chunked-parallel by default (whole if chosen).
+// The snac-worker returns an embeddings_exp6 message (z=embEnc, z_q=embQuant) that
+// the existing handler turns into currentEmbeds and projects.
+async function startEncodeSnac(myRun, stale) {
+  const sr = mp.getSampleRate();
+  let audioA, audioB;
+  try {
+    setStatus('Loading A…');
+    audioA = await srcWidget.buildAudioAuto(panelA, sr, 1);
+    if (stale()) return;
+    setStatus('Loading B…');
+    audioB = await srcWidget.buildAudioAuto(panelB, sr, 1);
+    if (stale()) return;
+  } catch (err) { setStatus(err.message, true); return; }
+
+  coordsA = coordsB = null;
+  scheduleRender();
+  rawAudioA = audioA; rawAudioB = audioB; rawAudioCh = 1;
+  durA = audioA.length / sr; durB = audioB.length / sr;
+  folderClipFracsA = audioA.clipStarts ? audioA.clipStarts.map(s => s / audioA.length) : null;
+  folderClipFracsB = audioB.clipStarts ? audioB.clipStarts.map(s => s / audioB.length) : null;
+  playerA.setAudio(rawAudioA, sr, folderClipFracsA ? folderColorFn(folderClipFracsA, 'A') : null, 1);
+  playerB.setAudio(rawAudioB, sr, folderClipFracsB ? folderColorFn(folderClipFracsB, 'B') : null, 1);
+
+  // The shared embeddings_exp6 handler takes its simple branch for SNAC.
+  pendingResolvedA = pendingResolvedB = null;
+  pendingSidecarA = pendingSidecarB = null;
+  pendingSnacCacheA = pendingSnacCacheB = null;
+
+  const model = mp.getSnacModel();
+  // Pre-warm the primary worker's sessions (chunked encode runs on the pool, so
+  // the primary is otherwise cold until the first trajectory/frame decode).
+  worker.postMessage({ type: 'warm', model });
+  // Per-source SNAC code cache (folder sources only — they expose a writable dir).
+  const dirA = panelA.getType() === 'folder' ? panelA.getDirHandle?.() : null;
+  const dirB = panelB.getType() === 'folder' ? panelB.getDirHandle?.() : null;
+  const crcA = snacCrc(audioA), crcB = snacCrc(audioB);
+  const cA = dirA ? await readSnacCache(dirA, model, crcA) : null;
+  if (stale()) return;
+  const cB = dirB ? await readSnacCache(dirB, model, crcB) : null;
+  if (stale()) return;
+  const hitA = cA && snacCacheMatches(cA.header, { model, crc32: crcA, sampleRate: sr });
+  const hitB = cB && snacCacheMatches(cB.header, { model, crc32: crcB, sampleRate: sr });
+
+  activeJobId = ++jobSeq;
+  progWrap.style.display = 'block'; progBar.style.width = '0%';
+
+  if (hitA && hitB) {
+    // Both cached → rebuild embeddings from codes, skip the encoder entirely.
+    setStatus('Loading SNAC codes from cache…');
+    worker.postMessage({ type: 'recon_exp6', jobId: activeJobId, model,
+      levelsA: cA.levels, levelsB: cB.levels });
+    return;
+  }
+
+  // Miss → encode; remember which folder sources to write a cache for afterwards.
+  pendingSnacCacheA = (dirA && !hitA) ? { dir: dirA, crc: crcA, model, sampleRate: sr } : null;
+  pendingSnacCacheB = (dirB && !hitB) ? { dir: dirB, crc: crcB, model, sampleRate: sr } : null;
+
+  const chunkCfg = mp.getChunkConfig();
+  if (chunkCfg) {
+    // Chunked parallel encode (default for SNAC) — scales to long folders.
+    const pool = ensureSnacPool();
+    try {
+      const A = await encodeSnacSourceChunked(audioA, model, chunkCfg, sr, pool, (d, t) => setStatus(`Encoding A… ${d}/${t} chunks`));
+      if (stale()) return;
+      const B = await encodeSnacSourceChunked(audioB, model, chunkCfg, sr, pool, (d, t) => setStatus(`Encoding B… ${d}/${t} chunks`));
+      if (stale()) return;
+      // Feed the assembled result through the shared embeddings handler.
+      onWorkerMsg({ data: {
+        type: 'embeddings_exp6', jobId: activeJobId,
+        embEncA: A.z, embEncDimsA: A.zDims, embEncB: B.z, embEncDimsB: B.zDims,
+        embQuantA: A.zq, embQuantDimsA: A.zqDims, embQuantB: B.zq, embQuantDimsB: B.zqDims,
+        codesA: A.codes, codesDimsA: A.codesDims, codesB: B.codes, codesDimsB: B.codesDims,
+        scalesA: null, scalesB: null,
+        rawLevelsA: A.rawLevels, rawLevelsB: B.rawLevels, frameRate: A.frameRate, vqStrides: A.vqStrides,
+      } });
+    } catch (err) { setStatus('SNAC encode failed: ' + err.message, true); }
+    return;
+  }
+
+  // Whole-file single-worker encode (only if the user picked "Whole file").
+  setStatus('Encoding (SNAC)…');
+  worker.postMessage({ type: 'encode_exp6', jobId: activeJobId,
+    audioA: audioA.slice(), audioB: audioB.slice(), model, chunk: null });
+}
+
 async function startEncode() {
-  if (!worker) initWorker();
+  ensureWorkerForCodec();
 
   // Claim this run. Any concurrent startEncode that started earlier will see
   // myRun !== encodeRunSeq after their awaits and silently abort.
@@ -3300,6 +3576,9 @@ async function startEncode() {
 
   // Kill any in-flight UMAP/PCA — the new encode will trigger a fresh projection.
   cancelProjection();
+
+  // SNAC: dedicated whole-file embeddings path (no sidecars / pools / OLA).
+  if (mp.getCodec() === 'snac') { await startEncodeSnac(myRun, stale); return; }
 
   const sr       = mp.getSampleRate();
   const modelHz  = mp.getModelHz();
@@ -4231,7 +4510,9 @@ function startUMAPReduction() {
 async function buildUMAPFeatureData() {
   let framesA, framesB;
 
-  if (umapMode === 'combined') {
+  // SNAC's per-level codes are multi-scale/ragged and don't use EnCodec codebooks,
+  // so the codebook-lookup feature is unavailable — fall back to the continuous space.
+  if (umapMode === 'combined' || mp.getCodec() === 'snac') {
     if (embSpace === 'pre_vq') {
       framesA = embQuantToFrames(currentEmbeds.embEncA,   currentEmbeds.embEncDimsA);
       framesB = embQuantToFrames(currentEmbeds.embEncB,   currentEmbeds.embEncDimsB);
@@ -4944,6 +5225,18 @@ umapCanvas.addEventListener('click', async e => {
   const scalesSrc = bestSrc === 'A' ? currentEmbeds.scalesA    : currentEmbeds.scalesB;
   const K  = codesDimsSrc[1];
   const nF = endFrame - startFrame;
+
+  // SNAC: decode the embQuant (z_q) window directly via decode_audio — no codebooks.
+  if (mp.getCodec() === 'snac') {
+    const embSrc = bestSrc === 'A' ? currentEmbeds.embQuantA : currentEmbeds.embQuantB;
+    const D = (bestSrc === 'A' ? currentEmbeds.embQuantDimsA : currentEmbeds.embQuantDimsB)[1];
+    const win = new Float32Array(D * nF);
+    for (let d = 0; d < D; d++)
+      for (let t = 0; t < nF; t++) win[d * nF + t] = embSrc[d * T + startFrame + t];
+    worker.postMessage({ type: 'decode_frame_snac', jobId: playJobId, model: mp.getSnacModel(), embQuant: win, dims: [1, D, nF] }, [win.buffer]);
+    return;
+  }
+
   const codesWin = new Int32Array(K * nF);
   for (let k = 0; k < K; k++)
     for (let t = 0; t < nF; t++) codesWin[k * nF + t] = codesSrc[k * T + startFrame + t];

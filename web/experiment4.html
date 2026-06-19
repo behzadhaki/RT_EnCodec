@@ -231,6 +231,7 @@ import {
 } from './lib/stft.js';
 
 const MODELS_BASE = new URL('../serialization/encodec_onnx_exports', location.href).href;
+const SNAC_BASE   = new URL('../serialization/snac_onnx_exports', location.href).href;
 
 // ═══════════════════════════════════════════════════════════════════════
 // State
@@ -314,6 +315,7 @@ const { panelA, panelB } = srcWidget;
 
 const mp = createModelPanel({
   defaultModel: '48k',
+  enableSnac: true,
   onChange: () => { capturesDirty = true; svd4Ready = false; clearScrees(); scheduleEncode(200); },
 });
 controls.appendChild(mp.modelSection);
@@ -598,11 +600,22 @@ function scheduleApply() {
 // Worker
 // ═══════════════════════════════════════════════════════════════════════
 
-function initWorker() {
+let workerCodec = null;   // 'encodec' | 'snac' — which worker is currently live
+
+function initWorker(codec = 'encodec') {
   if (worker) worker.terminate();
-  worker = new Worker('encodec-worker.js?v=' + Date.now());
-  worker.postMessage({ type: 'init', modelsBaseUrl: MODELS_BASE });
+  const script = codec === 'snac' ? 'snac-worker.js' : 'encodec-worker.js';
+  const base   = codec === 'snac' ? SNAC_BASE : MODELS_BASE;
+  worker = new Worker(script + '?v=' + Date.now());
+  worker.postMessage({ type: 'init', modelsBaseUrl: base });
   worker.onmessage = onWorkerMsg;
+  workerCodec = codec;
+}
+
+// Recreate the worker if the selected codec changed (encodec ⇄ snac).
+function ensureWorkerForCodec() {
+  const codec = mp.getCodec();
+  if (codec !== workerCodec) initWorker(codec);
 }
 
 function onWorkerMsg(e) {
@@ -695,6 +708,7 @@ function onWorkerMsg(e) {
 
 async function triggerEncode() {
   if (!worker) return;
+  ensureWorkerForCodec();
   const sr       = mp.getSampleRate();
   const targetSec = srcWidget.getDuration();
   const finalLen  = Math.round(targetSec * sr);
@@ -731,6 +745,8 @@ async function triggerEncode() {
     bwKbps:    mp.getBwKbps(),
     streaming: mp.isStreaming(),
     frameSize: mp.getFrameSize(),
+    model:     mp.getSnacModel(),     // SNAC variant (null for EnCodec)
+    chunk:     mp.getChunkConfig(),
   });
 }
 
@@ -747,6 +763,8 @@ function startEncodeB() {
     bwKbps:    mp.getBwKbps(),
     streaming: mp.isStreaming(),
     frameSize: mp.getFrameSize(),
+    model:     mp.getSnacModel(),
+    chunk:     mp.getChunkConfig(),
   });
 }
 
