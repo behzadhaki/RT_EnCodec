@@ -1,5 +1,18 @@
 import { UMAP } from 'https://esm.sh/umap-js';
 
+// ── perf self-stats (busy% via timer-drift; heap on demand) ──
+let _busyMs = 0, _wallMs = 0, _lastTick = performance.now();
+setInterval(() => {
+  const now = performance.now(), dt = now - _lastTick;
+  _wallMs += dt; _busyMs += Math.max(0, dt - 250);
+  _lastTick = now;
+}, 250);
+function _statReply(id) {
+  self.postMessage({ type: '__stat', id,
+    heap: (typeof performance !== 'undefined' && performance.memory) ? performance.memory.usedJSHeapSize : 0,
+    busyMs: _busyMs, wallMs: _wallMs });
+}
+
 // ── PRNG ──────────────────────────────────────────────────────────────────────
 
 function mulberry32(seed) {
@@ -370,6 +383,7 @@ function cosineDist(a, b) {
 // ── Message handler ───────────────────────────────────────────────────────────
 
 self.onmessage = ({ data: msg }) => {
+  if (msg.type === '__stat') { _statReply(msg.id); return; }
   // ── Feature pre-reduction ──────────────────────────────────────────────────
   if (msg.type === 'reduce_features') {
     const { jobId, flat, N, D, kMax, varTarget } = msg;

@@ -3479,9 +3479,48 @@ async function decodeTrajectorySnacParallel(embQuant, D, N, model, pool) {
   return out;
 }
 
+// In-memory per-source encode memo (model:crc → result) so changing one source
+// does NOT re-encode the unchanged one. Bounded to a few entries (each ~few MB).
+const snacEncMemo = new Map();
+function snacMemoStore(key, r) {
+  snacEncMemo.delete(key); snacEncMemo.set(key, r);
+  while (snacEncMemo.size > 6) snacEncMemo.delete(snacEncMemo.keys().next().value);
+}
+let _reconSeq = 0;
+function reconSnacViaPool(levels, model, pool) {
+  const w = pool[0], idx = ++_reconSeq;
+  return new Promise((resolve, reject) => {
+    const on = e => {
+      const m = e.data;
+      if (m.type === 'recon_src_done' && m.idx === idx) { w.removeEventListener('message', on); resolve(m); }
+      else if (m.type === 'error') { w.removeEventListener('message', on); reject(new Error(m.message)); }
+    };
+    w.addEventListener('message', on);
+    w.postMessage({ type: 'recon_src_snac', model, idx, levels });
+  });
+}
+// Resolve one source to its embeddings: in-memory memo → file cache → fresh encode.
+async function resolveSnacSource(audio, crc, dir, model, chunkCfg, sr, pool, label) {
+  const key = `${model}:${crc}`;
+  if (snacEncMemo.has(key)) { const r = snacEncMemo.get(key); snacMemoStore(key, r); return { ...r, fresh: false }; }
+  if (dir) {
+    const c = await readSnacCache(dir, model, crc);
+    if (c && snacCacheMatches(c.header, { model, crc32: crc, sampleRate: sr })) {
+      setStatus(`Loading ${label} from cache…`);
+      const rr = await reconSnacViaPool(c.levels, model, pool);
+      const meta = await getSnacMeta(model);
+      const r = { z: null, zDims: null, zq: rr.zq, zqDims: rr.zqDims, rawLevels: c.levels,
+                  codes: rr.codes, codesDims: rr.codesDims, frameRate: meta.frame_rate, vqStrides: meta.vq_strides };
+      snacMemoStore(key, r); return { ...r, fresh: false };
+    }
+  }
+  const r = await encodeSnacSourceChunked(audio, model, chunkCfg, sr, pool, (d, t) => setStatus(`Encoding ${label}… ${d}/${t} chunks`));
+  snacMemoStore(key, r); return { ...r, fresh: true };
+}
+
 // SNAC embeddings path for exp6: mono; chunked-parallel by default (whole if chosen).
-// The snac-worker returns an embeddings_exp6 message (z=embEnc, z_q=embQuant) that
-// the existing handler turns into currentEmbeds and projects.
+// Each source is resolved independently (memo → cache → encode), so changing one
+// source reuses the other's embeddings instead of re-encoding it.
 async function startEncodeSnac(myRun, stale) {
   const sr = mp.getSampleRate();
   let audioA, audioB;
@@ -3512,58 +3551,43 @@ async function startEncodeSnac(myRun, stale) {
   // Pre-warm the primary worker's sessions (chunked encode runs on the pool, so
   // the primary is otherwise cold until the first trajectory/frame decode).
   worker.postMessage({ type: 'warm', model });
-  // Per-source SNAC code cache (folder sources only — they expose a writable dir).
+  // Folder sources expose a writable dir (file cache); compute content keys.
   const dirA = panelA.getType() === 'folder' ? panelA.getDirHandle?.() : null;
   const dirB = panelB.getType() === 'folder' ? panelB.getDirHandle?.() : null;
   const crcA = snacCrc(audioA), crcB = snacCrc(audioB);
-  const cA = dirA ? await readSnacCache(dirA, model, crcA) : null;
-  if (stale()) return;
-  const cB = dirB ? await readSnacCache(dirB, model, crcB) : null;
-  if (stale()) return;
-  const hitA = cA && snacCacheMatches(cA.header, { model, crc32: crcA, sampleRate: sr });
-  const hitB = cB && snacCacheMatches(cB.header, { model, crc32: crcB, sampleRate: sr });
 
   activeJobId = ++jobSeq;
   progWrap.style.display = 'block'; progBar.style.width = '0%';
 
-  if (hitA && hitB) {
-    // Both cached → rebuild embeddings from codes, skip the encoder entirely.
-    setStatus('Loading SNAC codes from cache…');
-    worker.postMessage({ type: 'recon_exp6', jobId: activeJobId, model,
-      levelsA: cA.levels, levelsB: cB.levels });
-    return;
-  }
+  const pool = ensureSnacPool();
+  const chunkCfg = mp.getChunkConfig();   // null = "Whole file" → 1 chunk
+  let A, B;
+  try {
+    A = await resolveSnacSource(audioA, crcA, dirA, model, chunkCfg, sr, pool, 'A');
+    if (stale()) return;
+    B = await resolveSnacSource(audioB, crcB, dirB, model, chunkCfg, sr, pool, 'B');
+    if (stale()) return;
+  } catch (err) { setStatus('SNAC encode failed: ' + err.message, true); return; }
 
-  // Miss → encode; remember which folder sources to write a cache for afterwards.
-  pendingSnacCacheA = (dirA && !hitA) ? { dir: dirA, crc: crcA, model, sampleRate: sr } : null;
-  pendingSnacCacheB = (dirB && !hitB) ? { dir: dirB, crc: crcB, model, sampleRate: sr } : null;
+  // Assemble both sources through the shared embeddings handler.
+  onWorkerMsg({ data: {
+    type: 'embeddings_exp6', jobId: activeJobId,
+    embEncA: A.z, embEncDimsA: A.zDims, embEncB: B.z, embEncDimsB: B.zDims,
+    embQuantA: A.zq, embQuantDimsA: A.zqDims, embQuantB: B.zq, embQuantDimsB: B.zqDims,
+    codesA: A.codes, codesDimsA: A.codesDims, codesB: B.codes, codesDimsB: B.codesDims,
+    scalesA: null, scalesB: null,
+    rawLevelsA: A.rawLevels, rawLevelsB: B.rawLevels, frameRate: A.frameRate, vqStrides: A.vqStrides,
+  } });
 
-  const chunkCfg = mp.getChunkConfig();
-  if (chunkCfg) {
-    // Chunked parallel encode (default for SNAC) — scales to long folders.
-    const pool = ensureSnacPool();
+  // Write file caches for freshly-encoded folder sources (best-effort).
+  for (const [dir, crc, r] of [[dirA, crcA, A], [dirB, crcB, B]]) {
+    if (!dir || !r.fresh || !r.rawLevels) continue;
     try {
-      const A = await encodeSnacSourceChunked(audioA, model, chunkCfg, sr, pool, (d, t) => setStatus(`Encoding A… ${d}/${t} chunks`));
-      if (stale()) return;
-      const B = await encodeSnacSourceChunked(audioB, model, chunkCfg, sr, pool, (d, t) => setStatus(`Encoding B… ${d}/${t} chunks`));
-      if (stale()) return;
-      // Feed the assembled result through the shared embeddings handler.
-      onWorkerMsg({ data: {
-        type: 'embeddings_exp6', jobId: activeJobId,
-        embEncA: A.z, embEncDimsA: A.zDims, embEncB: B.z, embEncDimsB: B.zDims,
-        embQuantA: A.zq, embQuantDimsA: A.zqDims, embQuantB: B.zq, embQuantDimsB: B.zqDims,
-        codesA: A.codes, codesDimsA: A.codesDims, codesB: B.codes, codesDimsB: B.codesDims,
-        scalesA: null, scalesB: null,
-        rawLevelsA: A.rawLevels, rawLevelsB: B.rawLevels, frameRate: A.frameRate, vqStrides: A.vqStrides,
-      } });
-    } catch (err) { setStatus('SNAC encode failed: ' + err.message, true); }
-    return;
+      const { serializeSnacCache } = await import('./lib/snac-sidecar.js');
+      const buf = serializeSnacCache({ model, crc32: crc, sampleRate: sr, frameRate: r.frameRate, vqStrides: r.vqStrides }, r.rawLevels);
+      await writeSnacCache(dir, model, crc, buf);
+    } catch (e) { console.warn('SNAC cache not written:', e.message); }
   }
-
-  // Whole-file single-worker encode (only if the user picked "Whole file").
-  setStatus('Encoding (SNAC)…');
-  worker.postMessage({ type: 'encode_exp6', jobId: activeJobId,
-    audioA: audioA.slice(), audioB: audioB.slice(), model, chunk: null });
 }
 
 async function startEncode() {
@@ -5687,6 +5711,95 @@ initHelpTips({
   // Library
   '#libDownloadAll': 'Download every bookmark as one ZIP of WAVs.',
 });
+
+// ════════════════════════════════════════════════════════════════════════════
+// Live stats overlay (bottom-right): RAM + per-thread CPU busy%.
+// CPU has no browser API; each thread self-reports how blocked its event loop is
+// (timer drift) — a good busy% proxy, and one row ≈ one core's load from our app.
+// RAM: performance.memory is JS-heap only (misses the wasm ONNX models), so we
+// add a model-size estimate per loaded worker; with cross-origin isolation we use
+// the exact measureUserAgentSpecificMemory() instead.
+// ════════════════════════════════════════════════════════════════════════════
+(function initStatsOverlay() {
+  const MODEL_BYTES = { '24khz': 76e6, '32khz': 205e6, '44khz': 205e6 }; // ≈ onnx sizes (per worker copy)
+  const fmtMB = b => (b / 1048576).toFixed(0) + ' MB';
+  const bar = pct => { const n = Math.round(Math.max(0, Math.min(100, pct)) / 10); return '▓'.repeat(n) + '░'.repeat(10 - n); };
+
+  const panel = document.createElement('div');
+  panel.style.cssText =
+    'position:fixed;right:8px;bottom:8px;z-index:99999;font:11px/1.35 ui-monospace,Menlo,monospace;' +
+    'background:rgba(14,17,22,.88);color:#cfd6e0;border:1px solid #2a2f3a;border-radius:7px;' +
+    'padding:7px 9px;min-width:200px;backdrop-filter:blur(3px);user-select:none;cursor:pointer;white-space:pre';
+  panel.title = 'Click to collapse';
+  document.body.appendChild(panel);
+  let collapsed = false;
+  panel.addEventListener('click', () => { collapsed = !collapsed; });
+
+  // main-thread busy via timer drift
+  let mBusy = 0, mWall = 0, mLast = performance.now(), mPrevB = 0, mPrevW = 0;
+  setInterval(() => { const n = performance.now(), dt = n - mLast; mWall += dt; mBusy += Math.max(0, dt - 250); mLast = n; }, 250);
+
+  const rec = new Map(); const wired = new WeakSet(); let reqId = 0;
+  const liveWorkers = () => {
+    const l = [];
+    if (worker) l.push([worker, 'snac·main']);
+    if (snacPool) snacPool.forEach((w, i) => l.push([w, 'snac·pool' + i]));
+    if (umapWorker) l.push([umapWorker, 'umap']);
+    if (ssmWorker) l.push([ssmWorker, 'ssm']);
+    return l;
+  };
+  function wire(w, label) {
+    if (wired.has(w)) { rec.get(w).label = label; return; }
+    wired.add(w);
+    rec.set(w, { label, heap: 0, pB: 0, pW: 0, busyPct: 0, loaded: false, model: null });
+    w.addEventListener('message', e => {
+      const m = e.data; if (!m || m.type !== '__stat') return;
+      const r = rec.get(w); if (!r) return;
+      const dB = m.busyMs - r.pB, dW = m.wallMs - r.pW;
+      if (dW > 0) r.busyPct = Math.max(0, Math.min(100, dB / dW * 100));
+      r.pB = m.busyMs; r.pW = m.wallMs; r.heap = m.heap; r.loaded = m.loaded; r.model = m.model;
+    });
+  }
+
+  let exactRam = null, lastExactT = 0;
+  async function maybeExactRam() {
+    if (!self.crossOriginIsolated || !performance.measureUserAgentSpecificMemory) return;
+    const now = performance.now(); if (now - lastExactT < 5000) return; lastExactT = now;
+    try { exactRam = (await performance.measureUserAgentSpecificMemory()).bytes; } catch (_) {}
+  }
+
+  function tick() {
+    const ws = liveWorkers();
+    ws.forEach(([w, label]) => wire(w, label));
+    ws.forEach(([w]) => { try { w.postMessage({ type: '__stat', id: ++reqId }); } catch (_) {} });
+
+    const dB = mBusy - mPrevB, dW = mWall - mPrevW;
+    const mainPct = dW > 0 ? Math.max(0, Math.min(100, dB / dW * 100)) : 0;
+    mPrevB = mBusy; mPrevW = mWall;
+    maybeExactRam();
+
+    const mainHeap = performance.memory ? performance.memory.usedJSHeapSize : 0;
+    let estRam = mainHeap;
+    ws.forEach(([w]) => { const r = rec.get(w); if (r) estRam += r.heap + (r.loaded ? (MODEL_BYTES[r.model] || 0) : 0); });
+    const ramTxt = fmtMB(exactRam || estRam) + (exactRam ? ' (exact)' : ' (≈js+model)');
+
+    if (collapsed) { panel.textContent = `stats  ${ramTxt} · gui ${Math.round(mainPct)}%`; return; }
+
+    const cores = navigator.hardwareConcurrency || '?';
+    let html = `<div style="color:#5db0ff;font-weight:600;margin-bottom:3px">PERF · ${cores} cores</div>`;
+    html += `<div>RAM ${ramTxt}</div>`;
+    html += `<div style="margin:2px 0 3px">GUI    <span style="color:#ffcf5d">${bar(mainPct)}</span>${String(Math.round(mainPct)).padStart(4)}% <span style="color:#6b7585">${fmtMB(mainHeap)}</span></div>`;
+    ws.forEach(([w]) => {
+      const r = rec.get(w); if (!r) return;
+      const col = r.label.startsWith('snac') ? '#7ee787' : '#c8a8ff';
+      const mem = r.loaded ? (MODEL_BYTES[r.model] || 0) : r.heap;   // worker JS heap is hidden by Chrome; show its model RAM
+      html += `<div>${r.label.padEnd(9)}<span style="color:${col}">${bar(r.busyPct)}</span>${String(Math.round(r.busyPct)).padStart(4)}% <span style="color:#6b7585">${fmtMB(mem)}</span></div>`;
+    });
+    html += `<div style="color:#6b7585;margin-top:3px">audio ${audioCtx ? audioCtx.state : 'none'} · cpu n/a</div>`;
+    panel.innerHTML = html;
+  }
+  setInterval(tick, 600);
+})();
 </script>
 </body>
 </html>

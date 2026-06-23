@@ -1,3 +1,16 @@
+// ── perf self-stats (busy% via timer-drift; heap on demand) ──
+let _busyMs = 0, _wallMs = 0, _lastTick = performance.now();
+setInterval(() => {
+  const now = performance.now(), dt = now - _lastTick;
+  _wallMs += dt; _busyMs += Math.max(0, dt - 250);
+  _lastTick = now;
+}, 250);
+function _statReply(id) {
+  self.postMessage({ type: '__stat', id,
+    heap: (typeof performance !== 'undefined' && performance.memory) ? performance.memory.usedJSHeapSize : 0,
+    busyMs: _busyMs, wallMs: _wallMs });
+}
+
 // ── SSM worker ──────────────────────────────────────────────────────────────
 // Self- / cross-similarity matrix over the shared feature matrix `flat`
 // ((T_A+T_B)×D, z-scored, A rows first). Temporal pooling caps the matrix at
@@ -104,6 +117,7 @@ function computeSSMInput(flat, T_A, T_B, D, P) {
 }
 
 self.onmessage = ({ data: msg }) => {
+  if (msg.type === '__stat') { _statReply(msg.id); return; }
   if (msg.type === 'compute_ssm_input') {
     const { jobId, flat, T_A, T_B, D, P } = msg;
     const r = computeSSMInput(flat, T_A, T_B, D, P);

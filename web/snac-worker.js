@@ -48,6 +48,20 @@ let meta = null;       // model.json
 // cache.chunks: [{ start, zq: Float32Array[], zqDims: [1,D,Tb] }]
 let cache = null;
 
+// ── perf self-stats: busy% via timer-drift (a worker blocked in synchronous
+// wasm can't service this interval, so the overrun beyond the tick = busy time).
+let _busyMs = 0, _wallMs = 0, _lastTick = performance.now();
+setInterval(() => {
+  const now = performance.now(), dt = now - _lastTick;
+  _wallMs += dt; _busyMs += Math.max(0, dt - 250);
+  _lastTick = now;
+}, 250);
+function _statReply(id) {
+  self.postMessage({ type: '__stat', id,
+    heap: (typeof performance !== 'undefined' && performance.memory) ? performance.memory.usedJSHeapSize : 0,
+    busyMs: _busyMs, wallMs: _wallMs, model: cachedModel, loaded: !!sessions });
+}
+
 // ---------------------------------------------------------------------------
 // Session loading
 // ---------------------------------------------------------------------------
@@ -540,6 +554,15 @@ self.onmessage = async (e) => {
         break;
       }
 
+      case 'recon_src_snac': {
+        // Rebuild ONE source's embeddings from cached per-level codes.
+        const r = await reconEmb(msg.levels, msg.model, jobId);
+        self.postMessage({ type: 'recon_src_done', jobId, idx: msg.idx,
+          zq: r.zqData, zqDims: r.zqDims, codes: r.codes, codesDims: r.codesDims },
+          [r.zqData.buffer, r.codes.buffer]);
+        break;
+      }
+
       case 'recon_exp6': {
         // Rebuild both sources' embeddings from cached per-level codes (no encode).
         progress(jobId, 0.3, 'Reconstructing from cache…');
@@ -581,6 +604,10 @@ self.onmessage = async (e) => {
         self.postMessage({ type: 'result', jobId, decoded }, [decoded.buffer]);
         break;
       }
+
+      case '__stat':
+        _statReply(msg.id);
+        break;
 
       case 'cancel':
         break;
