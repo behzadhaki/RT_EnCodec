@@ -901,6 +901,8 @@ let pendingResolvedA = null;   // {codes,codesDims,scales} loaded from cache —
 let pendingResolvedB = null;
 let pendingSnacCacheA = null;  // { dir, crc, model, sampleRate } — SNAC code cache to write post-encode
 let pendingSnacCacheB = null;
+let decodeLevelMask = null;    // bool[N] — which codebook levels feed the DECODED (generated) audio
+let decodePanel = null, decodeMaskRow = null, decodeMaskJob = -1;
 let lastSidecarNoticeKey = null;  // de-dupes the one-shot sidecar popup (re-shows only on a changed outcome)
 let folderSupportWarned  = false; // one-shot "needs Chrome/Edge" notice for folder code-saving
 
@@ -2614,6 +2616,15 @@ async function onWorkerMsg(e) {
     return;
   }
 
+  if (msg.type === 'decode_masked_done') {
+    if (msg.jobId === decodeMaskJob && currentEmbeds) {
+      currentEmbeds.decEmbA = msg.embA; currentEmbeds.decEmbB = msg.embB;
+      setStatus('');
+      markDirty('AUDIO');   // re-decode the current generation with the masked levels
+    }
+    return;
+  }
+
   if (msg.jobId !== undefined && msg.jobId !== activeJobId) return;
 
   if (msg.type === 'progress') {
@@ -2676,6 +2687,8 @@ async function onWorkerMsg(e) {
 
     currentEmbeds = embeds;
     populateLevelSelect(embeds.codesDimsA[1]);
+    setupDecodeControl(embeds);
+    updateDecodePanelVis();
     progWrap.style.display = 'none';
     markDirty('COORDS', 'WAYPOINTS', 'AUDIO', 'RENDER');
 
@@ -3050,6 +3063,13 @@ function onTrajectoryDecoded(decoded, channels, jobId) {
 
 // Decode dispatcher: stateless 48k fans out across the pool; everything else
 // (stateful 48k, 24k) goes to the primary worker. playJobId is set by the caller.
+// Embedding used for DECODING the generated audio. When a SNAC decode-level
+// mask is active, decEmbA/decEmbB hold the masked z_q; otherwise full embQuant.
+function decEmb(src) {
+  if (src === 'A') return currentEmbeds.decEmbA || currentEmbeds.embQuantA;
+  return currentEmbeds.decEmbB || currentEmbeds.embQuantB;
+}
+
 function decodeTrajectory(embQuant, D, N, frameScales) {
   const modelHz = mp.getModelHz();
   const myJobId = playJobId;
@@ -3835,6 +3855,7 @@ function setUmapSpace(space) {
     umapMode  = 'combined';
     embSpace  = space;   // 'pre_vq' | 'post_vq'
   }
+  updateDecodePanelVis();   // decode-level panel is VQ-only
   markDirty('COORDS', 'WAYPOINTS', 'AUDIO', 'RENDER');
 }
 
@@ -4229,12 +4250,13 @@ async function ensureCodebooks() {
  * @param  {number[]}   codesDims — [1, n_q, T]
  * @returns {Float32Array}         flat layout [dim × T]: result[d * T + t]
  */
-function reconstructEmbQuant(cb, codes, codesDims) {
+function reconstructEmbQuant(cb, codes, codesDims, mask) {
   const T   = codesDims[codesDims.length - 1];
   const n_q = codesDims[codesDims.length - 2];
   const { data, vocab_size, dim } = cb;
   const result = new Float32Array(dim * T);
   for (let q = 0; q < n_q; q++) {
+    if (mask && !mask[q]) continue;   // decode-level mask: skip dropped codebooks
     for (let t = 0; t < T; t++) {
       const codeIdx = codes[q * T + t];
       const cbOff   = q * vocab_size * dim + codeIdx * dim;
@@ -5252,7 +5274,7 @@ umapCanvas.addEventListener('click', async e => {
 
   // SNAC: decode the embQuant (z_q) window directly via decode_audio — no codebooks.
   if (mp.getCodec() === 'snac') {
-    const embSrc = bestSrc === 'A' ? currentEmbeds.embQuantA : currentEmbeds.embQuantB;
+    const embSrc = decEmb(bestSrc);
     const D = (bestSrc === 'A' ? currentEmbeds.embQuantDimsA : currentEmbeds.embQuantDimsB)[1];
     const win = new Float32Array(D * nF);
     for (let d = 0; d < D; d++)
@@ -5484,7 +5506,7 @@ async function playTrajectory() {
     const blended = new Float32Array(D * N);
     for (let i = 0; i < N; i++) {
       const { src, idx } = genPlaySeq[i];
-      const emb = src === 'A' ? currentEmbeds.embQuantA : currentEmbeds.embQuantB;
+      const emb = decEmb(src);
       const T   = src === 'A' ? T_A : T_B;
       for (let d = 0; d < D; d++) blended[d * N + i] = emb[d * T + idx];
     }
@@ -5505,7 +5527,7 @@ async function playTrajectory() {
     const blended = new Float32Array(D * N);
     for (let i = 0; i < N; i++) {
       const { src, idx } = seq[i];
-      const emb = src === 'A' ? currentEmbeds.embQuantA : currentEmbeds.embQuantB;
+      const emb = decEmb(src);
       const T   = src === 'A' ? T_A : T_B;
       for (let d = 0; d < D; d++) blended[d * N + i] = emb[d * T + idx];
     }
@@ -5713,6 +5735,91 @@ initHelpTips({
 });
 
 // ════════════════════════════════════════════════════════════════════════════
+// Decoding control — mask which codebook levels feed the GENERATED audio
+// (separate from the map-construction level selector). SNAC + VQ space only.
+// ════════════════════════════════════════════════════════════════════════════
+function createDecodePanel() {
+  const host = umapCanvas.parentElement;
+  if (getComputedStyle(host).position === 'static') host.style.position = 'relative';
+  decodePanel = document.createElement('div');
+  decodePanel.id = 'decodeCtrl';
+  decodePanel.style.cssText =
+    'position:absolute;right:10px;bottom:10px;z-index:50;display:none;' +
+    'background:rgba(20,24,30,.92);border:1px solid #2a2f3a;border-radius:7px;padding:7px 10px;' +
+    'font:11px/1.45 ui-monospace,Menlo,monospace;color:#cfd6e0;user-select:none;backdrop-filter:blur(3px);';
+  decodePanel.innerHTML =
+    '<div style="color:#5db0ff;font-weight:600;margin-bottom:1px">Decoding control</div>' +
+    '<div style="color:#6b7585;margin-bottom:4px">levels → generated audio</div>' +
+    '<div class="dc-rows" style="max-height:170px;overflow-y:auto"></div>';
+  decodeMaskRow = decodePanel.querySelector('.dc-rows');
+  host.appendChild(decodePanel);
+}
+
+function buildDecodePanel(N) {
+  if (!decodeMaskRow) return;
+  decodeMaskRow.innerHTML = '';
+  // SNAC is multi-scale (coarse→fine); EnCodec's RVQ levels are all the same
+  // temporal resolution, so no coarse/fine labels and a 2-column grid (up to 32).
+  const isSnac = mp.getCodec() === 'snac';
+  decodeMaskRow.style.display = isSnac ? 'block' : 'grid';
+  decodeMaskRow.style.gridTemplateColumns = isSnac ? '' : '1fr 1fr';
+  decodeMaskRow.style.columnGap = isSnac ? '' : '12px';
+  for (let i = 0; i < N; i++) {
+    const label = document.createElement('label');
+    label.style.cssText = 'display:block;cursor:pointer';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox'; cb.checked = decodeLevelMask[i]; cb.dataset.i = i;
+    cb.style.cssText = 'vertical-align:middle;margin-right:5px';
+    cb.addEventListener('change', () => { decodeLevelMask[+cb.dataset.i] = cb.checked; applyDecodeMask(); });
+    label.appendChild(cb);
+    const tag = isSnac ? (i === 0 ? ' · coarse' : (i === N - 1 ? ' · fine' : '')) : '';
+    label.appendChild(document.createTextNode('L' + i + tag));
+    decodeMaskRow.appendChild(label);
+  }
+}
+
+function updateDecodePanelVis() {
+  if (!decodePanel) return;
+  const show = !!currentEmbeds && togVQMode.classList.contains('active');
+  decodePanel.style.display = show ? 'block' : 'none';
+}
+
+// Re-derive the masked decode embeddings (kept levels only) and re-decode.
+// SNAC: recompute z_q in the worker. EnCodec: re-sum the codebooks client-side
+// (codebooks are already loaded for the per-level projection feature).
+async function applyDecodeMask() {
+  if (!currentEmbeds || !decodeLevelMask) return;
+  if (decodeLevelMask.every(Boolean)) {            // all levels → full embQuant, no recompute
+    currentEmbeds.decEmbA = null; currentEmbeds.decEmbB = null;
+    markDirty('AUDIO'); return;
+  }
+  if (mp.getCodec() === 'snac') {
+    if (!currentEmbeds.rawLevelsA) return;
+    decodeMaskJob = ++jobSeq;
+    setStatus('Applying decode level mask…');
+    worker.postMessage({ type: 'decode_masked_exp6', jobId: decodeMaskJob, model: mp.getSnacModel(),
+      levelsA: currentEmbeds.rawLevelsA, levelsB: currentEmbeds.rawLevelsB, mask: decodeLevelMask.slice() });
+  } else {
+    const cb = await ensureCodebooks();
+    if (!currentEmbeds) return;
+    const m = decodeLevelMask.slice();
+    currentEmbeds.decEmbA = reconstructEmbQuant(cb, currentEmbeds.codesA, currentEmbeds.codesDimsA, m);
+    currentEmbeds.decEmbB = reconstructEmbQuant(cb, currentEmbeds.codesB, currentEmbeds.codesDimsB, m);
+    markDirty('AUDIO');
+  }
+}
+
+// Called after any encode/recon: reset the mask, (re)build the per-level panel.
+function setupDecodeControl(embeds) {
+  currentEmbeds.decEmbA = null; currentEmbeds.decEmbB = null;
+  const N = embeds.codesDimsA ? embeds.codesDimsA[1] : 0;
+  decodeLevelMask = new Array(N).fill(true);
+  buildDecodePanel(N);
+}
+
+createDecodePanel();
+
+// ════════════════════════════════════════════════════════════════════════════
 // Live stats overlay (bottom-right): RAM + per-thread CPU busy%.
 // CPU has no browser API; each thread self-reports how blocked its event loop is
 // (timer drift) — a good busy% proxy, and one row ≈ one core's load from our app.
@@ -5725,13 +5832,15 @@ initHelpTips({
   const fmtMB = b => (b / 1048576).toFixed(0) + ' MB';
   const bar = pct => { const n = Math.round(Math.max(0, Math.min(100, pct)) / 10); return '▓'.repeat(n) + '░'.repeat(10 - n); };
 
+  const host = umapCanvas.parentElement;
+  if (getComputedStyle(host).position === 'static') host.style.position = 'relative';
   const panel = document.createElement('div');
   panel.style.cssText =
-    'position:fixed;right:8px;bottom:8px;z-index:99999;font:11px/1.35 ui-monospace,Menlo,monospace;' +
+    'position:absolute;left:10px;bottom:10px;z-index:50;font:11px/1.35 ui-monospace,Menlo,monospace;' +
     'background:rgba(14,17,22,.88);color:#cfd6e0;border:1px solid #2a2f3a;border-radius:7px;' +
     'padding:7px 9px;min-width:200px;backdrop-filter:blur(3px);user-select:none;cursor:pointer;white-space:pre';
   panel.title = 'Click to collapse';
-  document.body.appendChild(panel);
+  host.appendChild(panel);
   let collapsed = false;
   panel.addEventListener('click', () => { collapsed = !collapsed; });
 

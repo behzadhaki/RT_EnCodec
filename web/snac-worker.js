@@ -315,7 +315,8 @@ async function encodeEmb(audio, model, jobId) {
 }
 
 // Rebuild embQuant (z_q) + packed codes from cached per-level codes — no encode.
-async function reconEmb(levels, model, jobId) {
+// mask (optional): bool[N] — only the kept levels are summed into z_q.
+async function reconEmb(levels, model, jobId, mask) {
   await ensureSessions(model, jobId);
   const N = meta.n_codebooks;
   const codeTensors = {};
@@ -327,7 +328,10 @@ async function reconEmb(levels, model, jobId) {
   const dOut = await sessions.decCodes.run(codeTensors);
   const [B, D, Tb] = dOut.zq_0.dims;
   const zqSum = new Float32Array(B * D * Tb);
-  for (let i = 0; i < N; i++) { const zi = dOut[`zq_${i}`].data; for (let k = 0; k < zqSum.length; k++) zqSum[k] += zi[k]; }
+  for (let i = 0; i < N; i++) {
+    if (mask && !mask[i]) continue;
+    const zi = dOut[`zq_${i}`].data; for (let k = 0; k < zqSum.length; k++) zqSum[k] += zi[k];
+  }
   const codes = new Int32Array(N * Tb);
   for (let i = 0; i < N; i++) {
     const lv = levels[i], st = meta.vq_strides[i];
@@ -575,7 +579,21 @@ self.onmessage = async (e) => {
           embQuantA: A.zqData, embQuantDimsA: A.zqDims, embQuantB: B.zqData, embQuantDimsB: B.zqDims,
           codesA: A.codes, codesDimsA: A.codesDims, codesB: B.codes, codesDimsB: B.codesDims,
           scalesA: null, scalesB: null,
-        }, [A.zqData.buffer, B.zqData.buffer, A.codes.buffer, B.codes.buffer]);
+          // echo the per-level codes so the main thread can re-derive masked decode embeddings
+          rawLevelsA: msg.levelsA, rawLevelsB: msg.levelsB,
+        });
+        break;
+      }
+
+      case 'decode_masked_exp6': {
+        // Re-derive both sources' decode embeddings using only the kept levels.
+        await ensureSessions(msg.model, jobId);
+        const A = await reconEmb(msg.levelsA, msg.model, jobId, msg.mask);
+        const B = await reconEmb(msg.levelsB, msg.model, jobId, msg.mask);
+        self.postMessage({
+          type: 'decode_masked_done', jobId,
+          embA: A.zqData, dimsA: A.zqDims, embB: B.zqData, dimsB: B.zqDims,
+        }, [A.zqData.buffer, B.zqData.buffer]);
         break;
       }
 
