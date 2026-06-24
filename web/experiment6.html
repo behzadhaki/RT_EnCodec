@@ -476,6 +476,13 @@ umapSection.innerHTML = `
     <input type="number" id="ssmBudget" value="1024" min="16" max="4096" step="16" style="width:64px">
     <span style="font-size:11px;color:var(--muted);margin-left:2px">px max</span>
   </div>
+  <div class="row" id="ssmPoolRow" style="display:none">
+    <span class="lbl">Pooling</span>
+    <div style="display:flex;gap:3px">
+      <button class="tog active" id="togPoolMean">Mean</button>
+      <button class="tog"        id="togPoolRand">Random</button>
+    </div>
+  </div>
   <div class="row" id="ssmMetricRow" style="display:none">
     <span class="lbl">Metric</span>
     <div style="display:flex;gap:3px">
@@ -536,10 +543,11 @@ umapSection.innerHTML = `
       <button class="tog active" id="togWinGauss">Gauss</button>
     </div>
   </div>
-  <div class="row" id="preReduceRow">
+  <div class="row" id="preReduceRow" style="flex-wrap:wrap">
     <span class="lbl">Pre-PCA</span>
-    <button class="tog active" id="togPreReduce">On</button>
-    <span id="preReduceInfo" style="font-size:11px;color:var(--muted);margin-left:4px"></span>
+    <button class="tog" id="togPreReduce">Off</button>
+    <input type="number" id="preReduceVar" value="0.95" min="0.5" max="0.999" step="0.01" style="width:52px;flex:none" title="Target cumulative explained variance (more variance = more dims kept)">
+    <span id="preReduceInfo" style="font-size:11px;color:var(--muted);flex:0 0 100%;margin-left:0;margin-top:1px"></span>
   </div>
   <div class="row" id="metricRow">
     <span class="lbl">Metric</span>
@@ -548,11 +556,11 @@ umapSection.innerHTML = `
       <button class="tog"        id="togMetricCos">Cosine</button>
     </div>
   </div>
-  <div class="row" id="dedupRow">
+  <div class="row" id="dedupRow" style="flex-wrap:wrap">
     <span class="lbl">Dedup</span>
     <button class="tog" id="togDedup">Off</button>
-    <input type="number" id="dedupThresh" value="0.05" min="0" max="1" step="0.01" style="width:48px">
-    <span id="dedupInfo" style="font-size:11px;color:var(--muted);margin-left:4px"></span>
+    <input type="number" id="dedupThresh" value="0.05" min="0" max="1" step="0.01" style="width:52px;flex:none">
+    <span id="dedupInfo" style="font-size:11px;color:var(--muted);flex:0 0 100%;margin-left:0;margin-top:1px"></span>
   </div>
   <div class="row" id="neighborRow">
     <span class="lbl">Neighbors</span>
@@ -734,7 +742,7 @@ let embSpace        = 'vq';     // 'pre_vq' | 'vq' | 'post_vq'
 let embMode         = 'emb';    // 'emb' | 'emb+delta' | 'delta'
 let ctxDirection    = 'centered';  // 'past' | 'centered' | 'future' — window placement + delta type
 let ctxShape        = 'gaussian';  // 'flat' | 'triangular' | 'gaussian' — context slot weighting
-let preReduceEnabled = true;        // PCA pre-reduction of UMAP features (worker-side)
+let preReduceEnabled = false;       // PCA pre-reduction of UMAP features (worker-side); off by default
 let umapMetric       = 'euclidean'; // 'euclidean' | 'cosine' — UMAP distance
 let scaleFeatEnabled = false;       // append log(scale) feature dim (48k only — no-op without scales)
 let dedupEnabled     = false;       // collapse consecutive near-duplicate frames before the UMAP fit
@@ -754,6 +762,7 @@ let embedInput      = 'features';
 
 // SSM state (joint-only: A·A | A·B | B·B)
 let ssmBudget       = 1024;       // pixel budget P — caps the matrix at P×P (temporal pooling)
+let ssmPool         = 'mean';     // super-frame pooling: 'mean' (avg bin) | 'random' (1 real frame/bin)
 let ssmMetric       = 'cosine';   // 'cosine' | 'euclidean'
 let ssmImage        = null;       // { rgba:ImageData, w, h, scope, seam, pA, pB, T_A, T_B, vmin, vmax, metric }
 let ssmWorker       = null;
@@ -1912,7 +1921,7 @@ function ensureSSMInput() {
       resolve(si);
     };
     w.onerror = e => { w.terminate(); reject(new Error(e.message || 'SSM input failed')); };
-    w.postMessage({ type: 'compute_ssm_input', flat: fd.flat, T_A: fd.T_A, T_B: fd.T_B, D: fd.D, P });
+    w.postMessage({ type: 'compute_ssm_input', flat: fd.flat, T_A: fd.T_A, T_B: fd.T_B, D: fd.D, P, pool: ssmPool });
   });
 }
 
@@ -2003,7 +2012,7 @@ function launchSSM() {
   ssmWorker.postMessage({
     type: 'compute_ssm', jobId: activeSSMJobId,
     flat, T_A, T_B, D,
-    scope: 'joint', which: 'A', P, metric: ssmMetric,
+    scope: 'joint', which: 'A', P, metric: ssmMetric, pool: ssmPool,
   });
 }
 
@@ -2247,6 +2256,7 @@ function setProjectionMode(mode) {
   document.getElementById('wheelScaleRow') .style.display = mode === 'wheel' ? '' : 'none';
   document.getElementById('embedInputRow').style.display = (mode === 'umap' || mode === 'pca') ? '' : 'none';
   document.getElementById('ssmResRow')    .style.display = (mode === 'ssm' || mode === 'mds' || ssmInputActive) ? '' : 'none';
+  document.getElementById('ssmPoolRow')   .style.display = (mode === 'ssm' || mode === 'mds' || ssmInputActive) ? '' : 'none';
   document.getElementById('ssmMetricRow') .style.display = mode === 'ssm' ? '' : 'none';
   document.getElementById('trajPanel')     .style.display = mode === 'ssm' ? 'none' : '';
   slotWrap.classList.toggle('visible', mode === 'umap' && umapSlots.some(s => s));
@@ -3899,6 +3909,9 @@ togPreReduce.addEventListener('click', () => {
   togPreReduce.textContent = preReduceEnabled ? 'On' : 'Off';
   if (projectionMode === 'umap') markDirty('COORDS', 'WAYPOINTS', 'AUDIO', 'RENDER');
 });
+document.getElementById('preReduceVar').addEventListener('change', () => {
+  if (preReduceEnabled && projectionMode === 'umap') markDirty('COORDS', 'WAYPOINTS', 'AUDIO', 'RENDER');
+});
 
 createToggleGroup([
   { el: document.getElementById('togMetricEuc'), value: 'euclidean' },
@@ -3965,6 +3978,8 @@ createToggleGroup([
   const ssmInputActive = embedInput === 'ssm' && (projectionMode === 'umap' || projectionMode === 'pca');
   document.getElementById('ssmResRow').style.display =
     (projectionMode === 'ssm' || projectionMode === 'mds' || ssmInputActive) ? '' : 'none';
+  document.getElementById('ssmPoolRow').style.display =
+    (projectionMode === 'ssm' || projectionMode === 'mds' || ssmInputActive) ? '' : 'none';
   document.getElementById('dedupRow').style.display =
     (projectionMode === 'umap' && !ssmInputActive) ? '' : 'none';
   relaunchScatter();
@@ -3982,6 +3997,16 @@ createToggleGroup([
 ], v => { ssmMetric = v; recomputeSSMIfActive(); });
 ssmBudgetEl.addEventListener('change', () => {
   if (umapFeatureData) umapFeatureData.ssmInput = null; // pooling budget changed
+  recomputeSSMIfActive();
+  if (projectionMode === 'mds' ||
+      (embedInput === 'ssm' && (projectionMode === 'umap' || projectionMode === 'pca'))) relaunchScatter();
+});
+createToggleGroup([
+  { el: document.getElementById('togPoolMean'), value: 'mean' },
+  { el: document.getElementById('togPoolRand'), value: 'random' },
+], v => {
+  ssmPool = v;
+  if (umapFeatureData) umapFeatureData.ssmInput = null; // pooling strategy changed
   recomputeSSMIfActive();
   if (projectionMode === 'mds' ||
       (embedInput === 'ssm' && (projectionMode === 'umap' || projectionMode === 'pca'))) relaunchScatter();
@@ -4546,7 +4571,7 @@ function startUMAPReduction() {
   umapWorker.postMessage({
     type: 'reduce_features', jobId: activeUMAPJobId,
     flat: fd.umapFlat, N: fd.umapTA + fd.umapTB, D: fd.umapD,
-    kMax: PRE_REDUCE_KMAX, varTarget: PRE_REDUCE_VAR,
+    kMax: PRE_REDUCE_KMAX, varTarget: Math.max(0.5, Math.min(0.999, parseFloat(document.getElementById('preReduceVar').value) || PRE_REDUCE_VAR)),
   });
 }
 

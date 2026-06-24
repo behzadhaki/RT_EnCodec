@@ -43,20 +43,42 @@ function magma(t, out, o) {
   out[o + 3] = 255;
 }
 
-// Mean-pool the rows [start, start+T) of `flat` into `p` super-frames (≤T).
-// Returns a Float32Array (p×D), row-major. p === T is an identity copy.
-function poolRows(flat, start, T, D, p) {
+// Deterministic PRNG (seeded → reproducible super-frame picks across recomputes).
+function mulberry32(seed) {
+  let s = seed >>> 0;
+  return () => {
+    s += 0x6d2b79f5;
+    let t = Math.imul(s ^ (s >>> 15), 1 | s);
+    t ^= t + Math.imul(t ^ (t >>> 7), 61 | t);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// Pool the rows [start, start+T) of `flat` into `p` super-frames (≤T).
+// pool='mean'   → average each contiguous bin (smooth, may be off-manifold).
+// pool='random' → pick ONE real frame per bin (a true point in the space),
+//                 seeded so the choice is reproducible. p===T is identity either way.
+// Returns a Float32Array (p×D), row-major.
+function poolRows(flat, start, T, D, p, pool) {
   const out = new Float32Array(p * D);
+  const rnd = pool === 'random' ? mulberry32((start * 2654435761 + T) >>> 0) : null;
   for (let i = 0; i < p; i++) {
     const lo = start + Math.floor((i * T) / p);
     const hi = start + Math.floor(((i + 1) * T) / p);
-    const n = Math.max(1, hi - lo);
     const oo = i * D;
-    for (let r = lo; r < hi; r++) {
+    if (rnd) {
+      const span = Math.max(1, hi - lo);
+      const r = lo + Math.min(span - 1, Math.floor(rnd() * span));
       const ro = r * D;
-      for (let d = 0; d < D; d++) out[oo + d] += flat[ro + d];
+      for (let d = 0; d < D; d++) out[oo + d] = flat[ro + d];
+    } else {
+      const n = Math.max(1, hi - lo);
+      for (let r = lo; r < hi; r++) {
+        const ro = r * D;
+        for (let d = 0; d < D; d++) out[oo + d] += flat[ro + d];
+      }
+      for (let d = 0; d < D; d++) out[oo + d] /= n;
     }
-    for (let d = 0; d < D; d++) out[oo + d] /= n;
   }
   return out;
 }
@@ -96,14 +118,14 @@ function dot(A, i, B, j, D) {
 // Pooled joint cosine SSM used as a projection input (MDS / UMAP-on-SSM /
 // PCA-on-SSM). Returns the raw (pA+pB)² similarity matrix — no colormap — plus
 // the pooled per-source counts so the main thread can map super-frames → frames.
-function computeSSMInput(flat, T_A, T_B, D, P) {
+function computeSSMInput(flat, T_A, T_B, D, P, pool) {
   const budget = Math.max(2, P | 0);
   const pA = T_A > 0 ? Math.min(budget, T_A) : 0;
   const pB = T_B > 0 ? Math.min(budget, T_B) : 0;
   const M  = pA + pB;
   const X  = new Float32Array(M * D);
-  if (pA) X.set(poolRows(flat, 0,   T_A, D, pA), 0);
-  if (pB) X.set(poolRows(flat, T_A, T_B, D, pB), pA * D);
+  if (pA) X.set(poolRows(flat, 0,   T_A, D, pA, pool), 0);
+  if (pB) X.set(poolRows(flat, T_A, T_B, D, pB, pool), pA * D);
   l2normRows(X, M, D);                 // cosine ⇒ S = X·Xᵀ ∈ [-1,1], PSD
   const sim = new Float32Array(M * M);
   for (let i = 0; i < M; i++) {
@@ -119,14 +141,14 @@ function computeSSMInput(flat, T_A, T_B, D, P) {
 self.onmessage = ({ data: msg }) => {
   if (msg.type === '__stat') { _statReply(msg.id); return; }
   if (msg.type === 'compute_ssm_input') {
-    const { jobId, flat, T_A, T_B, D, P } = msg;
-    const r = computeSSMInput(flat, T_A, T_B, D, P);
+    const { jobId, flat, T_A, T_B, D, P, pool } = msg;
+    const r = computeSSMInput(flat, T_A, T_B, D, P, pool);
     self.postMessage({ type: 'ssm_input_result', jobId, sim: r.sim.buffer,
       pA: r.pA, pB: r.pB, T_A: r.T_A, T_B: r.T_B }, [r.sim.buffer]);
     return;
   }
   if (msg.type !== 'compute_ssm') return;
-  const { jobId, flat, T_A, T_B, D, scope, which, P, metric } = msg;
+  const { jobId, flat, T_A, T_B, D, scope, which, P, metric, pool } = msg;
 
   const budget = Math.max(2, P | 0);
   const cosine = metric !== 'euclidean';
@@ -140,18 +162,18 @@ self.onmessage = ({ data: msg }) => {
   let rowsX, colsX, rowP, colP, seam = -1;
 
   if (scope === 'cross') {
-    rowsX = poolRows(flat, 0, T_A, D, pA);  rowP = pA;
-    colsX = poolRows(flat, T_A, T_B, D, pB); colP = pB;
+    rowsX = poolRows(flat, 0, T_A, D, pA, pool);  rowP = pA;
+    colsX = poolRows(flat, T_A, T_B, D, pB, pool); colP = pB;
   } else if (scope === 'self') {
     const useA = which !== 'B';
     const start = useA ? 0 : T_A;
     const T = useA ? T_A : T_B;
     const p = useA ? pA : pB;
-    rowsX = poolRows(flat, start, T, D, p); rowP = p;
+    rowsX = poolRows(flat, start, T, D, p, pool); rowP = p;
     colsX = rowsX; colP = p;
   } else { // joint — concat pooled A then pooled B
-    const a = poolRows(flat, 0, T_A, D, pA);
-    const b = poolRows(flat, T_A, T_B, D, pB);
+    const a = poolRows(flat, 0, T_A, D, pA, pool);
+    const b = poolRows(flat, T_A, T_B, D, pB, pool);
     const M = pA + pB;
     const cat = new Float32Array(M * D);
     cat.set(a, 0);
