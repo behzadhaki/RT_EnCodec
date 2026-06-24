@@ -161,8 +161,6 @@
       </div>
       <span style="flex:1"></span>
       <button class="tog active" id="togExplore">Explore</button>
-      <button class="tog"        id="togDraw">Draw Path</button>
-      <button class="tog"        id="togPins">Pins</button>
     </div>
 
     <div id="umapWrap">
@@ -476,6 +474,13 @@ umapSection.innerHTML = `
     <input type="number" id="ssmBudget" value="1024" min="16" max="4096" step="16" style="width:64px">
     <span style="font-size:11px;color:var(--muted);margin-left:2px">px max</span>
   </div>
+  <div class="row" id="ssmPoolRow" style="display:none">
+    <span class="lbl">Pooling</span>
+    <div style="display:flex;gap:3px">
+      <button class="tog active" id="togPoolMean">Mean</button>
+      <button class="tog"        id="togPoolRand">Random</button>
+    </div>
+  </div>
   <div class="row" id="ssmMetricRow" style="display:none">
     <span class="lbl">Metric</span>
     <div style="display:flex;gap:3px">
@@ -536,10 +541,11 @@ umapSection.innerHTML = `
       <button class="tog active" id="togWinGauss">Gauss</button>
     </div>
   </div>
-  <div class="row" id="preReduceRow">
+  <div class="row" id="preReduceRow" style="flex-wrap:wrap">
     <span class="lbl">Pre-PCA</span>
-    <button class="tog active" id="togPreReduce">On</button>
-    <span id="preReduceInfo" style="font-size:11px;color:var(--muted);margin-left:4px"></span>
+    <button class="tog" id="togPreReduce">Off</button>
+    <input type="number" id="preReduceVar" value="0.95" min="0.5" max="0.999" step="0.01" style="width:52px;flex:none" title="Target cumulative explained variance (more variance = more dims kept)">
+    <span id="preReduceInfo" style="font-size:11px;color:var(--muted);flex:0 0 100%;margin-left:0;margin-top:1px"></span>
   </div>
   <div class="row" id="metricRow">
     <span class="lbl">Metric</span>
@@ -548,11 +554,11 @@ umapSection.innerHTML = `
       <button class="tog"        id="togMetricCos">Cosine</button>
     </div>
   </div>
-  <div class="row" id="dedupRow">
+  <div class="row" id="dedupRow" style="flex-wrap:wrap">
     <span class="lbl">Dedup</span>
     <button class="tog" id="togDedup">Off</button>
-    <input type="number" id="dedupThresh" value="0.05" min="0" max="1" step="0.01" style="width:48px">
-    <span id="dedupInfo" style="font-size:11px;color:var(--muted);margin-left:4px"></span>
+    <input type="number" id="dedupThresh" value="0.05" min="0" max="1" step="0.01" style="width:52px;flex:none">
+    <span id="dedupInfo" style="font-size:11px;color:var(--muted);flex:0 0 100%;margin-left:0;margin-top:1px"></span>
   </div>
   <div class="row" id="neighborRow">
     <span class="lbl">Neighbors</span>
@@ -631,6 +637,7 @@ trajSection.innerHTML = `
 `.trim();
 // Append to umapWrap so it overlays the canvas
 document.getElementById('umapWrap').appendChild(trajSection);
+trajSection.style.display = 'none';   // retired: phrases replace the live draw/pins trajectory system
 
 document.getElementById('trajPanelTitle').addEventListener('click', () => {
   const collapsed = trajSection.classList.toggle('collapsed');
@@ -734,7 +741,7 @@ let embSpace        = 'vq';     // 'pre_vq' | 'vq' | 'post_vq'
 let embMode         = 'emb';    // 'emb' | 'emb+delta' | 'delta'
 let ctxDirection    = 'centered';  // 'past' | 'centered' | 'future' — window placement + delta type
 let ctxShape        = 'gaussian';  // 'flat' | 'triangular' | 'gaussian' — context slot weighting
-let preReduceEnabled = true;        // PCA pre-reduction of UMAP features (worker-side)
+let preReduceEnabled = false;       // PCA pre-reduction of UMAP features (worker-side); off by default
 let umapMetric       = 'euclidean'; // 'euclidean' | 'cosine' — UMAP distance
 let scaleFeatEnabled = false;       // append log(scale) feature dim (48k only — no-op without scales)
 let dedupEnabled     = false;       // collapse consecutive near-duplicate frames before the UMAP fit
@@ -754,6 +761,7 @@ let embedInput      = 'features';
 
 // SSM state (joint-only: A·A | A·B | B·B)
 let ssmBudget       = 1024;       // pixel budget P — caps the matrix at P×P (temporal pooling)
+let ssmPool         = 'mean';     // super-frame pooling: 'mean' (avg bin) | 'random' (1 real frame/bin)
 let ssmMetric       = 'cosine';   // 'cosine' | 'euclidean'
 let ssmImage        = null;       // { rgba:ImageData, w, h, scope, seam, pA, pB, T_A, T_B, vmin, vmax, metric }
 let ssmWorker       = null;
@@ -774,6 +782,13 @@ let umapFeatureData = null; // {flat,T_A,T_B,D,nNeighbors,minDist} — shared ac
 let viewZoom = 1;
 let viewPanX = 0;
 let viewPanY = 0;
+
+// Phrase manager state (declared early so autoRegenerate can live-capture)
+let phrases = [];
+let phraseSeq = 0;
+let activePhraseId = null;     // last played
+let editingPhraseId = null;    // phrase the canvas gesture currently feeds (drives canvasMode)
+let phraseAutoPlayTimer = null;
 
 // Canvas interaction / drag
 let canvasMode      = 'explore';  // 'explore' | 'draw' | 'pins'
@@ -830,6 +845,7 @@ let ctxSwapDist     = 0.3;  // UMAP-space radius for nearby-frame search
 // Playback
 let audioCtx            = null;
 let playJobId           = -1;
+let genTarget           = null;   // {phId,jobId,play,seq,sig,refs} — phrase awaiting its decode result
 let activeSrc           = null;
 let activeGain          = null;
 const XFADE_S           = 0.04;
@@ -1284,6 +1300,12 @@ function renderScatter() {
     snapMode, snapKVal, snapDurVal, framesPerSec: fps,
     srcAEnabled, srcBEnabled,
     pointColorsA, pointColorsB,
+    phraseFrames: (() => {
+      const p = phrases.find(x => x.id === (editingPhraseId ?? activePhraseId));
+      if (!p) return null;
+      const fr = activeFrames(p);
+      return p.maxFrames ? uniformSubsample(fr, p.maxFrames) : fr;   // show the points actually used
+    })(),
   });
   if (result !== null) lastTransform = result;
 }
@@ -1583,6 +1605,7 @@ function resizeCanvas() {
   scheduleRender();
 }
 new ResizeObserver(resizeCanvas).observe(umapCanvas.parentElement);
+requestAnimationFrame(resizeCanvas);   // size once on load (the observer doesn't always fire initially)
 
 // ── Workers ───────────────────────────────────────────────────────────────────
 
@@ -1912,7 +1935,7 @@ function ensureSSMInput() {
       resolve(si);
     };
     w.onerror = e => { w.terminate(); reject(new Error(e.message || 'SSM input failed')); };
-    w.postMessage({ type: 'compute_ssm_input', flat: fd.flat, T_A: fd.T_A, T_B: fd.T_B, D: fd.D, P });
+    w.postMessage({ type: 'compute_ssm_input', flat: fd.flat, T_A: fd.T_A, T_B: fd.T_B, D: fd.D, P, pool: ssmPool });
   });
 }
 
@@ -2003,7 +2026,7 @@ function launchSSM() {
   ssmWorker.postMessage({
     type: 'compute_ssm', jobId: activeSSMJobId,
     flat, T_A, T_B, D,
-    scope: 'joint', which: 'A', P, metric: ssmMetric,
+    scope: 'joint', which: 'A', P, metric: ssmMetric, pool: ssmPool,
   });
 }
 
@@ -2247,6 +2270,7 @@ function setProjectionMode(mode) {
   document.getElementById('wheelScaleRow') .style.display = mode === 'wheel' ? '' : 'none';
   document.getElementById('embedInputRow').style.display = (mode === 'umap' || mode === 'pca') ? '' : 'none';
   document.getElementById('ssmResRow')    .style.display = (mode === 'ssm' || mode === 'mds' || ssmInputActive) ? '' : 'none';
+  document.getElementById('ssmPoolRow')   .style.display = (mode === 'ssm' || mode === 'mds' || ssmInputActive) ? '' : 'none';
   document.getElementById('ssmMetricRow') .style.display = mode === 'ssm' ? '' : 'none';
   document.getElementById('trajPanel')     .style.display = mode === 'ssm' ? 'none' : '';
   slotWrap.classList.toggle('visible', mode === 'umap' && umapSlots.some(s => s));
@@ -3054,6 +3078,20 @@ async function runParallelDecode48k(embQuant, D, N, frameScales, isCurrent) {
 function onTrajectoryDecoded(decoded, channels, jobId) {
   if (jobId !== playJobId) return;
   const sr = mp.getSampleRate();
+  // If a phrase requested this decode, cache the result on it and (re)play via
+  // the shared loader so ▶ can replay instantly without decoding again.
+  if (genTarget && genTarget.jobId === jobId) {
+    const ph = phrases.find(p => p.id === genTarget.phId);
+    const { play, seq, sig, refs } = genTarget;
+    genTarget = null;
+    if (ph) {
+      ph.audio = { f32: decoded, sr, ch: channels };
+      ph.audioSeq = seq; ph.audioSig = sig; ph.audioRefs = refs; ph.audioDirty = false;
+      applyPhraseToPlayer(ph, play);
+      setStatus('');
+      return;
+    }
+  }
   lastRawPcm = decoded; lastRawPcmSr = sr; lastRawPcmCh = channels;
   stopTrajPlayback();
   playerG.setAudio(applyGenFade(decoded, sr, channels), sr, makeGenColorFn(), channels);
@@ -3899,6 +3937,9 @@ togPreReduce.addEventListener('click', () => {
   togPreReduce.textContent = preReduceEnabled ? 'On' : 'Off';
   if (projectionMode === 'umap') markDirty('COORDS', 'WAYPOINTS', 'AUDIO', 'RENDER');
 });
+document.getElementById('preReduceVar').addEventListener('change', () => {
+  if (preReduceEnabled && projectionMode === 'umap') markDirty('COORDS', 'WAYPOINTS', 'AUDIO', 'RENDER');
+});
 
 createToggleGroup([
   { el: document.getElementById('togMetricEuc'), value: 'euclidean' },
@@ -3965,6 +4006,8 @@ createToggleGroup([
   const ssmInputActive = embedInput === 'ssm' && (projectionMode === 'umap' || projectionMode === 'pca');
   document.getElementById('ssmResRow').style.display =
     (projectionMode === 'ssm' || projectionMode === 'mds' || ssmInputActive) ? '' : 'none';
+  document.getElementById('ssmPoolRow').style.display =
+    (projectionMode === 'ssm' || projectionMode === 'mds' || ssmInputActive) ? '' : 'none';
   document.getElementById('dedupRow').style.display =
     (projectionMode === 'umap' && !ssmInputActive) ? '' : 'none';
   relaunchScatter();
@@ -3982,6 +4025,16 @@ createToggleGroup([
 ], v => { ssmMetric = v; recomputeSSMIfActive(); });
 ssmBudgetEl.addEventListener('change', () => {
   if (umapFeatureData) umapFeatureData.ssmInput = null; // pooling budget changed
+  recomputeSSMIfActive();
+  if (projectionMode === 'mds' ||
+      (embedInput === 'ssm' && (projectionMode === 'umap' || projectionMode === 'pca'))) relaunchScatter();
+});
+createToggleGroup([
+  { el: document.getElementById('togPoolMean'), value: 'mean' },
+  { el: document.getElementById('togPoolRand'), value: 'random' },
+], v => {
+  ssmPool = v;
+  if (umapFeatureData) umapFeatureData.ssmInput = null; // pooling strategy changed
   recomputeSSMIfActive();
   if (projectionMode === 'mds' ||
       (embedInput === 'ssm' && (projectionMode === 'umap' || projectionMode === 'pca'))) relaunchScatter();
@@ -4546,7 +4599,7 @@ function startUMAPReduction() {
   umapWorker.postMessage({
     type: 'reduce_features', jobId: activeUMAPJobId,
     flat: fd.umapFlat, N: fd.umapTA + fd.umapTB, D: fd.umapD,
-    kMax: PRE_REDUCE_KMAX, varTarget: PRE_REDUCE_VAR,
+    kMax: PRE_REDUCE_KMAX, varTarget: Math.max(0.5, Math.min(0.999, parseFloat(document.getElementById('preReduceVar').value) || PRE_REDUCE_VAR)),
   });
 }
 
@@ -4836,8 +4889,8 @@ function updatePinSeqBar() {
 function setCanvasMode(mode) {
   canvasMode = mode;
   togExplore.classList.toggle('active', mode === 'explore');
-  togDraw   .classList.toggle('active', mode === 'draw');
-  togPins   .classList.toggle('active', mode === 'pins');
+  togDraw   && togDraw.classList.toggle('active', mode === 'draw');   // Draw/Pins top buttons removed;
+  togPins   && togPins.classList.toggle('active', mode === 'pins');   // canvas mode now driven by phrase cards
   umapCanvas.style.cursor = mode === 'pins' ? 'cell' : 'crosshair';
   if (mode === 'draw')    setStatus('Click and drag to draw. Each stroke adds a new segment.');
   if (mode === 'pins')    setStatus('Double-click near a UMAP point to add/remove pins.');
@@ -4850,9 +4903,7 @@ function setCanvasMode(mode) {
   autoRegenerate();
 }
 
-togExplore.addEventListener('click', () => setCanvasMode('explore'));
-togDraw   .addEventListener('click', () => setCanvasMode('draw'));
-togPins   .addEventListener('click', () => setCanvasMode('pins'));
+togExplore.addEventListener('click', () => { editingPhraseId = null; setCanvasMode('explore'); });
 
 // ── Canvas helpers ────────────────────────────────────────────────────────────
 
@@ -4958,7 +5009,12 @@ umapCanvas.addEventListener('mousedown', e => {
   }
   if (canvasMode === 'draw' && e.button === 0) {
     isDrawing = true;
-    rawDrawPoints = [canvasToUmap(e)];  // start fresh stroke; rawDrawSegments kept
+    rawDrawSegments = []; drawSegmentBoundaries = [];  // each new stroke REPLACES the old (a phrase = one selection)
+    // Drop the editing phrase's current selection now so the old highlight
+    // disappears the instant you start a new path (recaptured on mouse-up).
+    const _ep = phrases.find(p => p.id === editingPhraseId);
+    if (_ep) { _ep.byMode[_ep.selection] = []; _ep.traj[_ep.selection] = []; }
+    rawDrawPoints = [canvasToUmap(e)];
     trajAnchorPos = -1;
     scheduleRender();
     return;
@@ -5466,10 +5522,25 @@ function computeWaypoints() {
 }
 
 function autoRegenerate() {
-  if (userTrajectory.length >= 2 && (!currentEmbeds || !coordsA || !coordsB)) {
-    setStatus('Path drawn. Encode sources and run UMAP to play.');
-  }
-  markDirty('WAYPOINTS', 'AUDIO', 'RENDER');
+  // A canvas gesture LIVE-captures into the phrase being edited — into THIS mode's
+  // slot (path/bag/pins kept separately so switching modes doesn't lose the others)
+  // — re-renders the overlay, then auto-plays the phrase (debounced) so drawing/
+  // pinning regenerates audio immediately. Decodes through the phrase, so a Bag
+  // plays its enclosed points (not the loop as a path).
+  markDirty('RENDER');
+  const ph = phrases.find(p => p.id === editingPhraseId);
+  if (!ph) return;
+  const fr = captureFramesFor(ph);
+  if (!fr.length) return;
+  ph.byMode[ph.selection] = fr;
+  ph.traj[ph.selection]   = (userTrajectory || []).map(p => [p[0], p[1]]);  // raw path for interp
+  ph.audioDirty = true;                                                      // selection changed → re-decode
+  renderPhrases();
+  clearTimeout(phraseAutoPlayTimer);
+  phraseAutoPlayTimer = setTimeout(() => {
+    const p = phrases.find(x => x.id === editingPhraseId);
+    if (p && currentEmbeds) playPhrase(p);
+  }, 250);
 }
 
 // Build a per-position color function for the generated waveform based on the
@@ -5818,6 +5889,291 @@ function setupDecodeControl(embeds) {
 }
 
 createDecodePanel();
+
+// ════════════════════════════════════════════════════════════════════════════
+// PHRASE MANAGER (stage 1)
+// A phrase = an ordered list of real frames {src,idx} captured from the current
+// draw/pin gesture, plus playback config. Compiles to a genPlaySeq → decode →
+// generated player (reuses decodeTrajectory). Self-contained & serializable so a
+// future "sequence maker" can collect phrases.
+// ════════════════════════════════════════════════════════════════════════════
+// phrase state is declared near the top (canvasMode area) so autoRegenerate,
+// which runs during init, can reference it without a TDZ error.
+
+// (geometry helpers removed — phrases now snap via computeSnapWaypoints)
+function uniformSubsample(arr, n) {
+  if (!n || n >= arr.length) return arr.slice();
+  if (n === 1) return [arr[0]];
+  const out = [];
+  for (let i = 0; i < n; i++) out.push(arr[Math.round(i * (arr.length - 1) / (n - 1))]); // keeps endpoints
+  return out;
+}
+
+// ── capture from the current gesture ─────────────────────────────────────────
+// A phrase stores WAYPOINTS — the same snapped points the old snap/code path
+// modes use — via the shared computeSnapWaypoints(). The play sub-mode then
+// expands them (Contextual = snap context, Linear = repeat each). One capture
+// path for both Path (drawn) and Pins.
+function captureFramesFor(ph) {
+  if (!coordsA || !coordsB) return [];
+  const { wps } = computeSnapWaypoints({
+    canvasMode: ph.selection === 'pins' ? 'pins' : 'draw',
+    pinPoints: pinCoords(), coordsA, coordsB,
+    userTrajectory, pathMode: 'snap', snapMode: 'equal',
+    snapDurVal: ph.durationVal, codeSecVal: ph.durationVal, trajDuration: ph.durationVal,
+    framesPerSec: coordsA.length / srcDuration('A'),
+    drawSegmentBoundaries, enabledSrcs: getEnabledSrcs(),
+  });
+  return wps || [];
+}
+// Clear the canvas gesture so each phrase (and each fresh mode-select) starts on a
+// blank slate — otherwise strokes/pins accumulate and pollute the next selection
+// (a Bag polygon would include leftover strokes from earlier captures).
+function clearGesture() {
+  rawDrawSegments = []; rawDrawPoints = []; drawSegmentBoundaries = [];
+  pinPoints = []; userTrajectory = [];
+  scheduleRender();
+}
+// Frames captured for a phrase's CURRENT selection mode. Each mode keeps its own
+// slot, so switching path→bag→pins and back doesn't discard the earlier selection.
+function activeFrames(ph) { return (ph.byMode && ph.byMode[ph.selection]) || []; }
+
+function newPhrase() {
+  const ph = { id: ++phraseSeq, name: `phrase ${phraseSeq}`,
+               byMode: { path: [], pins: [] },   // snapped waypoints (contextual/step + highlight)
+               traj:   { path: [], pins: [] },   // raw drawn polyline (interp blends along this)
+               selection: 'path', playMode: 'contextual', cfMode: 'step', durationVal: 2, maxFrames: 0 };
+  phrases.push(ph);
+  editingPhraseId = ph.id;
+  clearGesture();
+  setCanvasMode('draw');
+  renderPhrases();
+  setStatus(`${ph.name}: pick Path/Bag/Pins and draw on the map — it captures live.`);
+}
+function setPhraseSelection(ph, mode) {
+  ph.selection = mode;
+  editingPhraseId = ph.id;
+  clearGesture();                                   // clear the live gesture; byMode keeps each mode's frames
+  setCanvasMode(mode === 'pins' ? 'pins' : 'draw');
+  renderPhrases();
+  // Switching restores this mode's selection — replay it so audio + the on-map
+  // highlight match what's now active (no-op the first time a mode is empty).
+  schedulePhrasePlay(ph);
+}
+// Debounced replay of a phrase (after a param/selection change). No-op if empty.
+function schedulePhrasePlay(ph) {
+  if (!currentEmbeds || !activeFrames(ph).length) return;
+  clearTimeout(phraseAutoPlayTimer);
+  phraseAutoPlayTimer = setTimeout(() => playPhrase(ph), 200);
+}
+// ── compile + play (reuses the decode pipeline) ──────────────────────────────
+// Waypoints → playable frame sequence. durationVal is SECONDS.
+//   Linear     = old "code" mode: hold each waypoint K frames over the length.
+//   Contextual = old "snap" mode: expand each waypoint with its real temporal
+//                neighbours (buildSnapSequenceFixed), filling the length.
+function compilePhraseSeq(ph) {
+  let wps = activeFrames(ph);
+  if (ph.maxFrames) wps = uniformSubsample(wps, ph.maxFrames);
+  if (!wps.length) return [];
+  const fps    = coordsA ? coordsA.length / srcDuration('A') : 1;
+  const Ntotal = Math.max(wps.length, Math.round(ph.durationVal * fps));
+
+  if (ph.playMode === 'context-free') {   // step (interp is handled directly in playPhrase)
+    const K = Math.max(1, Math.round(Ntotal / wps.length));
+    return wps.flatMap(wp => Array.from({ length: K }, () => ({ src: wp.src, idx: wp.idx })));
+  }
+  // contextual — snap-mode context expansion (needs the encoded embeddings for T)
+  if (!currentEmbeds) return wps.map(wp => ({ src: wp.src, idx: wp.idx }));
+  const is48k   = mp.getModelHz() === '48k';
+  const ctxMode = is48k ? 'sym' : 'pre';
+  const K_post  = is48k ? Math.max(2, Math.round(fps * 0.03)) : 0;
+  const snapCtx = { snapMode: 'equal', snapKVal: 8, snapDurVal: ph.durationVal, framesPerSec: fps, coordsA, coordsB };
+  return buildSnapSequenceFixed(wps, Ntotal, K_post, { prob: 0, range: 0 }, coordsA, coordsB, currentEmbeds, snapCtx, ctxMode);
+}
+// Builds the decode inputs for a phrase: { blended, D, N, scales, seq } or null.
+// Pure — does not touch the player or kick off a decode (so it can be cached).
+function buildPhraseDecode(ph) {
+  if (!currentEmbeds) return null;
+  const [, D, T_A] = currentEmbeds.embQuantDimsA;
+  const [, , T_B]  = currentEmbeds.embQuantDimsB;
+  const fps = coordsA ? coordsA.length / srcDuration('A') : 1;
+
+  let blended, N, scales = null, seq = null;
+
+  if (ph.playMode === 'context-free' && ph.cfMode === 'interp') {
+    // Interp: blend embeddings continuously along the RAW drawn path (2 nearest
+    // frames per sample, inverse-distance weighted) — no snapping to waypoints.
+    // The same nearest frame drives the playback cursor on the map.
+    const traj = ph.traj[ph.selection] || [];
+    if (traj.length < 2) return null;
+    N = Math.max(2, Math.round(ph.durationVal * fps));
+    const sA = currentEmbeds.scalesA, sB = currentEmbeds.scalesB;
+    if (sA || sB) scales = new Float32Array(N);
+    const scOf = (src, idx) => { const a = src === 'A' ? sA : sB; return a ? (a[idx] || 1) : 1; };
+    const cursorSeq = new Array(N);
+    blended = new Float32Array(D * N);
+    for (let i = 0; i < N; i++) {
+      const ti = (i / (N - 1)) * (traj.length - 1);
+      const lo = Math.floor(ti), hi = Math.min(lo + 1, traj.length - 1);
+      const t  = ti - lo;
+      const px = traj[lo][0] + t * (traj[hi][0] - traj[lo][0]);
+      const py = traj[lo][1] + t * (traj[hi][1] - traj[lo][1]);
+      // two nearest UMAP frames
+      let d1 = Infinity, d2 = Infinity, s1 = null, i1 = -1, s2 = null, i2 = -1;
+      const scan = (coords, src) => { if (!coords) return; for (let j = 0; j < coords.length; j++) {
+        const dd = (coords[j][0] - px) ** 2 + (coords[j][1] - py) ** 2;
+        if (dd < d1) { d2 = d1; s2 = s1; i2 = i1; d1 = dd; s1 = src; i1 = j; }
+        else if (dd < d2) { d2 = dd; s2 = src; i2 = j; } } };
+      if (srcAEnabled) scan(coordsA, 'A');
+      if (srcBEnabled) scan(coordsB, 'B');
+      const e1 = decEmb(s1), T1 = s1 === 'A' ? T_A : T_B;
+      const has2 = i2 >= 0, s2u = has2 ? s2 : s1, i2u = has2 ? i2 : i1;
+      const e2 = decEmb(s2u), T2 = s2u === 'A' ? T_A : T_B;
+      const sd1 = Math.sqrt(d1), sd2 = has2 ? Math.sqrt(d2) : 0, sum = sd1 + sd2;
+      const w1 = sum > 1e-12 ? sd2 / sum : 1, w2 = 1 - w1;
+      for (let d = 0; d < D; d++) blended[d * N + i] = w1 * e1[d * T1 + i1] + w2 * e2[d * T2 + i2u];
+      if (scales) scales[i] = w1 * scOf(s1, i1) + w2 * scOf(s2u, i2u);
+      cursorSeq[i] = w1 >= w2 ? { src: s1, idx: i1 } : { src: s2u, idx: i2u };
+    }
+    seq = cursorSeq;                      // nearest frame per step → moving cursor on the map
+  } else {
+    const dseq = compilePhraseSeq(ph);    // contextual or context-free/step
+    if (!dseq.length) return null;
+    N = dseq.length;
+    blended = new Float32Array(D * N);
+    for (let i = 0; i < N; i++) {
+      const { src, idx } = dseq[i];
+      const emb = decEmb(src); const T = src === 'A' ? T_A : T_B;
+      for (let d = 0; d < D; d++) blended[d * N + i] = emb[d * T + idx];
+    }
+    seq = dseq;                           // so the generated-player cursor highlights frames
+    scales = makeFrameScales(dseq, currentEmbeds);
+  }
+  return { blended, D, N, scales, seq };
+}
+
+// ── per-phrase audio cache ───────────────────────────────────────────────────
+// A phrase's decoded audio is kept on the phrase so ▶ replays instantly. It is
+// reused unless the phrase's params change (signature) or the underlying
+// embeddings/coords change (reference identity — re-encode, decode-mask, src
+// toggle, re-projection all swap those arrays).
+function phraseRefs() { return { eA: decEmb('A'), eB: decEmb('B'), cA: coordsA, cB: coordsB }; }
+function phraseSig(ph) {
+  return `${ph.selection}|${ph.playMode}|${ph.cfMode}|${ph.durationVal}|${ph.maxFrames}`;
+}
+function phraseCacheValid(ph) {
+  if (!ph.audio || ph.audioDirty || ph.audioSig !== phraseSig(ph)) return false;
+  const r = ph.audioRefs, c = phraseRefs();
+  return !!r && r.eA === c.eA && r.eB === c.eB && r.cA === c.cA && r.cB === c.cB;
+}
+
+// Load a phrase's (already-decoded) audio into the generated player + map.
+function applyPhraseToPlayer(ph, play) {
+  if (!ph || !ph.audio) return;
+  activePhraseId = ph.id;
+  genPlaySeq = ph.audioSeq || null;
+  const { f32, sr, ch } = ph.audio;
+  lastRawPcm = f32; lastRawPcmSr = sr; lastRawPcmCh = ch;
+  stopTrajPlayback();
+  if (play) playerG.stop();                                  // restart from 0
+  playerG.setAudio(applyGenFade(f32, sr, ch), sr, makeGenColorFn(), ch);
+  updateBookmarkBtn();
+  if (play) playerG.play();
+  scheduleRender();                                          // show selection + cursor on the map
+}
+
+// Decode a phrase (async) and cache the result; plays it when done if play=true.
+function generatePhrase(ph, play) {
+  const built = buildPhraseDecode(ph);
+  if (!built) { setStatus('Nothing to play — draw a path or add pins.', true); return; }
+  const { blended, D, N, scales, seq } = built;
+  activePhraseId = ph.id;
+  getAudioCtx();
+  playJobId = ++jobSeq;
+  genTarget = { phId: ph.id, jobId: playJobId, play, seq, sig: phraseSig(ph), refs: phraseRefs() };
+  setStatus(`Decoding ${ph.name} (${N} frames)…`);
+  decodeTrajectory(blended, D, N, scales || null);
+}
+
+function playPhrase(ph) {
+  if (!currentEmbeds) { setStatus('Encode first.', true); return; }
+  if (phraseCacheValid(ph)) { applyPhraseToPlayer(ph, true); setStatus(`${ph.name} ▸`); return; }  // instant, no decode
+  generatePhrase(ph, true);
+}
+
+// ── panel UI: one self-contained card per phrase ─────────────────────────────
+const phrasePanel = document.createElement('div');
+phrasePanel.id = 'phrasePanel';
+phrasePanel.style.cssText =
+  'position:absolute;top:8px;right:8px;z-index:30;width:218px;background:rgba(20,24,30,.92);' +
+  'border:1px solid #2a2f3a;border-radius:7px;padding:8px 10px;font:11px/1.4 ui-monospace,Menlo,monospace;color:#cfd6e0;backdrop-filter:blur(3px);';
+phrasePanel.innerHTML =
+  '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">' +
+    '<span style="color:#5db0ff;font-weight:600">Phrases</span>' +
+    '<button class="tog" id="phNew" style="padding:2px 8px">＋ New</button></div>' +
+  '<div id="phList" style="max-height:62vh;overflow-y:auto;display:flex;flex-direction:column;gap:6px"></div>';
+document.getElementById('umapWrap').appendChild(phrasePanel);
+
+const _seltab = (ph, mode, label) =>
+  `<button class="tog ${ph.selection === mode ? 'active' : ''}" data-act="sel" data-mode="${mode}" data-id="${ph.id}" style="flex:1">${label}</button>`;
+const _pmtab = (ph, mode, label) =>
+  `<button class="tog ${ph.playMode === mode ? 'active' : ''}" data-act="pmode" data-mode="${mode}" data-id="${ph.id}" style="flex:1">${label}</button>`;
+const _cftab = (ph, mode, label) =>
+  `<button class="tog ${ph.cfMode === mode ? 'active' : ''}" data-act="cfmode" data-mode="${mode}" data-id="${ph.id}" style="flex:1">${label}</button>`;
+
+function phraseCardHTML(ph) {
+  const nf = activeFrames(ph).length;
+  const used = nf ? (ph.maxFrames ? Math.min(ph.maxFrames, nf) : nf) + 'f' : '—';
+  const editing = ph.id === editingPhraseId;
+  return (
+    `<div class="ph-card" data-id="${ph.id}" style="border:1px solid ${editing ? '#5db0ff' : '#2a2f3a'};border-radius:6px;padding:6px 7px;background:${editing ? 'rgba(93,176,255,.08)' : 'transparent'}">` +
+      `<div style="display:flex;align-items:center;gap:4px;margin-bottom:4px">` +
+        `<button class="tog" data-act="play" data-id="${ph.id}" title="Play" style="padding:1px 6px">▶</button>` +
+        `<input data-field="name" data-id="${ph.id}" value="${ph.name}" style="flex:1;min-width:0;background:#171b22;border:1px solid #2a2f3a;color:#cfd6e0;border-radius:4px;padding:2px 4px;font:inherit">` +
+        `<span style="color:#6b7585;font-size:10px">${used}</span>` +
+        `<button class="tog" data-act="del" data-id="${ph.id}" title="Delete" style="padding:1px 6px;color:#ff6b6b">✕</button></div>` +
+      `<div class="row" style="gap:3px">${_seltab(ph, 'path', 'Path')}${_seltab(ph, 'pins', 'Pins')}</div>` +
+      `<div class="row" style="gap:3px">${_pmtab(ph, 'contextual', 'Contextual')}${_pmtab(ph, 'context-free', 'Context-free')}</div>` +
+      `<div class="row" style="gap:3px;${ph.playMode === 'context-free' ? '' : 'display:none'}">${_cftab(ph, 'step', 'Step')}${_cftab(ph, 'interp', 'Interp')}</div>` +
+      `<div class="row"><span class="lbl">Length</span>` +
+        `<input type="number" data-field="durval" data-id="${ph.id}" value="${ph.durationVal}" min="0.1" step="0.1" style="width:54px;flex:none">` +
+        `<span style="font-size:10px;color:#6b7585;margin-left:4px">s</span></div>` +
+      `<div class="row"><span class="lbl">Max</span>` +
+        `<input type="number" data-field="max" data-id="${ph.id}" value="${ph.maxFrames}" min="0" step="1" style="width:52px;flex:none">` +
+        `<span style="font-size:10px;color:#6b7585;margin-left:4px">0=∞</span></div>` +
+    `</div>`
+  );
+}
+function renderPhrases() {
+  const list = document.getElementById('phList');
+  if (!phrases.length) { list.innerHTML = '<div style="color:#6b7585">No phrases — click ＋ New.</div>'; return; }
+  list.innerHTML = phrases.map(phraseCardHTML).join('');
+}
+
+document.getElementById('phNew').addEventListener('click', newPhrase);
+document.getElementById('phList').addEventListener('click', e => {
+  const b = e.target.closest('button[data-act]'); if (!b) return;
+  const ph = phrases.find(p => p.id === +b.dataset.id); if (!ph) return;
+  switch (b.dataset.act) {
+    case 'sel':     setPhraseSelection(ph, b.dataset.mode); break;
+    case 'pmode':   ph.playMode = b.dataset.mode; editingPhraseId = ph.id; renderPhrases(); schedulePhrasePlay(ph); break;
+    case 'cfmode':  ph.cfMode = b.dataset.mode; editingPhraseId = ph.id; renderPhrases(); schedulePhrasePlay(ph); break;
+    case 'play':    playPhrase(ph); break;
+    case 'del':     phrases = phrases.filter(p => p.id !== ph.id);
+                    if (editingPhraseId === ph.id) editingPhraseId = null;
+                    if (activePhraseId === ph.id) activePhraseId = null;
+                    renderPhrases(); break;
+  }
+});
+document.getElementById('phList').addEventListener('change', e => {
+  const el = e.target.closest('[data-field]'); if (!el) return;
+  const ph = phrases.find(p => p.id === +el.dataset.id); if (!ph) return;
+  const f = el.dataset.field;
+  if (f === 'name') ph.name = el.value;
+  else if (f === 'max')    { ph.maxFrames  = Math.max(0,   parseInt(el.value)   || 0); renderPhrases(); schedulePhrasePlay(ph); }
+  else if (f === 'durval') { ph.durationVal = Math.max(0.1, parseFloat(el.value) || 2); schedulePhrasePlay(ph); }
+});
+renderPhrases();
 
 // ════════════════════════════════════════════════════════════════════════════
 // Live stats overlay (bottom-right): RAM + per-thread CPU busy%.

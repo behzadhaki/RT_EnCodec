@@ -55,6 +55,7 @@ export function renderScatter(canvas, dpr, state) {
     snapMode, snapKVal, snapDurVal, framesPerSec, canvasMode,
     srcAEnabled = true, srcBEnabled = true,
     pointColorsA = null, pointColorsB = null,
+    phraseFrames = null,
   } = state;
 
   function drawTrail(coords, color) {
@@ -367,6 +368,36 @@ export function renderScatter(canvas, dpr, state) {
       ctx.fill(); ctx.stroke();
       ctx.restore();
     }
+  }
+
+  // ── Active phrase selection (the frames currently captured for the phrase
+  //     being edited) — highlighted so the map always shows what's selected,
+  //     updating live on each draw/pin and persisting across mode switches. ──
+  if (phraseFrames && phraseFrames.length) {
+    const ptOf = ({ src, idx }) => (src === 'A' ? coordsA[idx] : coordsB[idx]);
+    ctx.save();
+    if (phraseFrames.length >= 2) {
+      ctx.strokeStyle = '#5db0ff';
+      ctx.lineWidth   = 1.4 * dpr;
+      ctx.globalAlpha = 0.7;
+      ctx.beginPath();
+      let started = false;
+      for (const f of phraseFrames) {
+        const p = ptOf(f); if (!p) continue;
+        started ? ctx.lineTo(toX(p[0]), toY(p[1])) : (ctx.moveTo(toX(p[0]), toY(p[1])), started = true);
+      }
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 0.95;
+    ctx.fillStyle   = '#5db0ff';
+    for (const f of phraseFrames) {
+      const p = ptOf(f); if (!p) continue;
+      ctx.beginPath(); ctx.arc(toX(p[0]), toY(p[1]), 3.5 * dpr, 0, 2 * Math.PI); ctx.fill();
+    }
+    const a = ptOf(phraseFrames[0]), b = ptOf(phraseFrames[phraseFrames.length - 1]);
+    if (a) { ctx.fillStyle = '#44ff88'; ctx.beginPath(); ctx.arc(toX(a[0]), toY(a[1]), 5 * dpr, 0, 2 * Math.PI); ctx.fill(); }
+    if (b) { ctx.fillStyle = '#ff4466'; ctx.beginPath(); ctx.arc(toX(b[0]), toY(b[1]), 5 * dpr, 0, 2 * Math.PI); ctx.fill(); }
+    ctx.restore();
   }
 
   return lastTransform;
