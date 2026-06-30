@@ -1228,7 +1228,17 @@ function setSnapSeqInfo(snapFrames, snapPlayFrames) {
 }
 
 function getAudioCtx() {
-  if (!audioCtx) audioCtx = new AudioContext();
+  if (!audioCtx) {
+    audioCtx = new AudioContext();
+    // The OS/browser can suspend or (Safari/macOS) "interrupt" the context on its
+    // own — most often when the audio output device changes (headphones, Bluetooth,
+    // interface, sample-rate switch) or the tab is backgrounded. Nothing else
+    // resumes it, so playback would stay dead until a reload. Auto-resume instead.
+    audioCtx.onstatechange = () => {
+      if (audioCtx && audioCtx.state !== 'running' && audioCtx.state !== 'closed') audioCtx.resume().catch(() => {});
+    };
+  }
+  if (audioCtx.state !== 'running' && audioCtx.state !== 'closed') audioCtx.resume().catch(() => {});
   return audioCtx;
 }
 

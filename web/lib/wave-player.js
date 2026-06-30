@@ -128,6 +128,12 @@ export function makeWavePlayer(canvasId, waveColor, { getAudioCtx, getMasterDest
   function doPlay(offset, xfade = false) {
     if (!audio) return;
     const ctx = getAudioCtx();
+    // If the context was suspended/interrupted, its clock is frozen — scheduling
+    // start() now would be silent. Resume first, then retry once it's running.
+    if (ctx.state !== 'running') {
+      ctx.resume().then(() => doPlay(offset, xfade)).catch(() => {});
+      return;
+    }
     const now = ctx.currentTime;
 
     const oldSrc  = srcNode;
