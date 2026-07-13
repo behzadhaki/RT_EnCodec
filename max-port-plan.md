@@ -79,68 +79,52 @@ ncs.rt.<model>_<variant>.<operation>     # real-time
 ncs.<model>_<variant>.<operation>        # buffer
 ```
 
-### SNAC -- 18 modules (6 per variant)
+### SNAC -- 24 modules (4 buffer + 4 RT per variant)
 
 ```
-ncs.snac_24k.encode              ncs.rt.snac_24k.encode
+ncs.snac_24k.encode              ncs.rt.snac_24k.encode~
 ncs.snac_24k.vq                  ncs.rt.snac_24k.vq
 ncs.snac_24k.embedcodes          ncs.rt.snac_24k.embedcodes
-ncs.snac_24k.decode              ncs.rt.snac_24k.decode
-ncs.snac_24k.encode~             ncs.rt.snac_24k.encode~
-ncs.snac_24k.decode~             ncs.rt.snac_24k.decode~
+ncs.snac_24k.decode              ncs.rt.snac_24k.decode~
 
-ncs.snac_32k.encode              ncs.rt.snac_32k.encode
+ncs.snac_32k.encode              ncs.rt.snac_32k.encode~
 ncs.snac_32k.vq                  ncs.rt.snac_32k.vq
 ncs.snac_32k.embedcodes          ncs.rt.snac_32k.embedcodes
-ncs.snac_32k.decode              ncs.rt.snac_32k.decode
-ncs.snac_32k.encode~             ncs.rt.snac_32k.encode~
-ncs.snac_32k.decode~             ncs.rt.snac_32k.decode~
+ncs.snac_32k.decode              ncs.rt.snac_32k.decode~
 
-ncs.snac_44k.encode              ncs.rt.snac_44k.encode
+ncs.snac_44k.encode              ncs.rt.snac_44k.encode~
 ncs.snac_44k.vq                  ncs.rt.snac_44k.vq
 ncs.snac_44k.embedcodes          ncs.rt.snac_44k.embedcodes
-ncs.snac_44k.decode              ncs.rt.snac_44k.decode
-ncs.snac_44k.encode~             ncs.rt.snac_44k.encode~
-ncs.snac_44k.decode~             ncs.rt.snac_44k.decode~
+ncs.snac_44k.decode              ncs.rt.snac_44k.decode~
 ```
 
-### EnCodec 24 kHz -- 30 modules (6 per bandwidth)
+### EnCodec 24 kHz -- 40 modules (4 buffer + 4 RT per bandwidth)
 
 ```
-ncs.encodec_24k_1.5kbps.encode       ncs.rt.encodec_24k_1.5kbps.encode
+ncs.encodec_24k_1.5kbps.encode       ncs.rt.encodec_24k_1.5kbps.encode~
 ncs.encodec_24k_1.5kbps.vq           ncs.rt.encodec_24k_1.5kbps.vq
 ncs.encodec_24k_1.5kbps.embedcodes   ncs.rt.encodec_24k_1.5kbps.embedcodes
-ncs.encodec_24k_1.5kbps.decode       ncs.rt.encodec_24k_1.5kbps.decode
-ncs.encodec_24k_1.5kbps.encode~      ncs.rt.encodec_24k_1.5kbps.encode~
-ncs.encodec_24k_1.5kbps.decode~      ncs.rt.encodec_24k_1.5kbps.decode~
+ncs.encodec_24k_1.5kbps.decode       ncs.rt.encodec_24k_1.5kbps.decode~
 
-ncs.encodec_24k_3kbps.encode         ncs.rt.encodec_24k_3kbps.encode
+ncs.encodec_24k_3kbps.encode         ncs.rt.encodec_24k_3kbps.encode~
 ncs.encodec_24k_3kbps.vq             ncs.rt.encodec_24k_3kbps.vq
 ncs.encodec_24k_3kbps.embedcodes     ncs.rt.encodec_24k_3kbps.embedcodes
-ncs.encodec_24k_3kbps.decode         ncs.rt.encodec_24k_3kbps.decode
-ncs.encodec_24k_3kbps.encode~        ncs.rt.encodec_24k_3kbps.encode~
-ncs.encodec_24k_3kbps.decode~        ncs.rt.encodec_24k_3kbps.decode~
+ncs.encodec_24k_3kbps.decode         ncs.rt.encodec_24k_3kbps.decode~
 
-ncs.encodec_24k_6kbps.encode         ncs.rt.encodec_24k_6kbps.encode
+ncs.encodec_24k_6kbps.encode         ncs.rt.encodec_24k_6kbps.encode~
 ncs.encodec_24k_6kbps.vq             ncs.rt.encodec_24k_6kbps.vq
 ncs.encodec_24k_6kbps.embedcodes     ncs.rt.encodec_24k_6kbps.embedcodes
-ncs.encodec_24k_6kbps.decode         ncs.rt.encodec_24k_6kbps.decode
-ncs.encodec_24k_6kbps.encode~        ncs.rt.encodec_24k_6kbps.encode~
-ncs.encodec_24k_6kbps.decode~        ncs.rt.encodec_24k_6kbps.decode~
+ncs.encodec_24k_6kbps.decode         ncs.rt.encodec_24k_6kbps.decode~
 
-ncs.encodec_24k_12kbps.encode        ncs.rt.encodec_24k_12kbps.encode
+ncs.encodec_24k_12kbps.encode        ncs.rt.encodec_24k_12kbps.encode~
 ncs.encodec_24k_12kbps.vq            ncs.rt.encodec_24k_12kbps.vq
 ncs.encodec_24k_12kbps.embedcodes    ncs.rt.encodec_24k_12kbps.embedcodes
-ncs.encodec_24k_12kbps.decode        ncs.rt.encodec_24k_12kbps.decode
-ncs.encodec_24k_12kbps.encode~       ncs.rt.encodec_24k_12kbps.encode~
-ncs.encodec_24k_12kbps.decode~       ncs.rt.encodec_24k_12kbps.decode~
+ncs.encodec_24k_12kbps.decode        ncs.rt.encodec_24k_12kbps.decode~
 
-ncs.encodec_24k_24kbps.encode        ncs.rt.encodec_24k_24kbps.encode
+ncs.encodec_24k_24kbps.encode        ncs.rt.encodec_24k_24kbps.encode~
 ncs.encodec_24k_24kbps.vq            ncs.rt.encodec_24k_24kbps.vq
 ncs.encodec_24k_24kbps.embedcodes    ncs.rt.encodec_24k_24kbps.embedcodes
-ncs.encodec_24k_24kbps.decode        ncs.rt.encodec_24k_24kbps.decode
-ncs.encodec_24k_24kbps.encode~       ncs.rt.encodec_24k_24kbps.encode~
-ncs.encodec_24k_24kbps.decode~       ncs.rt.encodec_24k_24kbps.decode~
+ncs.encodec_24k_24kbps.decode        ncs.rt.encodec_24k_24kbps.decode~
 ```
 
 ### EnCodec 48 kHz -- 16 modules (4 per bandwidth, no ~ variants)
