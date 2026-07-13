@@ -4763,6 +4763,18 @@ function getMasterDest() {
   return masterDest;
 }
 
+// Rebuild the whole audio engine on a fresh AudioContext. Use when the context
+// is wedged — typically it still reads "running" (the waveform animates) but is
+// silent because the output device it was bound to changed or went away. This is
+// the classic "have to restart the app to get sound back"; this does it without
+// a reload — the next play creates its nodes on the new context.
+function resetAudioContext() {
+  try { if (audioCtx && audioCtx.state !== 'closed') audioCtx.close(); } catch (_) {}
+  audioCtx = null; masterDest = null; notchFilters = [];
+  getAudioCtx();                       // fresh context; post-proc rebuilds lazily on next play
+  setStatus('Audio engine reset — press play.');
+}
+
 function updateNotchFilters() {
   if (!audioCtx || !masterDest) return;
   const maxFreq = audioCtx.sampleRate / 2 - 1;
@@ -4827,6 +4839,28 @@ playerB.setLoopBtn(document.getElementById('wbLoopB'));
 playerG.setPlayBtn(document.getElementById('wbPlayG'));
 playerG.setLoopBtn(document.getElementById('wbLoopG'));
 renderBookmarkList();
+
+// ── Audio-engine resilience ──────────────────────────────────────────────────
+// Resume an interrupted/suspended context from inside a real user gesture (some
+// browsers — notably Safari/macOS — only honour resume() during a gesture, so
+// the resume inside the async decode callback gets silently rejected).
+['pointerdown', 'keydown', 'touchstart'].forEach(ev =>
+  window.addEventListener(ev, () => {
+    if (audioCtx && audioCtx.state !== 'running' && audioCtx.state !== 'closed') audioCtx.resume().catch(() => {});
+  }, { capture: true, passive: true }));
+
+// A default-output-device change (headphones, Bluetooth, interface, the OS
+// switching sinks) leaves an existing context bound to the old, now-silent
+// device — it keeps reading "running" and the waveform animates, but there is no
+// sound. While nothing is playing, drop the context so the next play rebuilds on
+// the current device.
+if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) {
+  navigator.mediaDevices.addEventListener('devicechange', () => {
+    if ([playerA, playerB, playerG].some(p => p.isPlaying && p.isPlaying())) return;
+    try { if (audioCtx && audioCtx.state !== 'closed') audioCtx.close(); } catch (_) {}
+    audioCtx = null; masterDest = null; notchFilters = [];
+  });
+}
 
 ['A', 'B', 'G'].forEach(id => {
   const p = id === 'A' ? playerA : id === 'B' ? playerB : playerG;
@@ -6208,7 +6242,10 @@ renderPhrases();
   panel.title = 'Click to collapse';
   host.appendChild(panel);
   let collapsed = false;
-  panel.addEventListener('click', () => { collapsed = !collapsed; });
+  panel.addEventListener('click', (e) => {
+    if (e.target && e.target.id === 'audioResetBtn') { e.stopPropagation(); resetAudioContext(); return; }
+    collapsed = !collapsed;
+  });
 
   // main-thread busy via timer drift
   let mBusy = 0, mWall = 0, mLast = performance.now(), mPrevB = 0, mPrevW = 0;
@@ -6270,7 +6307,7 @@ renderPhrases();
       const mem = r.loaded ? (MODEL_BYTES[r.model] || 0) : r.heap;   // worker JS heap is hidden by Chrome; show its model RAM
       html += `<div>${r.label.padEnd(9)}<span style="color:${col}">${bar(r.busyPct)}</span>${String(Math.round(r.busyPct)).padStart(4)}% <span style="color:#6b7585">${fmtMB(mem)}</span></div>`;
     });
-    html += `<div style="color:#6b7585;margin-top:3px">audio ${audioCtx ? audioCtx.state : 'none'} · cpu n/a</div>`;
+    html += `<div style="color:#6b7585;margin-top:3px">audio ${audioCtx ? audioCtx.state : 'none'} · <span id="audioResetBtn" style="color:#5db0ff;cursor:pointer;text-decoration:underline">↻ reset</span></div>`;
     panel.innerHTML = html;
   }
   setInterval(tick, 600);
