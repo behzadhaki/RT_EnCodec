@@ -1,0 +1,826 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EnCodec Modulation Curves</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background: #111; color: #ccc; font: 12px/1.4 system-ui, sans-serif;
+  padding: 16px; display: flex; gap: 16px; align-items: flex-start;
+  min-height: 100vh;
+}
+h1 { font-size: 13px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: #888; margin-bottom: 8px; }
+h2 { font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: #666; margin-bottom: 4px; }
+#left { display: flex; flex-direction: column; gap: 10px; min-width: 280px; max-width: 320px; flex-shrink: 0; }
+#right { flex: 1; min-width: 0; }
+
+.section {
+  background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 6px; padding: 10px 12px;
+}
+.row { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; }
+.row:last-child { margin-bottom: 0; }
+.lbl { font-size: 11px; color: #888; min-width: 5em; flex-shrink: 0; }
+
+button, select, input {
+  font: inherit; background: #252525; border: 1px solid #333; color: #ccc;
+  border-radius: 3px; padding: 3px 8px; cursor: pointer;
+}
+button:hover { background: #333; border-color: #555; }
+button:disabled { opacity: 0.4; cursor: default; }
+button.active { background: #2a5a8a; border-color: #4a8aca; }
+select { cursor: pointer; }
+input[type=number] { width: 48px; padding: 2px 4px; cursor: text; }
+input[type=range] { flex: 1; accent-color: #4a8aca; cursor: pointer; min-width: 40px; }
+
+#dropZone {
+  border: 2px dashed #333; border-radius: 6px; padding: 24px 16px;
+  text-align: center; cursor: pointer; transition: border-color .2s;
+  font-size: 13px; color: #666;
+}
+#dropZone.dragover { border-color: #4a8aca; background: #1a2a3a; }
+#dropZone.hasFile { border-color: #3a6a3a; }
+#fileInfo { font-size: 11px; color: #888; margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+#canvasWrap { position: relative; }
+#curveCanvas { width: 100%; height: 320px; display: block; background: #0d0d0d; border-radius: 4px; }
+#canvasOverlay {
+  position: absolute; top: 0; left: 0; right: 0; bottom: 0;
+  pointer-events: none; font-size: 10px; color: #555;
+  padding: 4px 6px;
+}
+#canvasOverlay > span { position: absolute; }
+#canvasOverlay .tl { top: 0; left: 0; }
+#canvasOverlay .tr { top: 0; right: 0; text-align: right; }
+#canvasOverlay .bl { bottom: 0; left: 0; }
+#canvasOverlay .br { bottom: 0; right: 0; text-align: right; }
+
+#midiControls { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+#midiPorts { flex: 1; min-width: 100px; }
+
+#levelGrid {
+  display: grid; grid-template-columns: auto auto auto auto 1fr auto;
+  gap: 3px 6px; align-items: center; margin-top: 4px;
+  font-size: 11px;
+}
+#levelGrid .header { color: #555; font-size: 10px; letter-spacing: 0.05em; }
+#levelGrid .lvl-num { text-align: right; color: #888; min-width: 2em; }
+#levelGrid .lvl-color { width: 12px; height: 12px; border-radius: 50%; border: 1px solid #333; }
+#levelGrid .lvl-cc { width: 40px; }
+#levelGrid .lvl-smooth { width: 56px; }
+#levelGrid .lvl-gain { width: 56px; }
+#levelGrid .lvl-enable { justify-self: center; accent-color: #4a8aca; cursor: pointer; }
+
+#controlsRow { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-top: 6px; }
+
+#statusBar { font-size: 11px; color: #666; flex: 1; }
+#statusBar.active { color: #8a8; }
+#statusBar.error { color: #c66; }
+
+#legend { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 4px; font-size: 10px; }
+.legend-item { display: flex; align-items: center; gap: 3px; cursor: default; }
+.legend-swatch { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+
+#midiInfo { font-size: 10px; color: #555; margin-top: 2px; }
+
+.hidden { display: none !important; }
+
+#trimModal {
+  position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+  background: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center;
+  z-index: 100;
+}
+#trimModal > div {
+  background: #1a1a1a; border: 1px solid #333; border-radius: 8px;
+  padding: 20px 24px; text-align: center; max-width: 320px;
+}
+#trimModal h3 { font-size: 13px; color: #ccc; margin-bottom: 8px; font-weight: 600; }
+#trimModal p { font-size: 11px; color: #888; margin-bottom: 12px; }
+#trimModal .btns { display: flex; gap: 6px; justify-content: center; }
+#trimModal button { padding: 6px 14px; font-size: 12px; }
+</style>
+</head>
+<body>
+
+<div id="left">
+  <div class="section">
+    <h1>EnCodec Mod Curves</h1>
+    <div id="dropZone">
+      <div id="dropIcon">&#9654; Drop audio file or click</div>
+      <div id="fileInfo"></div>
+    </div>
+    <input type="file" id="fileInput" accept="audio/*" hidden>
+  </div>
+
+  <div class="section" style="display:flex;flex-direction:column;gap:4px">
+    <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+      <span class="lbl" style="min-width:auto">Model</span>
+      <select id="modelSelect" style="flex:1;min-width:80px">
+        <optgroup label="EnCodec">
+          <option value="encodec:24k">24 kHz</option>
+          <option value="encodec:48k">48 kHz</option>
+        </optgroup>
+        <optgroup label="SNAC">
+          <option value="snac:24khz">24 kHz</option>
+          <option value="snac:32khz">32 kHz</option>
+          <option value="snac:44khz">44 kHz</option>
+        </optgroup>
+      </select>
+      <span id="bwLabel" class="lbl" style="min-width:auto">BW</span>
+      <select id="bwSelect" style="flex:1;min-width:60px">
+        <option value="1.5">1.5 kbps</option>
+        <option value="3">3 kbps</option>
+        <option value="6">6 kbps</option>
+        <option value="12">12 kbps</option>
+        <option value="24">24 kbps</option>
+      </select>
+      <span class="lbl" style="min-width:auto">Δ</span>
+      <select id="metricSelect" style="width:64px">
+        <option value="l2">L2</option>
+        <option value="cosine">Cos</option>
+      </select>
+      <span class="lbl" style="min-width:auto">Up</span>
+      <select id="upsampleSelect" style="width:64px">
+        <option value="lerp">Lerp</option>
+        <option value="step">Step</option>
+      </select>
+    </div>
+    <div style="display:flex;gap:6px">
+      <button id="encodeBtn" disabled style="flex:1">Encode</button>
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>MIDI Output</h2>
+    <div id="midiControls">
+      <select id="midiPorts"><option value="">— no port —</option></select>
+      <span style="font-size:10px;color:#555">rate</span>
+      <select id="rateSelect">
+        <option value="1">1×</option>
+        <option value="2">2× (½ rate)</option>
+        <option value="4">4× (¼ rate)</option>
+        <option value="8">8×</option>
+      </select>
+    </div>
+  </div>
+
+  <div class="section" style="flex:1">
+    <div style="display:flex;justify-content:space-between;align-items:center">
+      <h2 style="margin-bottom:0">Levels</h2>
+      <span id="frameInfo" style="font-size:10px;color:#555"></span>
+    </div>
+    <div id="levelGrid">
+      <span class="header">#</span>
+      <span></span>
+      <span class="header">CC</span>
+      <span class="header">Smth</span>
+      <span class="header">Gain</span>
+      <span class="header">On</span>
+    </div>
+  </div>
+</div>
+
+<div id="right">
+  <div class="section" id="canvasWrap">
+    <canvas id="curveCanvas"></canvas>
+    <div id="canvasOverlay">
+      <span class="tl" id="infoModel"></span>
+      <span class="tr" id="infoDuration"></span>
+      <span class="bl" id="infoFrames"></span>
+      <span class="br" id="infoCursor"></span>
+    </div>
+  </div>
+
+  <div id="controlsRow">
+    <button id="playAudioBtn" disabled>&#9654; Audio</button>
+    <button id="playBtn" disabled>&#9654; Play MIDI</button>
+    <button id="stopBtn" disabled>&#9632; Stop</button>
+    <span id="statusBar">Load audio and press Encode.</span>
+  </div>
+
+  <div id="legend"></div>
+  <div id="midiInfo"></div>
+</div>
+
+<div id="trimModal" class="hidden">
+  <div>
+    <h3>Audio exceeds visible range</h3>
+    <p id="trimInfo"></p>
+    <div class="btns">
+      <button id="trim10s" data-secs="10">10 sec</button>
+      <button id="trim20s" data-secs="20">20 sec</button>
+      <button id="trimFull" data-secs="-1">Full file</button>
+    </div>
+  </div>
+</div>
+
+<script type="module">
+const COLORS = [
+  '#ff4444','#ff8800','#ffcc00','#44cc44','#00ccaa','#3388ff',
+  '#7744ff','#cc44ff','#ff66aa','#aa8866','#88ddcc','#88aaff',
+];
+
+const DPR = devicePixelRatio || 1;
+
+const dropZone    = document.getElementById('dropZone');
+const fileInput   = document.getElementById('fileInput');
+const fileInfo    = document.getElementById('fileInfo');
+const modelSelect = document.getElementById('modelSelect');
+const bwSelect    = document.getElementById('bwSelect');
+const metricSelect = document.getElementById('metricSelect');
+const upsampleSelect = document.getElementById('upsampleSelect');
+const bwLabel     = document.getElementById('bwLabel');
+const encodeBtn   = document.getElementById('encodeBtn');
+const midiPorts   = document.getElementById('midiPorts');
+const rateSelect  = document.getElementById('rateSelect');
+const levelGrid   = document.getElementById('levelGrid');
+const canvas      = document.getElementById('curveCanvas');
+const legendEl    = document.getElementById('legend');
+const statusBar   = document.getElementById('statusBar');
+const playAudioBtn = document.getElementById('playAudioBtn');
+const playBtn     = document.getElementById('playBtn');
+const stopBtn     = document.getElementById('stopBtn');
+const infoModel   = document.getElementById('infoModel');
+const infoDuration = document.getElementById('infoDuration');
+const infoFrames  = document.getElementById('infoFrames');
+const infoCursor  = document.getElementById('infoCursor');
+const frameInfo   = document.getElementById('frameInfo');
+const midiInfoEl  = document.getElementById('midiInfo');
+
+let worker, workerReady = false, jobSeq = 0;
+let audioBuffer = null, audioSr = 0, audioFile = null;
+let curves = null, nLevels = 0, nFrames = 0, hopSize = 320;
+let midiAccess = null, midiOut = null, playing = false;
+let playTimer = null, playFrame = 0;
+let audioCtx = null, audioPlaying = false, audioPlayFrame = 0, audioRAF = null;
+let smoothCurves = null;
+
+const levelState = []; // [{cc, enabled, smooth, gain, color}]
+
+function showTrimModal(totalSec) {
+  return new Promise((resolve) => {
+    const modal = document.getElementById('trimModal');
+    document.getElementById('trimInfo').textContent =
+      totalSec.toFixed(1) + 's total. Select length to keep:';
+    modal.classList.remove('hidden');
+    const btns = modal.querySelectorAll('button');
+    const cleanup = () => { modal.classList.add('hidden'); };
+    for (const btn of btns) {
+      btn.onclick = () => {
+        cleanup();
+        const secs = parseInt(btn.dataset.secs);
+        resolve(secs > 0 ? secs : totalSec);
+      };
+    }
+  });
+}
+
+function setStatus(msg, cls = '') {
+  statusBar.textContent = msg;
+  statusBar.className = cls;
+}
+
+function updateBWVisibility() {
+  const isEnCodec = modelSelect.value.startsWith('encodec:');
+  bwSelect.style.display = isEnCodec ? '' : 'none';
+  bwLabel.style.display = isEnCodec ? '' : 'none';
+}
+modelSelect.addEventListener('change', updateBWVisibility);
+updateBWVisibility();
+
+function updateEncodeBtn() {
+  encodeBtn.disabled = !workerReady || !audioFile;
+}
+
+function initWorker() {
+  const workerUrl = new URL('mod-extractor-worker.js', import.meta.url).href;
+  worker = new Worker(workerUrl);
+  worker.onmessage = (e) => {
+    const msg = e.data;
+    switch (msg.type) {
+      case 'ready':
+        workerReady = true;
+        updateEncodeBtn();
+        setStatus('Worker ready. Load audio.');
+        break;
+      case 'progress':
+        setStatus(msg.status + (msg.value != null ? ' ' + Math.round(msg.value * 100) + '%' : ''));
+        break;
+      case 'result':
+        onResult(msg);
+        break;
+      case 'error':
+        setStatus('Error: ' + msg.message, 'error');
+        encodeBtn.disabled = false;
+        break;
+    }
+  };
+  worker.onerror = (e) => {
+    setStatus('Worker error: ' + e.message, 'error');
+    e.preventDefault();
+  };
+  worker.postMessage({ type: 'init' });
+}
+initWorker();
+
+function loadAudioFile(file) {
+  audioFile = file;
+  fileInfo.textContent = file.name + ' (' + (file.size / 1024).toFixed(0) + ' KB)';
+  dropZone.classList.add('hasFile');
+  updateEncodeBtn();
+  fetchMIDIPorts();
+
+  const reader = new FileReader();
+  reader.onload = async (e) => {
+    try {
+      const ctx = new AudioContext();
+      const decoded = await ctx.decodeAudioData(e.target.result.slice(0));
+      ctx.close();
+      audioSr = decoded.sampleRate;
+      const totalSec = decoded.length / audioSr;
+      let maxLen = decoded.length;
+      if (totalSec > 10) {
+        const chosen = await showTrimModal(totalSec);
+        if (chosen > 0) maxLen = Math.round(chosen * audioSr);
+      }
+      audioBuffer = new Float32Array(maxLen);
+      const ch = decoded.getChannelData(0);
+      for (let i = 0; i < maxLen; i++) audioBuffer[i] = ch[i];
+      infoDuration.textContent = (maxLen / audioSr).toFixed(1) + ' s';
+      setStatus('Loaded ' + file.name + ' (' + (maxLen / audioSr).toFixed(1) + 's)');
+    } catch (err) {
+      setStatus('Decode error: ' + err.message, 'error');
+    }
+  };
+  reader.readAsArrayBuffer(file);
+}
+
+dropZone.addEventListener('click', () => fileInput.click());
+dropZone.addEventListener('dragover', (e) => { e.preventDefault(); dropZone.classList.add('dragover'); });
+dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
+dropZone.addEventListener('drop', (e) => {
+  e.preventDefault();
+  dropZone.classList.remove('dragover');
+  const f = e.dataTransfer.files[0];
+  if (f) loadAudioFile(f);
+});
+fileInput.addEventListener('change', () => {
+  if (fileInput.files[0]) loadAudioFile(fileInput.files[0]);
+});
+
+function resample(src, srcSr, dstSr) {
+  if (!src || src.length === 0) throw new Error('Empty audio buffer');
+  if (!srcSr || srcSr <= 0) throw new Error('Invalid source sample rate: ' + srcSr);
+  if (srcSr === dstSr) return new Float32Array(src);
+  const len = Math.max(1, Math.round(src.length * dstSr / srcSr));
+  const ctx = new OfflineAudioContext(1, len, dstSr);
+  const buf = ctx.createBuffer(1, src.length, srcSr);
+  buf.copyToChannel(src, 0);
+  const srcNode = ctx.createBufferSource();
+  srcNode.buffer = buf;
+  srcNode.connect(ctx.destination);
+  srcNode.start();
+  return new Promise((res, rej) => {
+    const t = setTimeout(() => { try { ctx.close(); } catch {} rej(new Error('Resample timed out (>15s)')); }, 15000);
+    ctx.startRendering().then(
+      rendered => { clearTimeout(t); res(rendered.getChannelData(0)); },
+      err => { clearTimeout(t); rej(new Error('Resample failed: ' + err.message)); }
+    );
+  });
+}
+
+function getModelSr(modelId) {
+  const parts = modelId.split(':');
+  const variant = parts[1];
+  if (variant === '44khz') return 44100;
+  return parseInt(variant) * 1000;
+}
+
+function getModelLabel(modelId) {
+  const parts = modelId.split(':');
+  const family = parts[0];
+  const variant = parts[1];
+  const bw = parts[2];
+  const srLabel = variant.replace('khz', ' kHz').replace('k', ' kHz');
+  if (family === 'snac') return `SNAC ${srLabel}`;
+  return `EnCodec ${srLabel} @ ${bw} kbps`;
+}
+
+encodeBtn.addEventListener('click', async () => {
+  if (!workerReady || !audioFile) { setStatus('Worker not ready or no audio.', 'error'); return; }
+  if (!audioBuffer) { setStatus('Audio not decoded yet.', 'error'); return; }
+  encodeBtn.disabled = true;
+  stopAll();
+
+  const rawModel = modelSelect.value;
+  const bwKbps = bwSelect.value;
+  const modelId = rawModel.startsWith('encodec:') ? rawModel + ':' + bwKbps : rawModel;
+  targetSr = getModelSr(modelId);
+
+  try {
+    setStatus('Resampling…');
+    const audio = await resample(audioBuffer, audioSr, targetSr);
+
+    const jobId = ++jobSeq;
+    curves = null;
+    nLevels = 0;
+    nFrames = 0;
+    infoModel.textContent = getModelLabel(modelId);
+
+    worker.postMessage({ type: 'encode', jobId, audio, modelId, metric: metricSelect.value, upsample: upsampleSelect.value },
+      [audio.buffer]);
+  } catch (err) {
+    setStatus(err.message, 'error');
+    encodeBtn.disabled = false;
+  }
+});
+
+function onResult(msg) {
+  curves = msg.curves;
+  nLevels = msg.nLevels;
+  nFrames = msg.nFrames;
+  hopSize = msg.hopSize;
+
+  buildLevelUI();
+  computeSmoothCurves();
+  drawCurves();
+  updateLegend();
+  fetchMIDIPorts();
+
+  const dur = nFrames * hopSize / msg.sampleRate;
+  infoFrames.textContent = nFrames + ' frames, ' + dur.toFixed(1) + ' s';
+  frameInfo.textContent = nLevels + ' levels, ' + nFrames + ' frames';
+
+  playAudioBtn.disabled = false;
+  playBtn.disabled = false;
+  stopBtn.disabled = false;
+  encodeBtn.disabled = false;
+  setStatus('Ready. ' + nLevels + ' curves, ' + nFrames + ' frames.');
+}
+
+function buildLevelUI() {
+  const oldState = levelState.slice();
+  levelState.length = 0;
+  const rows = levelGrid.querySelectorAll('.lvl-row');
+  for (const r of rows) r.remove();
+
+  for (let i = 0; i < nLevels; i++) {
+    const prev = oldState[i];
+    const st = {
+      cc: prev?.cc ?? 1 + i,
+      enabled: prev?.enabled ?? true,
+      smooth: prev?.smooth ?? 0,
+      gain: prev?.gain ?? 1.0,
+      color: prev?.color ?? COLORS[i % COLORS.length],
+    };
+    levelState.push(st);
+
+    const row = document.createElement('div');
+    row.className = 'lvl-row';
+    row.style.cssText = 'display:contents';
+
+    const num = document.createElement('span');
+    num.className = 'lvl-num'; num.textContent = i;
+
+    const swatch = document.createElement('span');
+    swatch.className = 'lvl-color';
+    swatch.style.background = st.color;
+
+    const ccInput = document.createElement('input');
+    ccInput.type = 'number'; ccInput.className = 'lvl-cc';
+    ccInput.min = 1; ccInput.max = 127; ccInput.value = st.cc;
+    ccInput.addEventListener('input', () => { st.cc = parseInt(ccInput.value) || 1; });
+
+    const smoothInput = document.createElement('input');
+    smoothInput.type = 'range'; smoothInput.className = 'lvl-smooth';
+    smoothInput.min = 0; smoothInput.max = 0.99; smoothInput.step = 0.01; smoothInput.value = st.smooth;
+    smoothInput.addEventListener('input', () => {
+      st.smooth = parseFloat(smoothInput.value);
+      computeSmoothCurves();
+      drawCurves();
+    });
+
+    const gainInput = document.createElement('input');
+    gainInput.type = 'range'; gainInput.className = 'lvl-gain';
+    gainInput.min = 0; gainInput.max = 3; gainInput.step = 0.01; gainInput.value = st.gain;
+    gainInput.addEventListener('input', () => { st.gain = parseFloat(gainInput.value); computeMidiGlobalMax(); });
+
+    const cb = document.createElement('input');
+    cb.type = 'checkbox'; cb.className = 'lvl-enable'; cb.checked = st.enabled;
+    cb.addEventListener('change', () => {
+      st.enabled = cb.checked;
+      computeMidiGlobalMax();
+      drawCurves();
+      updateLegend();
+    });
+
+    row.appendChild(num);
+    row.appendChild(swatch);
+    row.appendChild(ccInput);
+    row.appendChild(smoothInput);
+    row.appendChild(gainInput);
+    row.appendChild(cb);
+    levelGrid.appendChild(row);
+  }
+}
+
+function computeSmoothCurves() {
+  if (!curves) return;
+  smoothCurves = new Float32Array(curves.length);
+  for (let k = 0; k < nLevels; k++) {
+    const a = levelState[k]?.smooth ?? 0.3;
+    const alpha = 1 - a;
+    const off = k * nFrames;
+    let prev = 0;
+    for (let t = 0; t < nFrames; t++) {
+      const raw = curves[off + t];
+      prev = alpha * raw + (1 - alpha) * prev;
+      smoothCurves[off + t] = prev;
+    }
+  }
+  computeMidiGlobalMax();
+}
+
+function drawCurves() {
+  const rect = canvas.parentElement.getBoundingClientRect();
+  const W = rect.width;
+  const H = 320;
+  canvas.width = W * DPR;
+  canvas.height = H * DPR;
+  canvas.style.width = W + 'px';
+  canvas.style.height = H + 'px';
+
+  const ctx = canvas.getContext('2d');
+  ctx.scale(DPR, DPR);
+  ctx.clearRect(0, 0, W, H);
+
+  if (!curves || nFrames < 2) {
+    ctx.fillStyle = '#333';
+    ctx.font = '12px system-ui';
+    ctx.textAlign = 'center';
+    ctx.fillText('Encode audio to see curves', W/2, H/2);
+    return;
+  }
+
+  const padL = 4, padR = 4, padT = 4, padB = 4;
+  const plotW = W - padL - padR;
+  const plotH = H - padT - padB;
+
+  let globalMax = 0;
+  for (let k = 0; k < nLevels; k++) {
+    if (!levelState[k]?.enabled) continue;
+    const off = k * nFrames;
+    for (let t = 0; t < nFrames; t++) {
+      const v = (smoothCurves ?? curves)[off + t] * levelState[k].gain;
+      if (v > globalMax) globalMax = v;
+    }
+  }
+  const yMax = Math.max(globalMax, 1e-6);
+
+  // Y axis label
+  ctx.fillStyle = '#444';
+  ctx.font = '9px monospace';
+  ctx.textAlign = 'right';
+  ctx.textBaseline = 'top';
+  ctx.fillText(yMax.toFixed(2), W - padR - 2, padT);
+  ctx.textBaseline = 'bottom';
+  ctx.fillText('0', W - padR - 2, H - padB);
+
+  // Grid lines
+  ctx.strokeStyle = '#1a1a1a';
+  ctx.lineWidth = 1;
+  for (let i = 0; i < 4; i++) {
+    const y = padT + plotH * i / 4;
+    ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(W - padR, y); ctx.stroke();
+  }
+
+  const data = smoothCurves ?? curves;
+
+  // Draw filled areas first
+  for (let k = nLevels - 1; k >= 0; k--) {
+    if (!levelState[k]?.enabled) continue;
+    const color = levelState[k].color;
+    const gain = levelState[k].gain;
+    const off = k * nFrames;
+
+    ctx.beginPath();
+    ctx.moveTo(padL, padT + plotH);
+    for (let t = 0; t < nFrames; t++) {
+      const x = padL + (t / (nFrames - 1)) * plotW;
+      const v = data[off + t] * gain;
+      const y = padT + plotH - (v / yMax) * plotH;
+      ctx.lineTo(x, y);
+    }
+    ctx.lineTo(padL + plotW, padT + plotH);
+    ctx.closePath();
+    ctx.fillStyle = color + '20';
+    ctx.fill();
+  }
+
+  // Draw lines
+  for (let k = 0; k < nLevels; k++) {
+    if (!levelState[k]?.enabled) continue;
+    const color = levelState[k].color;
+    const gain = levelState[k].gain;
+    const off = k * nFrames;
+
+    ctx.beginPath();
+    for (let t = 0; t < nFrames; t++) {
+      const x = padL + (t / (nFrames - 1)) * plotW;
+      const v = data[off + t] * gain;
+      const y = padT + plotH - (v / yMax) * plotH;
+      if (t === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+  }
+
+  // Playback cursors
+  if (nFrames > 0) {
+    if (playing) {
+      const cx = padL + (playFrame / (nFrames - 1)) * plotW;
+      ctx.strokeStyle = '#ffffff44';
+      ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(cx, padT); ctx.lineTo(cx, padT + plotH); ctx.stroke();
+    }
+    if (audioPlaying) {
+      const cx = padL + (audioPlayFrame / (nFrames - 1)) * plotW;
+      ctx.strokeStyle = '#44ff88aa';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.moveTo(cx, padT); ctx.lineTo(cx, padT + plotH); ctx.stroke();
+    }
+  }
+}
+
+function updateLegend() {
+  legendEl.innerHTML = '';
+  for (let k = 0; k < nLevels; k++) {
+    if (!levelState[k]?.enabled) continue;
+    const item = document.createElement('span');
+    item.className = 'legend-item';
+    item.innerHTML = `<span class="legend-swatch" style="background:${levelState[k].color}"></span> L${k} CC${levelState[k].cc}`;
+    legendEl.appendChild(item);
+  }
+}
+
+async function fetchMIDIPorts() {
+  try {
+    if (!midiAccess) midiAccess = await navigator.requestMIDIAccess();
+    if (!midiAccess) return;
+    const ports = [...midiAccess.outputs.values()];
+    midiPorts.innerHTML = '<option value="">— select port —</option>' +
+      ports.map(p => `<option value="${p.id}">${p.name}</option>`).join('');
+    if (midiOut) {
+      const match = ports.find(p => p.id === midiOut.id);
+      if (match) midiPorts.value = match.id;
+    }
+  } catch {}
+}
+
+midiPorts.addEventListener('change', () => {
+  if (!midiAccess) return;
+  midiOut = midiAccess.outputs.get(midiPorts.value) || null;
+  updateMIDIInfo();
+});
+
+function updateMIDIInfo() {
+  midiInfoEl.textContent = midiOut
+    ? 'Connected: ' + midiOut.name
+    : 'No MIDI output selected.';
+}
+
+let targetSr = 24000;
+
+function getMIDIPeriod() {
+  const rateDiv = parseInt(rateSelect.value);
+  const frameRate = targetSr / hopSize;
+  return 1000 / (frameRate / rateDiv);
+}
+
+function startAudioPlayback() {
+  if (!audioBuffer) return;
+  stopAudioPlayback();
+  stopMIDI();
+  audioCtx = new AudioContext();
+  const buf = audioCtx.createBuffer(1, audioBuffer.length, audioSr);
+  buf.copyToChannel(audioBuffer, 0);
+  const src = audioCtx.createBufferSource();
+  src.buffer = buf;
+  src.connect(audioCtx.destination);
+  const startTime = audioCtx.currentTime;
+  src.start();
+  audioPlaying = true;
+  playAudioBtn.textContent = '\u25A0 Audio';
+  setStatus('Playing audio…', 'active');
+  function tick() {
+    if (!audioPlaying) return;
+    const elapsed = audioCtx.currentTime - startTime;
+    audioPlayFrame = Math.round(elapsed * targetSr / hopSize);
+    if (audioPlayFrame >= nFrames || audioPlayFrame < 0) {
+      stopAudioPlayback();
+      return;
+    }
+    drawCurves();
+    infoCursor.textContent = 'frame ' + audioPlayFrame + '/' + nFrames;
+    audioRAF = requestAnimationFrame(tick);
+  }
+  src.onended = stopAudioPlayback;
+  tick();
+}
+
+function stopAudioPlayback() {
+  audioPlaying = false;
+  if (audioRAF) { cancelAnimationFrame(audioRAF); audioRAF = null; }
+  if (audioCtx) { audioCtx.close().catch(() => {}); audioCtx = null; }
+  audioPlayFrame = 0;
+  playAudioBtn.textContent = '\u25B6 Audio';
+  drawCurves();
+}
+
+playAudioBtn.addEventListener('click', () => {
+  if (!audioBuffer) return;
+  if (audioPlaying) { stopAudioPlayback(); return; }
+  startAudioPlayback();
+});
+
+playBtn.addEventListener('click', () => {
+  if (!curves || playing) return;
+  if (!midiOut) {
+    setStatus('Select a MIDI output port first.', 'error');
+    return;
+  }
+  playing = true;
+  playFrame = 0;
+  playBtn.textContent = '\u25B6 Playing…';
+  setStatus('Streaming MIDI…', 'active');
+  scheduleNextMIDI();
+});
+
+function scheduleNextMIDI() {
+  if (!playing) return;
+  const period = getMIDIPeriod();
+  playTimer = setTimeout(() => {
+    if (!playing) return;
+    sendMIDIFrame();
+    playFrame += parseInt(rateSelect.value);
+    if (playFrame >= nFrames) playFrame = 0; // loop
+    drawCurves();
+    infoCursor.textContent = 'frame ' + playFrame + '/' + nFrames;
+    scheduleNextMIDI();
+  }, period);
+}
+
+let midiGlobalMax = 0;
+
+function computeMidiGlobalMax() {
+  midiGlobalMax = 0;
+  if (!smoothCurves) return;
+  for (let k = 0; k < nLevels; k++) {
+    if (!levelState[k]?.enabled) continue;
+    const gain = levelState[k].gain;
+    const off = k * nFrames;
+    for (let t = 0; t < nFrames; t++) {
+      const v = smoothCurves[off + t] * gain;
+      if (v > midiGlobalMax) midiGlobalMax = v;
+    }
+  }
+}
+
+function sendMIDIFrame() {
+  if (!midiOut || !smoothCurves) return;
+  const t = Math.min(playFrame, nFrames - 1);
+  const scale = midiGlobalMax > 1e-8 ? 127 / midiGlobalMax : 0;
+  for (let k = 0; k < nLevels; k++) {
+    const st = levelState[k];
+    if (!st || !st.enabled) continue;
+    const v = smoothCurves[k * nFrames + t] * st.gain;
+    const ccVal = Math.max(0, Math.min(127, Math.round(v * scale)));
+    midiOut.send([0xB0, st.cc - 1, ccVal]);
+  }
+}
+
+function stopMIDI() {
+  playing = false;
+  if (playTimer) { clearTimeout(playTimer); playTimer = null; }
+  playBtn.textContent = '\u25B6 Play MIDI';
+  playFrame = 0;
+  infoCursor.textContent = '';
+  drawCurves();
+}
+
+function stopAll() {
+  stopAudioPlayback();
+  stopMIDI();
+  setStatus('Stopped.');
+}
+
+stopBtn.addEventListener('click', stopAll);
+
+window.addEventListener('resize', drawCurves);
+
+setStatus('Initializing worker…');
+</script>
+</body>
+</html>
