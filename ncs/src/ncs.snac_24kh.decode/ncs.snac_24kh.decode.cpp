@@ -44,7 +44,7 @@ struct DecodeJob {
     double output_sr;
 };
 
-// ncs.snac_24kh.embedcodes sends its (chunked) embeddings as a `frameix
+// ncs.snac_24kh.embedcodes sends its (chunked) embeddings as a `messageix
 // <index>` message (index -1 = last chunk) immediately followed by
 // `tensor <data...>`, both real Max message selectors -- see
 // ncs.snac_24kh.encode.cpp's kMaxChunkAtoms comment for the full crash
@@ -76,7 +76,7 @@ public:
     MIN_DESCRIPTION     {"Runs the SNAC 24kHz decoder and writes the result to a named buffer~."};
     MIN_TAGS            {"snac, onnx, audio"};
     MIN_AUTHOR          {"Behzad Haki"};
-    inlet<> embeddings_in{ this, "(set/load/frameix/tensor) buffer name, model path, or chunked embeddings from ncs.snac_24kh.embedcodes" };
+    inlet<> embeddings_in{ this, "(set/load/messageix/tensor) buffer name, model path, or chunked embeddings from ncs.snac_24kh.embedcodes" };
     inlet<> length_in{ this, "(float) source duration in seconds -- wire directly from ncs.snac_24kh.encode's second outlet" };
 
     buffer_reference buffer_ref_{ this };
@@ -115,7 +115,7 @@ public:
     }
 
     // Chunks accumulate here; only once a tensor arrives whose preceding
-    // frameix was -1 (the last chunk) does decode_audio.onnx actually
+    // messageix was -1 (the last chunk) does decode_audio.onnx actually
     // run, on the full reassembled embeddings -- so there's no
     // chunk-boundary artifact in the decoded audio, chunking is purely a
     // transport concern. The output buffer's own sample rate and the
@@ -127,7 +127,7 @@ public:
     // error() inline) -- this can fire very early during patch load, and
     // calling error() synchronously at that point has crashed Max's
     // console/UI; deferring it to the timer callback avoids that.
-    message<> frameix_msg{this, "frameix", "Chunk index (-1 = last chunk)",
+    message<> messageix_msg{this, "messageix", "Chunk index (-1 = last chunk)",
         MIN_FUNCTION {
             if (!args.empty())
                 pending_is_last_ = ((int)args[0] == -1);

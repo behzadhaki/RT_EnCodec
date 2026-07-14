@@ -39,7 +39,7 @@ static constexpr int kNumLevels = 3;
 // (headerless) list -- vq never chunks its output, so no frame/last
 // protocol is needed there. Embeddings out (to ncs.snac_24kh.decode and
 // friends, per level, chunked) mirror ncs.snac_24kh.encode's data_out
-// format: a `frameix <index>` message (index -1 = last chunk) immediately
+// format: a `messageix <index>` message (index -1 = last chunk) immediately
 // followed by `tensor <data...>`, both real Max message selectors rather
 // than a header baked into a generic list (see
 // ncs.snac_24kh.encode.cpp's kMaxChunkAtoms comment for why that matters
@@ -78,12 +78,12 @@ public:
 
     // Leftmost outlet is always the sum (each level scaled by its
     // level<N>_scale before summing); the rest are always the raw,
-    // unscaled per-level embeddings. Each is a frameix/tensor chunked
+    // unscaled per-level embeddings. Each is a messageix/tensor chunked
     // stream, same format as ncs.snac_24kh.encode's data_out.
-    outlet<> sum_out{ this, "(frameix/tensor) summed embeddings chunk (level0_scale*L0 + level1_scale*L1 + level2_scale*L2), channel-major [768 x T]" };
-    outlet<> level0_out{ this, "(frameix/tensor) level 0 embeddings chunk, unscaled, channel-major [768 x T]" };
-    outlet<> level1_out{ this, "(frameix/tensor) level 1 embeddings chunk, unscaled, channel-major [768 x T]" };
-    outlet<> level2_out{ this, "(frameix/tensor) level 2 embeddings chunk, unscaled, channel-major [768 x T]" };
+    outlet<> sum_out{ this, "(messageix/tensor) summed embeddings chunk (level0_scale*L0 + level1_scale*L1 + level2_scale*L2), channel-major [768 x T]" };
+    outlet<> level0_out{ this, "(messageix/tensor) level 0 embeddings chunk, unscaled, channel-major [768 x T]" };
+    outlet<> level1_out{ this, "(messageix/tensor) level 1 embeddings chunk, unscaled, channel-major [768 x T]" };
+    outlet<> level2_out{ this, "(messageix/tensor) level 2 embeddings chunk, unscaled, channel-major [768 x T]" };
 
     attribute<number> level0_scale{ this, "level0_scale", 1.0,
         description{"Gain applied to codebook level 0 (coarsest) before summing into the sum outlet. Does not affect the raw level0 outlet."} };
@@ -234,10 +234,10 @@ private:
             bool is_last = (i + 1 == chunks.size());
             int idx = is_last ? -1 : static_cast<int>(i);
 
-            atoms frameix_msg;
-            frameix_msg.push_back(symbol("frameix"));
-            frameix_msg.push_back(idx);
-            q.enqueue({outlet_id, std::move(frameix_msg)});
+            atoms messageix_msg;
+            messageix_msg.push_back(symbol("messageix"));
+            messageix_msg.push_back(idx);
+            q.enqueue({outlet_id, std::move(messageix_msg)});
 
             atoms tensor_msg;
             tensor_msg.reserve(1 + chunks[i].size());

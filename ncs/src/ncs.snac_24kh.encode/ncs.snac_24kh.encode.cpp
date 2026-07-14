@@ -43,11 +43,11 @@ static constexpr int64_t kPadMultiple = 2048;
 // SENT out in pieces of at most kMaxChunkAtoms.
 //
 // Data goes out as a pair of proper Max messages per chunk, both from
-// data_out: `frameix <index>` (index -1 marks the last chunk, folding in
+// data_out: `messageix <index>` (index -1 marks the last chunk, folding in
 // what used to be a separate is_last flag) followed by `tensor <data...>`.
 // Unlike the earlier symbol-tagged header attempt (which crashed with
 // "doesn't understand frame" because "frame" wasn't a real message name),
-// ncs.snac_24kh.vq below defines actual `frameix`/`tensor` message
+// ncs.snac_24kh.vq below defines actual `messageix`/`tensor` message
 // handlers, so Max's normal selector routing does the header parsing for
 // free -- the tensor handler's args are already header-free data, no
 // manual stripping downstream. This also means every tensor chunk is a
@@ -100,13 +100,13 @@ static constexpr double kModelSampleRate = 24000.0;
 //
 // This is a deliberate, accepted race: since this direct wire is far
 // faster than the tensor data's trip through vq's and embedcodes' own
-// ONNX passes, a *second* bang here before a first bang's tensor chunks
-// have finished threading through to decode will overwrite decode's
-// cached length before the first run's data arrives, silently pairing
-// the wrong length with it. Not a crash risk -- worst case is a
-// mistrimmed buffer -- and considered acceptable for buffer-mode's
-// typical bang/wait/use workflow. If nothing is connected to length_out,
-// decode just skips trimming.
+// ONNX passes, a *second* bang here before a first bang's data has
+// finished threading through to decode will overwrite decode's cached
+// length before the first run's data arrives, silently pairing the wrong
+// length with it. Not a crash risk -- worst case is a mistrimmed buffer
+// -- and considered acceptable for buffer-mode's typical bang/wait/use
+// workflow. If nothing is connected to length_out, decode just skips
+// trimming.
 struct PendingSend {
     atoms data; // always for data_out -- length_out is sent directly, see above
 };
@@ -118,7 +118,7 @@ public:
     MIN_TAGS            {"snac, onnx, audio"};
     MIN_AUTHOR          {"Behzad Haki"};
     inlet<> control_in{ this, "(set/bang/load) buffer name, trigger, or model path" };
-    outlet<> data_out{ this, "(frameix/tensor) chunked embeddings, channel-major [768 x T]" };
+    outlet<> data_out{ this, "(messageix/tensor) chunked embeddings, channel-major [768 x T]" };
     outlet<> length_out{ this, "(float) source duration in seconds -- wire directly to ncs.snac_24kh.decode's second inlet" };
 
     buffer_reference buffer_ref_{ this };
@@ -328,10 +328,10 @@ private:
             bool is_last = (i + 1 == chunks.size());
             int idx = is_last ? -1 : static_cast<int>(i);
 
-            atoms frameix_msg;
-            frameix_msg.push_back(symbol("frameix"));
-            frameix_msg.push_back(idx);
-            output_queue_.enqueue({std::move(frameix_msg)});
+            atoms messageix_msg;
+            messageix_msg.push_back(symbol("messageix"));
+            messageix_msg.push_back(idx);
+            output_queue_.enqueue({std::move(messageix_msg)});
 
             atoms tensor_msg;
             tensor_msg.reserve(1 + chunks[i].size());

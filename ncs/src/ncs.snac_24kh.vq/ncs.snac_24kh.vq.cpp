@@ -32,7 +32,7 @@ using namespace c74::min;
 // expansion/interleaving is needed here.
 static constexpr int kNumLevels = 3;
 
-// ncs.snac_24kh.encode sends chunked embeddings as a `frameix <index>`
+// ncs.snac_24kh.encode sends chunked embeddings as a `messageix <index>`
 // message (index -1 = last chunk) immediately followed by a `tensor
 // <data...>` message, both from its single data outlet -- real Max
 // message selectors, not a header baked into a generic list, so the
@@ -57,7 +57,7 @@ public:
     MIN_DESCRIPTION     {"SNAC 24kHz residual vector quantizer: embeddings -> per-level codes."};
     MIN_TAGS            {"snac, onnx"};
     MIN_AUTHOR          {"Behzad Haki"};
-    inlet<> control_in{ this, "(frameix/tensor/load) embeddings chunk from ncs.snac_24kh.encode, or model path" };
+    inlet<> control_in{ this, "(messageix/tensor/load) embeddings chunk from ncs.snac_24kh.encode, or model path" };
     outlet<> level0_out{ this, "(list) codes... -- codebook level 0 (coarsest, stride 4)" };
     outlet<> level1_out{ this, "(list) codes... -- codebook level 1 (stride 2)" };
     outlet<> level2_out{ this, "(list) codes... -- codebook level 2 (finest, stride 1)" };
@@ -82,7 +82,7 @@ public:
     }
 
     // Chunks accumulate here; only once a tensor arrives whose preceding
-    // frameix was -1 (the last chunk) is the full reassembled embeddings
+    // messageix was -1 (the last chunk) is the full reassembled embeddings
     // vector handed to the worker -- the ONNX inference itself always
     // runs on the complete, non-chunked tensor, so there's no
     // chunk-boundary artifact in the quantization.
@@ -90,7 +90,7 @@ public:
     // very early during patch load, and calling error() synchronously at
     // that point has crashed Max's console/UI; deferring it to the timer
     // callback avoids that.
-    message<> frameix_msg{this, "frameix", "Chunk index (-1 = last chunk)",
+    message<> messageix_msg{this, "messageix", "Chunk index (-1 = last chunk)",
         MIN_FUNCTION {
             if (!args.empty())
                 pending_is_last_ = ((int)args[0] == -1);
