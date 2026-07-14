@@ -27,20 +27,47 @@ using namespace c74::min;
 
 // SNAC 24kHz codebook lookup: 3 levels, vq_strides=[4,2,1] (coarsest
 // first). decode_codes.onnx has 3 inputs (codes_0/1/2, each at its own
-// native temporal resolution) and 3 outputs (zq_0/1/2), each already
-// upsampled (via Tile) to the full base-rate length T but NOT summed --
-// the graph has no Add node, so the cross-level sum happens here.
+// native temporal resolution -- matches ncs.snac_24kh.vq's 3 outlets
+// directly, no zero-order-hold decoding needed) and 3 outputs (zq_0/1/2),
+// each already upsampled (via Tile) to the full base-rate length T but
+// NOT summed -- the graph has no Add node, so the cross-level sum happens
+// here, with a per-level gain applied before summing.
 static constexpr int kNumLevels = 3;
-static constexpr int64_t kVqStrides[kNumLevels] = {4, 2, 1};
+
+struct EmbedRequest {
+    std::vector<int64_t> codes[kNumLevels];
+    double scale[kNumLevels];
+};
 
 class NcsSnac_24khEmbedcodes : public object<NcsSnac_24khEmbedcodes>
 {
 public:
-    MIN_DESCRIPTION     {"SNAC 24kHz codebook lookup: codes -> summed quantized embeddings."};
+    MIN_DESCRIPTION     {"SNAC 24kHz codebook lookup: per-level codes -> summed + per-level quantized embeddings."};
     MIN_TAGS            {"snac, onnx"};
     MIN_AUTHOR          {"Behzad Haki"};
-    inlet<> control_in{ this, "(list/load) codes from ncs.snac_24kh.vq, or model path" };
-    outlet<> result_out{ this, "(list) quantized embeddings, channel-major flattened [768 x T]" };
+    // Inlet 0 is hot (triggers processing using the most recently cached
+    // level1/level2 values); inlets 1-2 are cold (cache only). This
+    // matches ncs.snac_24kh.vq, whose outlets fire right-to-left
+    // (level2 first, level0 last), so a direct patch cord hookup lands
+    // the cold values before the hot trigger arrives.
+    inlet<> level0_in{ this, "(list/load) codebook level 0 codes (coarsest, stride 4) -- hot, or model path" };
+    inlet<> level1_in{ this, "(list) codebook level 1 codes (stride 2) -- cold" };
+    inlet<> level2_in{ this, "(list) codebook level 2 codes (finest, stride 1) -- cold" };
+
+    // Leftmost outlet is always the sum (each level scaled by its
+    // level<N>_scale before summing); the rest are always the raw,
+    // unscaled per-level embeddings.
+    outlet<> sum_out{ this, "(list) summed embeddings (level0_scale*L0 + level1_scale*L1 + level2_scale*L2), channel-major [768 x T]" };
+    outlet<> level0_out{ this, "(list) level 0 embeddings, unscaled, channel-major [768 x T]" };
+    outlet<> level1_out{ this, "(list) level 1 embeddings, unscaled, channel-major [768 x T]" };
+    outlet<> level2_out{ this, "(list) level 2 embeddings, unscaled, channel-major [768 x T]" };
+
+    attribute<number> level0_scale{ this, "level0_scale", 1.0,
+        description{"Gain applied to codebook level 0 (coarsest) before summing into the sum outlet. Does not affect the raw level0 outlet."} };
+    attribute<number> level1_scale{ this, "level1_scale", 1.0,
+        description{"Gain applied to codebook level 1 before summing into the sum outlet. Does not affect the raw level1 outlet."} };
+    attribute<number> level2_scale{ this, "level2_scale", 1.0,
+        description{"Gain applied to codebook level 2 (finest) before summing into the sum outlet. Does not affect the raw level2 outlet."} };
 
     // =====================================================================
     // CONSTRUCTOR / DESTRUCTOR
@@ -61,15 +88,43 @@ public:
         stop_output_timer();
     }
 
-    message<> list_msg{this, "list", "Codes to embed (3 ints per base frame, coarsest first)",
+    // Errors go through log_queue_ (not error() inline) -- this can fire
+    // very early during patch load, and calling error() synchronously at
+    // that point has crashed Max's console/UI; deferring it to the timer
+    // callback avoids that.
+    message<> list_msg{this, "list", "Per-level codes (inlet 0 hot / 1-2 cold)",
         MIN_FUNCTION {
             try {
                 std::vector<int64_t> codes(args.size());
                 for (size_t i = 0; i < args.size(); ++i)
                     codes[i] = (int64_t)(int)args[i];
-                input_queue_.enqueue(std::move(codes));
+                if (inlet == 1) {
+                    cached_level1_ = std::move(codes);
+                } else if (inlet == 2) {
+                    cached_level2_ = std::move(codes);
+                } else if (inlet == 0) {
+                    // decode_codes.onnx structurally requires all 3 levels
+                    // as input (not optional) -- an empty/missing level
+                    // (e.g. vq's outlet 1 or 2 never connected here, so
+                    // its cache stayed empty) turns into a zero-length
+                    // tensor, which ONNX Runtime does not fail on
+                    // gracefully. Refuse instead of risking that.
+                    if (cached_level1_.empty() || cached_level2_.empty()) {
+                        log_queue_.enqueue({true, "ncs.snac_24kh.embedcodes: level1 and/or level2 codes not yet received "
+                              "— connect all three of ncs.snac_24kh.vq's outlets to inlets 0-2"});
+                        return {};
+                    }
+                    EmbedRequest req;
+                    req.codes[0] = std::move(codes);
+                    req.codes[1] = cached_level1_;
+                    req.codes[2] = cached_level2_;
+                    req.scale[0] = double(level0_scale);
+                    req.scale[1] = double(level1_scale);
+                    req.scale[2] = double(level2_scale);
+                    input_queue_.enqueue(std::move(req));
+                }
             } catch (const std::exception& ex) {
-                error("ncs.snac_24kh.embedcodes: list handling failed — " + std::string(ex.what()));
+                log_queue_.enqueue({true, "ncs.snac_24kh.embedcodes: list handling failed — " + std::string(ex.what())});
             }
             return {};
         }};
@@ -77,7 +132,7 @@ public:
     message<> load{this, "load", "Load an ONNX model (.onnx)",
         MIN_FUNCTION {
             if (args.size() < 1) {
-                error("ncs.snac_24kh.embedcodes: load requires a file path");
+                log_queue_.enqueue({true, "ncs.snac_24kh.embedcodes: load requires a file path"});
                 return {};
             }
             load_queue_.enqueue((std::string)args[0]);
@@ -92,8 +147,12 @@ private:
     std::atomic<bool> worker_running_{false};
     std::atomic<bool> stop_{false};
 
-    tsqueue<std::vector<int64_t>> input_queue_;
-    tsqueue<std::vector<float>> output_queue_;
+    // Only ever touched from message handlers, i.e. the main thread.
+    std::vector<int64_t> cached_level1_;
+    std::vector<int64_t> cached_level2_;
+
+    tsqueue<EmbedRequest> input_queue_;
+    tsqueue<std::vector<std::vector<float>>> output_queue_;
     tsqueue<std::string> load_queue_;
     tsqueue<std::pair<bool,std::string>> log_queue_;
 
@@ -130,22 +189,22 @@ private:
             std::string path;
             if (load_queue_.try_dequeue(path))
                 load_model(path);
-            std::vector<int64_t> input;
-            if (!input_queue_.wait_dequeue(input, 100))
+            EmbedRequest req;
+            if (!input_queue_.wait_dequeue(req, 100))
                 continue;
-            std::vector<int64_t> temp;
+            EmbedRequest temp;
             while (input_queue_.try_dequeue(temp))
-                input = std::move(temp);
-            process(input);
+                req = std::move(temp);
+            process(req);
         }
     }
 
-    void process(const std::vector<int64_t>& msg) {
+    void process(const EmbedRequest& req) {
         if (!model_loaded_) {
             log_queue_.enqueue({true, "ncs.snac_24kh.embedcodes: no model loaded"});
             return;
         }
-        auto result = run_onnx(msg);
+        auto result = run_onnx(req);
         if (result.empty()) {
             log_queue_.enqueue({true, "ncs.snac_24kh.embedcodes: inference failed"});
             return;
@@ -153,19 +212,33 @@ private:
         output_queue_.enqueue(std::move(result));
     }
 
+    // Every crash seen so far traced back to a call to error() -- post()
+    // has been reliable throughout. Route everything through post() with
+    // an "ERROR:" prefix instead, to avoid whatever error() is doing
+    // (likely highlighting the object in the patcher) that's unsafe here.
+    // Outlets fire right-to-left (level2, level1, level0, then sum last)
+    // so the sum outlet -- the one most patches key off of -- fires after
+    // the raw per-level data has already reached any downstream objects.
     void flush_output() {
         std::pair<bool,std::string> log_msg;
         while (log_queue_.try_dequeue(log_msg)) {
-            if (log_msg.first) error(log_msg.second);
+            if (log_msg.first) c74::max::post("%s", ("ERROR: " + log_msg.second).c_str());
             else c74::max::post("%s", log_msg.second.c_str());
         }
-        std::vector<float> result;
+        std::vector<std::vector<float>> result;
         if (output_queue_.try_dequeue(result)) {
-            std::vector<float> temp;
+            std::vector<std::vector<float>> temp;
             while (output_queue_.try_dequeue(temp))
                 result = std::move(temp);
-            atoms out_atoms(result.begin(), result.end());
-            result_out.send(out_atoms);
+            if (result.size() != kNumLevels + 1) return;
+            atoms a2(result[3].begin(), result[3].end());
+            level2_out.send(a2);
+            atoms a1(result[2].begin(), result[2].end());
+            level1_out.send(a1);
+            atoms a0(result[1].begin(), result[1].end());
+            level0_out.send(a0);
+            atoms asum(result[0].begin(), result[0].end());
+            sum_out.send(asum);
         }
     }
 
@@ -224,33 +297,19 @@ private:
         }
     }
 
-    // Takes the zero-order-held code list (as produced by
-    // ncs.snac_24kh.vq -- N ints per base frame, coarsest first), recovers
-    // each level's native (non-repeated) code sequence by sampling the
-    // first frame of each stride-run, runs decode_codes.onnx to get the
-    // three upsampled zq_i tensors, and elementwise-sums them into a
-    // single flattened [768 x T] embedding vector.
-    std::vector<float> run_onnx(const std::vector<int64_t>& codes_zoh) {
+    // Runs decode_codes.onnx on the three native-resolution per-level code
+    // sequences and returns 4 flattened [768 x T] embedding vectors:
+    // index 0 = sum of all levels (each scaled by req.scale[lvl] first),
+    // indices 1-3 = each level's raw, unscaled embedding.
+    std::vector<std::vector<float>> run_onnx(const EmbedRequest& req) {
         if (!session_ || !model_loaded_) return {};
-        if (codes_zoh.size() % kNumLevels != 0) return {};
-        int64_t T_b = static_cast<int64_t>(codes_zoh.size()) / kNumLevels;
         try {
-            std::vector<std::vector<int64_t>> native(kNumLevels);
-            for (int lvl = 0; lvl < kNumLevels; ++lvl)
-                native[lvl].resize(static_cast<size_t>(T_b / kVqStrides[lvl]));
-            for (int64_t t = 0; t < T_b; ++t) {
-                for (int lvl = 0; lvl < kNumLevels; ++lvl) {
-                    if (t % kVqStrides[lvl] == 0)
-                        native[lvl][static_cast<size_t>(t / kVqStrides[lvl])] = codes_zoh[t * kNumLevels + lvl];
-                }
-            }
-
             std::vector<Ort::Value> in_tensors;
             in_tensors.reserve(kNumLevels);
             std::vector<const char*> in_names;
             for (int lvl = 0; lvl < kNumLevels; ++lvl) {
-                std::vector<int64_t> shape = {1, static_cast<int64_t>(native[lvl].size())};
-                in_tensors.push_back(vector_to_tensor_i64(native[lvl], shape, allocator_));
+                std::vector<int64_t> shape = {1, static_cast<int64_t>(req.codes[lvl].size())};
+                in_tensors.push_back(vector_to_tensor_i64(req.codes[lvl], shape, allocator_));
                 in_names.push_back(input_names_[lvl].c_str());
             }
             std::vector<const char*> out_names;
@@ -261,15 +320,24 @@ private:
                                           out_names.data(), out_names.size());
             if (outputs.size() != kNumLevels) return {};
 
-            std::vector<float> zq0 = tensor_to_vector(outputs[0]);
-            std::vector<float> sum = zq0;
-            for (int lvl = 1; lvl < kNumLevels; ++lvl) {
-                auto zqi = tensor_to_vector(outputs[lvl]);
-                if (zqi.size() != sum.size()) return {};
+            std::vector<float> zq[kNumLevels];
+            for (int lvl = 0; lvl < kNumLevels; ++lvl)
+                zq[lvl] = tensor_to_vector(outputs[lvl]);
+
+            std::vector<float> sum(zq[0].size(), 0.0f);
+            for (int lvl = 0; lvl < kNumLevels; ++lvl) {
+                if (zq[lvl].size() != sum.size()) return {};
+                float s = static_cast<float>(req.scale[lvl]);
                 for (size_t i = 0; i < sum.size(); ++i)
-                    sum[i] += zqi[i];
+                    sum[i] += zq[lvl][i] * s;
             }
-            return sum;
+
+            std::vector<std::vector<float>> result;
+            result.reserve(kNumLevels + 1);
+            result.push_back(std::move(sum));
+            for (int lvl = 0; lvl < kNumLevels; ++lvl)
+                result.push_back(std::move(zq[lvl]));
+            return result;
         } catch (const std::exception&) {}
         return {};
     }

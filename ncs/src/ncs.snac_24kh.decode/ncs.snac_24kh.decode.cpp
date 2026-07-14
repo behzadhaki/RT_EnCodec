@@ -37,6 +37,20 @@ public:
 
     buffer_reference buffer_ref_{ this };
 
+    // @buffername lets the output buffer~ be set as an object-box argument
+    // (@buffername myBuf) or attribute message, alongside the 'set'
+    // message buffer_reference already provides. An attribute's setter
+    // runs immediately at construction with its default value ("" here)
+    // -- guard against binding an empty-named buffer, an untested call
+    // into Max's buffer subsystem that crashed on patch load.
+    attribute<symbol> buffername{ this, "buffername", "", description{"Name of the buffer~ to write to."},
+        setter{ MIN_FUNCTION {
+            symbol name = (symbol)args[0];
+            if (name != symbol(""))
+                buffer_ref_.set(name);
+            return {args};
+        }}};
+
     // =====================================================================
     // CONSTRUCTOR / DESTRUCTOR
     // =====================================================================
@@ -69,6 +83,10 @@ public:
     // Inlet 1 (hot): the arrival of the embeddings list is itself the
     // trigger -- unlike ncs.snac_24kh.encode there is no separate bang,
     // since this object has no other way to know new data is ready.
+    // Errors go through log_queue_ (not error() inline) -- this can fire
+    // very early during patch load, and calling error() synchronously at
+    // that point has crashed Max's console/UI; deferring it to the timer
+    // callback avoids that.
     message<> list_msg{this, "list", "Quantized embeddings (inlet 1)",
         MIN_FUNCTION {
             try {
@@ -79,7 +97,7 @@ public:
                     input_queue_.enqueue(std::move(emb));
                 }
             } catch (const std::exception& ex) {
-                error("ncs.snac_24kh.decode: list handling failed — " + std::string(ex.what()));
+                log_queue_.enqueue({true, "ncs.snac_24kh.decode: list handling failed — " + std::string(ex.what())});
             }
             return {};
         }};
@@ -87,7 +105,7 @@ public:
     message<> load{this, "load", "Load an ONNX model (.onnx)",
         MIN_FUNCTION {
             if (args.size() < 1) {
-                error("ncs.snac_24kh.decode: load requires a file path");
+                log_queue_.enqueue({true, "ncs.snac_24kh.decode: load requires a file path"});
                 return {};
             }
             load_queue_.enqueue((std::string)args[0]);
@@ -172,10 +190,14 @@ private:
     // thread only runs ONNX inference; the write (and the length trim)
     // happens here, since output_timer_ only ever fires on the main
     // thread.
+    // Every crash seen so far traced back to a call to error() -- post()
+    // has been reliable throughout. Route everything through post() with
+    // an "ERROR:" prefix instead, to avoid whatever error() is doing
+    // (likely highlighting the object in the patcher) that's unsafe here.
     void flush_output() {
         std::pair<bool,std::string> log_msg;
         while (log_queue_.try_dequeue(log_msg)) {
-            if (log_msg.first) error(log_msg.second);
+            if (log_msg.first) c74::max::post("%s", ("ERROR: " + log_msg.second).c_str());
             else c74::max::post("%s", log_msg.second.c_str());
         }
         std::vector<float> audio;
@@ -195,14 +217,14 @@ private:
                     audio.resize(static_cast<size_t>(trim));
 
                 if (!ncs_buffer::write_mono(buffer_ref_, audio)) {
-                    error("ncs.snac_24kh.decode: output buffer not found — use 'set <name>' first");
+                    c74::max::post("%s", "ERROR: ncs.snac_24kh.decode: output buffer not found — use 'set <name>' first");
                     return;
                 }
                 std::string msg = "ncs.snac_24kh.decode: wrote " + std::to_string(audio.size())
                                    + " samples to buffer '" + std::string(buffer_ref_.name()) + "'";
                 c74::max::post("%s", msg.c_str());
             } catch (const std::exception& ex) {
-                error("ncs.snac_24kh.decode: write failed — " + std::string(ex.what()));
+                c74::max::post("%s", ("ERROR: ncs.snac_24kh.decode: write failed — " + std::string(ex.what())).c_str());
             }
         }
     }

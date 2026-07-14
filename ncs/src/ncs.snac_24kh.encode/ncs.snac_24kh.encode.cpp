@@ -33,13 +33,14 @@ static constexpr int64_t kHopLength   = 512;
 static constexpr int64_t kPadMultiple = 2048;
 
 // Buffer mode processes the whole signal in one ONNX forward pass and
-// emits it as a single Max list message (768 floats per frame). Past a
-// few hundred thousand elements that either blows Max's list-message
-// path or ONNX Runtime's arena allocator -- both fail in ways that don't
-// throw a catchable C++ exception (observed as a hard process abort, not
-// a graceful error). ~20s @ 24kHz keeps embeddings comfortably under 700k
-// atoms; longer material needs chunking or the real-time streaming variant.
-static constexpr size_t kMaxInputSamples = 480000; // ~20s @ 24kHz
+// emits it as a single Max list message (768 floats per frame). A ~20s
+// buffer (~722k atoms) was confirmed to crash Max itself: EXC_BAD_ACCESS
+// inside Max's own outlet_cache/real_outlet_list (a raw memmove onto a
+// corrupted/wrapped-around address), not something a try/catch here can
+// guard against -- it's an overflow inside Max's C list-handling, not a
+// C++ exception. Capping an order of magnitude lower for real safety
+// margin; longer material needs chunking or the real-time streaming variant.
+static constexpr size_t kMaxInputSamples = 50000; // ~2s @ 24kHz
 
 class NcsSnac_24khEncode : public object<NcsSnac_24khEncode>
 {
@@ -52,6 +53,20 @@ public:
     outlet<> length_out{ this, "(int) original buffer length in samples, before padding" };
 
     buffer_reference buffer_ref_{ this };
+
+    // @buffername lets the input buffer~ be set as an object-box argument
+    // (@buffername myBuf) or attribute message, alongside the 'set'
+    // message buffer_reference already provides. An attribute's setter
+    // runs immediately at construction with its default value ("" here)
+    // -- guard against binding an empty-named buffer, an untested call
+    // into Max's buffer subsystem that crashed on patch load.
+    attribute<symbol> buffername{ this, "buffername", "", description{"Name of the buffer~ to read from."},
+        setter{ MIN_FUNCTION {
+            symbol name = (symbol)args[0];
+            if (name != symbol(""))
+                buffer_ref_.set(name);
+            return {args};
+        }}};
 
     // =====================================================================
     // CONSTRUCTOR / DESTRUCTOR
@@ -85,18 +100,24 @@ public:
     // escaping it does not unwind cleanly, it hits std::terminate() and
     // takes the whole host process down. read_mono() already catches
     // internally, but the resize/enqueue below is wrapped too, defensively.
+    // Error reporting is routed through log_queue_ + flush_output() rather
+    // than calling error() inline here: a bang can arrive very early
+    // (e.g. from a loadbang, before the buffer is even set), and calling
+    // error() synchronously at that point crashed Max's console/UI --
+    // deferring it to the timer callback (the same path already used for
+    // worker-thread errors) avoids that.
     message<> bang_msg{this, "bang", "Read the referenced buffer~ and run the encoder",
         MIN_FUNCTION {
             try {
                 auto samples = ncs_buffer::read_mono(buffer_ref_);
                 if (samples.empty()) {
-                    error("ncs.snac_24kh.encode: buffer not found or empty");
+                    log_queue_.enqueue({true, "ncs.snac_24kh.encode: buffer not found or empty"});
                     return {};
                 }
                 if (samples.size() > kMaxInputSamples) {
-                    error("ncs.snac_24kh.encode: buffer is " + std::to_string(samples.size())
+                    log_queue_.enqueue({true, "ncs.snac_24kh.encode: buffer is " + std::to_string(samples.size())
                           + " samples, over the " + std::to_string(kMaxInputSamples)
-                          + "-sample (~20s) buffer-mode limit — split it into shorter chunks");
+                          + "-sample (~2s) buffer-mode limit — split it into shorter chunks"});
                     return {};
                 }
                 int original_length = static_cast<int>(samples.size());
@@ -105,7 +126,7 @@ public:
                 samples.resize(static_cast<size_t>(padded_length), 0.0f);
                 input_queue_.enqueue({std::move(samples), original_length});
             } catch (const std::exception& ex) {
-                error("ncs.snac_24kh.encode: bang failed — " + std::string(ex.what()));
+                log_queue_.enqueue({true, "ncs.snac_24kh.encode: bang failed — " + std::string(ex.what())});
             }
             return {};
         }};
@@ -113,7 +134,7 @@ public:
     message<> load{this, "load", "Load an ONNX model (.onnx)",
         MIN_FUNCTION {
             if (args.size() < 1) {
-                error("ncs.snac_24kh.encode: load requires a file path");
+                log_queue_.enqueue({true, "ncs.snac_24kh.encode: load requires a file path"});
                 return {};
             }
             load_queue_.enqueue((std::string)args[0]);
@@ -193,10 +214,14 @@ private:
         length_out_queue_.enqueue(original_length);
     }
 
+    // Every crash seen so far traced back to a call to error() -- post()
+    // has been reliable throughout. Route everything through post() with
+    // an "ERROR:" prefix instead, to avoid whatever error() is doing
+    // (likely highlighting the object in the patcher) that's unsafe here.
     void flush_output() {
         std::pair<bool,std::string> log_msg;
         while (log_queue_.try_dequeue(log_msg)) {
-            if (log_msg.first) error(log_msg.second);
+            if (log_msg.first) c74::max::post("%s", ("ERROR: " + log_msg.second).c_str());
             else c74::max::post("%s", log_msg.second.c_str());
         }
         // fire the length outlet before the embeddings outlet so that a

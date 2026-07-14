@@ -27,18 +27,21 @@ using namespace c74::min;
 
 // SNAC 24kHz quantizer: 3 codebook levels, vq_strides=[4,2,1] (coarsest
 // first). quantize_encodings.onnx has 1 input ("z") and 3 outputs
-// (codes_0/1/2), each at its own native temporal resolution (T/4, T/2, T).
+// (codes_0/1/2), each already at its own native temporal resolution
+// (T/4, T/2, T) -- each level gets its own outlet, so no zero-order-hold
+// expansion/interleaving is needed here.
 static constexpr int kNumLevels = 3;
-static constexpr int64_t kVqStrides[kNumLevels] = {4, 2, 1};
 
 class NcsSnac_24khVq : public object<NcsSnac_24khVq>
 {
 public:
-    MIN_DESCRIPTION     {"SNAC 24kHz residual vector quantizer: embeddings -> codes."};
+    MIN_DESCRIPTION     {"SNAC 24kHz residual vector quantizer: embeddings -> per-level codes."};
     MIN_TAGS            {"snac, onnx"};
     MIN_AUTHOR          {"Behzad Haki"};
     inlet<> control_in{ this, "(list/load) embeddings from ncs.snac_24kh.encode, or model path" };
-    outlet<> result_out{ this, "(list) codes, 3 ints per base frame (zero-order-held, coarsest first)" };
+    outlet<> level0_out{ this, "(list) codebook level 0 codes (coarsest, stride 4)" };
+    outlet<> level1_out{ this, "(list) codebook level 1 codes (stride 2)" };
+    outlet<> level2_out{ this, "(list) codebook level 2 codes (finest, stride 1)" };
 
     // =====================================================================
     // CONSTRUCTOR / DESTRUCTOR
@@ -59,6 +62,10 @@ public:
         stop_output_timer();
     }
 
+    // Errors go through log_queue_ (not error() inline) -- this can fire
+    // very early during patch load, and calling error() synchronously at
+    // that point has crashed Max's console/UI; deferring it to the timer
+    // callback avoids that.
     message<> list_msg{this, "list", "Embeddings to quantize",
         MIN_FUNCTION {
             try {
@@ -67,7 +74,7 @@ public:
                     emb[i] = (float)args[i];
                 input_queue_.enqueue(std::move(emb));
             } catch (const std::exception& ex) {
-                error("ncs.snac_24kh.vq: list handling failed — " + std::string(ex.what()));
+                log_queue_.enqueue({true, "ncs.snac_24kh.vq: list handling failed — " + std::string(ex.what())});
             }
             return {};
         }};
@@ -75,7 +82,7 @@ public:
     message<> load{this, "load", "Load an ONNX model (.onnx)",
         MIN_FUNCTION {
             if (args.size() < 1) {
-                error("ncs.snac_24kh.vq: load requires a file path");
+                log_queue_.enqueue({true, "ncs.snac_24kh.vq: load requires a file path"});
                 return {};
             }
             load_queue_.enqueue((std::string)args[0]);
@@ -91,7 +98,7 @@ private:
     std::atomic<bool> stop_{false};
 
     tsqueue<std::vector<float>> input_queue_;
-    tsqueue<std::vector<int>> output_queue_;
+    tsqueue<std::vector<std::vector<int>>> output_queue_;
     tsqueue<std::string> load_queue_;
     tsqueue<std::pair<bool,std::string>> log_queue_;
 
@@ -152,19 +159,33 @@ private:
         output_queue_.enqueue(std::move(result));
     }
 
+    // Outlets fire right-to-left (level2 first, level0 last) -- the
+    // standard Max convention, and lets a downstream ncs.snac_24kh.embedcodes
+    // treat its leftmost (level0) inlet as the hot/triggering one once its
+    // cold level1/level2 inlets have already been updated.
+    // Every crash seen so far traced back to a call to error() -- post()
+    // has been reliable throughout. Route everything through post() with
+    // an "ERROR:" prefix instead, to avoid whatever error() is doing
+    // (likely highlighting the object in the patcher) that's unsafe here.
     void flush_output() {
         std::pair<bool,std::string> log_msg;
         while (log_queue_.try_dequeue(log_msg)) {
-            if (log_msg.first) error(log_msg.second);
+            if (log_msg.first) c74::max::post("%s", ("ERROR: " + log_msg.second).c_str());
             else c74::max::post("%s", log_msg.second.c_str());
         }
-        std::vector<int> result;
+        std::vector<std::vector<int>> result;
         if (output_queue_.try_dequeue(result)) {
-            std::vector<int> temp;
+            std::vector<std::vector<int>> temp;
             while (output_queue_.try_dequeue(temp))
                 result = std::move(temp);
-            atoms out_atoms(result.begin(), result.end());
-            result_out.send(out_atoms);
+            if (result.size() == kNumLevels) {
+                atoms a2(result[2].begin(), result[2].end());
+                level2_out.send(a2);
+                atoms a1(result[1].begin(), result[1].end());
+                level1_out.send(a1);
+                atoms a0(result[0].begin(), result[0].end());
+                level0_out.send(a0);
+            }
         }
     }
 
@@ -221,11 +242,9 @@ private:
     }
 
     // Runs quantize_encodings.onnx on flattened [768 x T] embeddings and
-    // returns codes as N ints per base frame (coarsest first), with
-    // coarser levels zero-order-held to align with the finest level --
-    // matches the shared vq output format used by both buffer and
-    // real-time modules (see max-port-plan.md).
-    std::vector<int> run_onnx(const std::vector<float>& z) {
+    // returns each level's native-resolution codes as a separate int
+    // vector (index 0 = coarsest/stride 4 ... index 2 = finest/stride 1).
+    std::vector<std::vector<int>> run_onnx(const std::vector<float>& z) {
         if (!session_ || !model_loaded_) return {};
         try {
             std::vector<int64_t> shape = input_dims_;
@@ -246,19 +265,10 @@ private:
                                           out_names.data(), out_names.size());
             if (outputs.size() != kNumLevels) return {};
 
-            std::vector<std::vector<int64_t>> raw(kNumLevels);
-            for (int lvl = 0; lvl < kNumLevels; ++lvl)
-                raw[lvl] = tensor_to_vector_i64(outputs[lvl]);
-
-            std::vector<int> result;
-            result.reserve(static_cast<size_t>(T_b) * kNumLevels);
-            for (int64_t t = 0; t < T_b; ++t) {
-                for (int lvl = 0; lvl < kNumLevels; ++lvl) {
-                    int64_t idx = t / kVqStrides[lvl];
-                    if (idx >= static_cast<int64_t>(raw[lvl].size()))
-                        idx = static_cast<int64_t>(raw[lvl].size()) - 1;
-                    result.push_back(idx >= 0 ? static_cast<int>(raw[lvl][idx]) : 0);
-                }
+            std::vector<std::vector<int>> result(kNumLevels);
+            for (int lvl = 0; lvl < kNumLevels; ++lvl) {
+                auto raw = tensor_to_vector_i64(outputs[lvl]);
+                result[lvl].assign(raw.begin(), raw.end());
             }
             return result;
         } catch (const std::exception&) {}
