@@ -14,6 +14,7 @@
 #include "../include/onnx_helpers.h"
 #include "../include/buffer_helpers.h"
 #include "../include/chunk_helpers.h"
+#include "../include/resample_helpers.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -64,6 +65,18 @@ static constexpr int64_t kPadMultiple = 2048;
 // the last known-good point for real margin.
 static constexpr size_t kMaxChunkAtoms   = 4000;      // per list message
 static constexpr size_t kMaxInputSamples = 14400000;   // ~10min @ 24kHz
+
+// The model only works at 24kHz; Max's live samplerate is basically never
+// that (no audio interface offers 24kHz as a hardware rate). buffer~
+// content is assumed to be at Max's current live samplerate, so it's
+// resampled to 24kHz here before padding/inference -- a one-shot
+// src_simple() call per bang, not the persistent-state streaming
+// resampler real-time signal modules need. This object has no signal
+// inlet/outlet, so there's no per-object samplerate() (that's a
+// sample_operator/audio_bang thing) -- c74::max::sys_getsr() reads the
+// audio driver's current global samplerate instead, read on the main
+// thread (in bang_msg) and passed into the queued work item.
+static constexpr double kModelSampleRate = 24000.0;
 
 struct OutChunk {
     int chunk_index;
@@ -125,8 +138,11 @@ public:
     // not safe to call from an arbitrary spawned std::thread (only the
     // main thread or the audio thread, per every min-api/min-devkit
     // example). So the read happens here, synchronously, and only the
-    // padded samples (pure data) cross over to the worker thread for the
-    // actual (slow) ONNX inference.
+    // raw samples (pure data) cross over to the worker thread for
+    // resampling + padding + the actual (slow) ONNX inference.
+    // sys_getsr() is read here too and carried alongside the samples
+    // rather than re-read from the worker, for the same locality reason
+    // as the buffer read.
     // This handler runs inside Max's own C dispatch loop -- an exception
     // escaping it does not unwind cleanly, it hits std::terminate() and
     // takes the whole host process down. read_mono() already catches
@@ -150,11 +166,8 @@ public:
                           + " samples, over the " + std::to_string(kMaxInputSamples) + "-sample sanity limit"});
                     return {};
                 }
-                int original_length = static_cast<int>(samples.size());
-                int64_t padded_length = ((static_cast<int64_t>(samples.size()) + kPadMultiple - 1)
-                                          / kPadMultiple) * kPadMultiple;
-                samples.resize(static_cast<size_t>(padded_length), 0.0f);
-                input_queue_.enqueue({std::move(samples), original_length});
+                double host_sr = static_cast<double>(c74::max::sys_getsr());
+                input_queue_.enqueue({std::move(samples), host_sr});
             } catch (const std::exception& ex) {
                 log_queue_.enqueue({true, "ncs.snac_24kh.encode: bang failed — " + std::string(ex.what())});
             }
@@ -179,7 +192,7 @@ private:
     std::atomic<bool> worker_running_{false};
     std::atomic<bool> stop_{false};
 
-    tsqueue<std::pair<std::vector<float>, int>> input_queue_;
+    tsqueue<std::pair<std::vector<float>, double>> input_queue_;
     tsqueue<OutChunk> output_queue_;
     tsqueue<std::string> load_queue_;
     tsqueue<std::pair<bool,std::string>> log_queue_;
@@ -219,22 +232,33 @@ private:
             std::string path;
             if (load_queue_.try_dequeue(path))
                 load_model(path);
-            std::pair<std::vector<float>, int> item;
+            std::pair<std::vector<float>, double> item;
             if (!input_queue_.wait_dequeue(item, 100))
                 continue;
-            std::pair<std::vector<float>, int> temp;
+            std::pair<std::vector<float>, double> temp;
             while (input_queue_.try_dequeue(temp))
                 item = std::move(temp);
             process(item.first, item.second);
         }
     }
 
-    void process(const std::vector<float>& padded_samples, int original_length) {
+    // Resample host_sr -> 24kHz first (so original_length below is in
+    // 24kHz-space, matching what ncs.snac_24kh.decode expects to trim to
+    // after its own resample back), then pad to kPadMultiple for the model.
+    void process(const std::vector<float>& raw_samples, double host_sr) {
         if (!model_loaded_) {
             log_queue_.enqueue({true, "ncs.snac_24kh.encode: no model loaded"});
             return;
         }
-        auto z = run_onnx(padded_samples);
+        std::vector<float> samples = (host_sr > 0.0)
+            ? ncs_resample::resample_simple(raw_samples, kModelSampleRate / host_sr)
+            : raw_samples;
+        int original_length = static_cast<int>(samples.size());
+        int64_t padded_length = ((static_cast<int64_t>(samples.size()) + kPadMultiple - 1)
+                                  / kPadMultiple) * kPadMultiple;
+        samples.resize(static_cast<size_t>(padded_length), 0.0f);
+
+        auto z = run_onnx(samples);
         if (z.empty()) {
             log_queue_.enqueue({true, "ncs.snac_24kh.encode: inference failed"});
             return;

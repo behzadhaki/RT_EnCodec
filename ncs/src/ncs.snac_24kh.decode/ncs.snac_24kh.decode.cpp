@@ -13,6 +13,7 @@
 #include "../include/shared_external_helpers.h"
 #include "../include/onnx_helpers.h"
 #include "../include/buffer_helpers.h"
+#include "../include/resample_helpers.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -25,6 +26,23 @@
 #include <vector>
 
 using namespace c74::min;
+
+// The model only outputs 24kHz audio; it's resampled to Max's live
+// samplerate here before being written to the output buffer~ -- a
+// one-shot src_simple() call per decode, not the persistent-state
+// streaming resampler real-time signal modules need. This object has no
+// signal inlet/outlet, so there's no per-object samplerate() (that's a
+// sample_operator/audio_bang thing) -- c74::max::sys_getsr() reads the
+// audio driver's current global samplerate instead, read in list_msg
+// (main thread, when the last chunk arrives) and carried into the
+// worker alongside the reassembled embeddings.
+static constexpr double kModelSampleRate = 24000.0;
+
+struct DecodeJob {
+    std::vector<float> embeddings;
+    int original_length;  // in 24kHz-space, i.e. before the output resample
+    double host_sr;
+};
 
 // A single "1-atom send followed by a large-list send" pattern crashed
 // Max regardless of size or which outlet was used (see
@@ -83,10 +101,11 @@ public:
     // accumulate here; only once is_last=1 arrives does decode_audio.onnx
     // actually run, on the full reassembled embeddings -- so there's no
     // chunk-boundary artifact in the decoded audio, chunking is purely a
-    // transport concern. Errors go through log_queue_ (not error()
-    // inline) -- this can fire very early during patch load, and calling
-    // error() synchronously at that point has crashed Max's console/UI;
-    // deferring it to the timer callback avoids that.
+    // transport concern. sys_getsr() is read here (main thread) at the
+    // same time. Errors go through log_queue_ (not error() inline) -- this can fire
+    // very early during patch load, and calling error() synchronously at
+    // that point has crashed Max's console/UI; deferring it to the timer
+    // callback avoids that.
     message<> list_msg{this, "list", "Embeddings chunk: chunk_index, is_last, original_length, data...",
         MIN_FUNCTION {
             try {
@@ -97,7 +116,8 @@ public:
                 for (size_t i = 3; i < args.size(); ++i)
                     accum_embeddings_.push_back((float)args[i]);
                 if (is_last) {
-                    input_queue_.enqueue({std::move(accum_embeddings_), length});
+                    double host_sr = static_cast<double>(c74::max::sys_getsr());
+                    input_queue_.enqueue({std::move(accum_embeddings_), length, host_sr});
                     accum_embeddings_.clear();
                 }
             } catch (const std::exception& ex) {
@@ -127,8 +147,8 @@ private:
     // Only ever touched from message handlers, i.e. the main thread.
     std::vector<float> accum_embeddings_;
 
-    tsqueue<std::pair<std::vector<float>, int>> input_queue_;
-    tsqueue<std::pair<std::vector<float>, int>> output_queue_;
+    tsqueue<DecodeJob> input_queue_;
+    tsqueue<std::vector<float>> output_queue_;
     tsqueue<std::string> load_queue_;
     tsqueue<std::pair<bool,std::string>> log_queue_;
 
@@ -167,35 +187,43 @@ private:
             std::string path;
             if (load_queue_.try_dequeue(path))
                 load_model(path);
-            std::pair<std::vector<float>, int> item;
+            DecodeJob item;
             if (!input_queue_.wait_dequeue(item, 100))
                 continue;
-            std::pair<std::vector<float>, int> temp;
+            DecodeJob temp;
             while (input_queue_.try_dequeue(temp))
                 item = std::move(temp);
-            process(item.first, item.second);
+            process(item);
         }
     }
 
-    void process(const std::vector<float>& embeddings, int original_length) {
+    // Trim to original_length (still in 24kHz-space, i.e. before the
+    // pad ncs.snac_24kh.encode added) BEFORE resampling 24000 -> host_sr,
+    // so the trim always operates in the space the model actually
+    // produced -- resampling first would need a second, ratio-scaled trim.
+    void process(const DecodeJob& job) {
         if (!model_loaded_) {
             log_queue_.enqueue({true, "ncs.snac_24kh.decode: no model loaded"});
             return;
         }
-        auto audio = run_onnx(embeddings);
+        auto audio = run_onnx(job.embeddings);
         if (audio.empty()) {
             log_queue_.enqueue({true, "ncs.snac_24kh.decode: inference failed"});
             return;
         }
-        output_queue_.enqueue({std::move(audio), original_length});
+        if (job.original_length > 0 && static_cast<size_t>(job.original_length) < audio.size())
+            audio.resize(static_cast<size_t>(job.original_length));
+        if (job.host_sr > 0.0)
+            audio = ncs_resample::resample_simple(audio, job.host_sr / kModelSampleRate);
+        output_queue_.enqueue(std::move(audio));
     }
 
     // buffer~ access must happen on the main thread -- min-api's
     // buffer_lock wraps Max's buffer_edit_begin/buffer_edit_end, which are
-    // not safe to call from an arbitrary spawned std::thread. The worker
-    // thread only runs ONNX inference; the write (and the length trim)
+    // not safe to call from an arbitrary spawned std::thread. The write
     // happens here, since output_timer_ only ever fires on the main
-    // thread.
+    // thread; trimming/resampling already happened in the worker's
+    // process() (see the comment there for why).
     // Every crash seen so far traced back to a call to error() -- post()
     // has been reliable throughout. Route everything through post() with
     // an "ERROR:" prefix instead, to avoid whatever error() is doing
@@ -206,20 +234,17 @@ private:
             if (log_msg.first) c74::max::post("%s", ("ERROR: " + log_msg.second).c_str());
             else c74::max::post("%s", log_msg.second.c_str());
         }
-        std::pair<std::vector<float>, int> item;
-        if (output_queue_.try_dequeue(item)) {
-            auto& audio = item.first;
-
+        std::vector<float> audio;
+        if (output_queue_.try_dequeue(audio)) {
             // This runs inside Max's own C dispatch loop (via output_timer_)
             // -- an exception escaping it does not unwind cleanly, it hits
             // std::terminate() and takes the whole host process down.
-            // write_mono() already catches internally; this wraps the trim
-            // and the name/post formatting too, defensively.
+            // write_mono() already catches internally; this wraps the
+            // name/post formatting too, defensively. Trimming and the
+            // output resample already happened in process() (worker
+            // thread), since both need original_length/host_sr which are
+            // only meaningful in 24kHz-space right after inference.
             try {
-                int trim = item.second;
-                if (trim > 0 && static_cast<size_t>(trim) < audio.size())
-                    audio.resize(static_cast<size_t>(trim));
-
                 if (!ncs_buffer::write_mono(buffer_ref_, audio)) {
                     c74::max::post("%s", "ERROR: ncs.snac_24kh.decode: output buffer not found — use 'set <name>' first");
                     return;

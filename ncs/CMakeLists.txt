@@ -23,6 +23,27 @@ endif()
 include(cmake/CPM.cmake)
 CPMAddPackage("gh:Cycling74/min-api#main")
 
+# libsamplerate -- buffer-mode SNAC/EnCodec modules run at a fixed model
+# sample rate (e.g. 24kHz) but read/write buffer~ content assumed to be at
+# Max's live samplerate, so encode/decode resample once per call (a plain
+# src_simple() call, not the persistent-state streaming resampler used by
+# real-time signal modules). Linked in automatically wherever
+# create_simple_external/create_onnx_external find the `samplerate` target.
+include(FetchContent)
+set(LIBSAMPLERATE_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(libsamplerate
+    GIT_REPOSITORY https://github.com/libsndfile/libsamplerate.git
+    GIT_TAG 0.2.2
+)
+# libsamplerate 0.2.2's own CMakeLists.txt declares
+# cmake_minimum_required(VERSION 3.1), which CMake >= 4.0 refuses outright
+# (compatibility below 3.5 was removed). Scoped so it only affects this
+# vendored dependency's own configure, not the rest of the project.
+set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
+FetchContent_MakeAvailable(libsamplerate)
+unset(CMAKE_POLICY_VERSION_MINIMUM)
+
 # Locate max-sdk-base (c74_max.h, ext.h etc.)
 set(_MSB "${min-api_SOURCE_DIR}/max-sdk-base")
 set(_MSB2 "${CMAKE_SOURCE_DIR}/lib/max-sdk/source/max-sdk-base")
