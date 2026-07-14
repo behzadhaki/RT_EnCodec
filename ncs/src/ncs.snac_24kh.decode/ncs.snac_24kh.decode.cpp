@@ -26,14 +26,22 @@
 
 using namespace c74::min;
 
+// A single "1-atom send followed by a large-list send" pattern crashed
+// Max regardless of size or which outlet was used (see
+// ncs.snac_24kh.encode.cpp's kMaxChunkAtoms comment for the full story).
+// So there's only one inlet here now; ncs.snac_24kh.embedcodes sends its
+// (chunked) embeddings as a single self-describing list per chunk, all
+// leading fields NUMBERS (a leading symbol gets routed by Max as a named
+// message selector, not the generic list handler):
+//   chunk_index, is_last (0/1), original_length, data...
+
 class NcsSnac_24khDecode : public object<NcsSnac_24khDecode>
 {
 public:
     MIN_DESCRIPTION     {"Runs the SNAC 24kHz decoder and writes the result to a named buffer~."};
     MIN_TAGS            {"snac, onnx, audio"};
     MIN_AUTHOR          {"Behzad Haki"};
-    inlet<> embeddings_in{ this, "(set/load/list) buffer name, model path, or quantized embeddings from ncs.snac_24kh.embedcodes" };
-    inlet<> length_in{ this, "(int) original sample count, from ncs.snac_24kh.encode outlet 2" };
+    inlet<> embeddings_in{ this, "(set/load/list) buffer name, model path, or chunk_index, is_last, original_length, data..." };
 
     buffer_reference buffer_ref_{ this };
 
@@ -70,31 +78,27 @@ public:
         stop_output_timer();
     }
 
-    // Inlet 2 (cold): caches the original, pre-padding sample count that
-    // ncs.snac_24kh.encode reported, so the decoded audio can be trimmed
-    // back to it before being written into the output buffer~.
-    message<> number{this, "number", "Original sample count (inlet 2)",
-        MIN_FUNCTION {
-            if (inlet == 1)
-                original_length_ = (int)args[0];
-            return {};
-        }};
-
-    // Inlet 1 (hot): the arrival of the embeddings list is itself the
-    // trigger -- unlike ncs.snac_24kh.encode there is no separate bang,
-    // since this object has no other way to know new data is ready.
-    // Errors go through log_queue_ (not error() inline) -- this can fire
-    // very early during patch load, and calling error() synchronously at
-    // that point has crashed Max's console/UI; deferring it to the timer
-    // callback avoids that.
-    message<> list_msg{this, "list", "Quantized embeddings (inlet 1)",
+    // Parses ncs.snac_24kh.embedcodes's self-describing chunk format:
+    // chunk_index, is_last (0/1), original_length, data.... Chunks
+    // accumulate here; only once is_last=1 arrives does decode_audio.onnx
+    // actually run, on the full reassembled embeddings -- so there's no
+    // chunk-boundary artifact in the decoded audio, chunking is purely a
+    // transport concern. Errors go through log_queue_ (not error()
+    // inline) -- this can fire very early during patch load, and calling
+    // error() synchronously at that point has crashed Max's console/UI;
+    // deferring it to the timer callback avoids that.
+    message<> list_msg{this, "list", "Embeddings chunk: chunk_index, is_last, original_length, data...",
         MIN_FUNCTION {
             try {
-                if (inlet == 0) {
-                    std::vector<float> emb(args.size());
-                    for (size_t i = 0; i < args.size(); ++i)
-                        emb[i] = (float)args[i];
-                    input_queue_.enqueue(std::move(emb));
+                // Header is 3 atoms: chunk_index, is_last, original_length.
+                if (args.size() < 3) return {};
+                bool is_last = (int)args[1] != 0;
+                int length = (int)args[2];
+                for (size_t i = 3; i < args.size(); ++i)
+                    accum_embeddings_.push_back((float)args[i]);
+                if (is_last) {
+                    input_queue_.enqueue({std::move(accum_embeddings_), length});
+                    accum_embeddings_.clear();
                 }
             } catch (const std::exception& ex) {
                 log_queue_.enqueue({true, "ncs.snac_24kh.decode: list handling failed — " + std::string(ex.what())});
@@ -119,10 +123,12 @@ private:
     std::thread worker_thread_;
     std::atomic<bool> worker_running_{false};
     std::atomic<bool> stop_{false};
-    std::atomic<int> original_length_{-1};
 
-    tsqueue<std::vector<float>> input_queue_;
-    tsqueue<std::vector<float>> output_queue_;
+    // Only ever touched from message handlers, i.e. the main thread.
+    std::vector<float> accum_embeddings_;
+
+    tsqueue<std::pair<std::vector<float>, int>> input_queue_;
+    tsqueue<std::pair<std::vector<float>, int>> output_queue_;
     tsqueue<std::string> load_queue_;
     tsqueue<std::pair<bool,std::string>> log_queue_;
 
@@ -161,17 +167,17 @@ private:
             std::string path;
             if (load_queue_.try_dequeue(path))
                 load_model(path);
-            std::vector<float> embeddings;
-            if (!input_queue_.wait_dequeue(embeddings, 100))
+            std::pair<std::vector<float>, int> item;
+            if (!input_queue_.wait_dequeue(item, 100))
                 continue;
-            std::vector<float> temp;
+            std::pair<std::vector<float>, int> temp;
             while (input_queue_.try_dequeue(temp))
-                embeddings = std::move(temp);
-            process(embeddings);
+                item = std::move(temp);
+            process(item.first, item.second);
         }
     }
 
-    void process(const std::vector<float>& embeddings) {
+    void process(const std::vector<float>& embeddings, int original_length) {
         if (!model_loaded_) {
             log_queue_.enqueue({true, "ncs.snac_24kh.decode: no model loaded"});
             return;
@@ -181,7 +187,7 @@ private:
             log_queue_.enqueue({true, "ncs.snac_24kh.decode: inference failed"});
             return;
         }
-        output_queue_.enqueue(std::move(audio));
+        output_queue_.enqueue({std::move(audio), original_length});
     }
 
     // buffer~ access must happen on the main thread -- min-api's
@@ -200,11 +206,9 @@ private:
             if (log_msg.first) c74::max::post("%s", ("ERROR: " + log_msg.second).c_str());
             else c74::max::post("%s", log_msg.second.c_str());
         }
-        std::vector<float> audio;
-        if (output_queue_.try_dequeue(audio)) {
-            std::vector<float> temp;
-            while (output_queue_.try_dequeue(temp))
-                audio = std::move(temp);
+        std::pair<std::vector<float>, int> item;
+        if (output_queue_.try_dequeue(item)) {
+            auto& audio = item.first;
 
             // This runs inside Max's own C dispatch loop (via output_timer_)
             // -- an exception escaping it does not unwind cleanly, it hits
@@ -212,7 +216,7 @@ private:
             // write_mono() already catches internally; this wraps the trim
             // and the name/post formatting too, defensively.
             try {
-                int trim = original_length_.load();
+                int trim = item.second;
                 if (trim > 0 && static_cast<size_t>(trim) < audio.size())
                     audio.resize(static_cast<size_t>(trim));
 

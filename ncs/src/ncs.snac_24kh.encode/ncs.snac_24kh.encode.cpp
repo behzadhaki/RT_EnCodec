@@ -13,6 +13,7 @@
 #include "../include/shared_external_helpers.h"
 #include "../include/onnx_helpers.h"
 #include "../include/buffer_helpers.h"
+#include "../include/chunk_helpers.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -32,15 +33,44 @@ using namespace c74::min;
 static constexpr int64_t kHopLength   = 512;
 static constexpr int64_t kPadMultiple = 2048;
 
-// Buffer mode processes the whole signal in one ONNX forward pass and
-// emits it as a single Max list message (768 floats per frame). A ~20s
-// buffer (~722k atoms) was confirmed to crash Max itself: EXC_BAD_ACCESS
-// inside Max's own outlet_cache/real_outlet_list (a raw memmove onto a
-// corrupted/wrapped-around address), not something a try/catch here can
-// guard against -- it's an overflow inside Max's C list-handling, not a
-// C++ exception. Capping an order of magnitude lower for real safety
-// margin; longer material needs chunking or the real-time streaming variant.
-static constexpr size_t kMaxInputSamples = 50000; // ~2s @ 24kHz
+// A ~20s buffer (~722k atoms in one list message) was confirmed to crash
+// Max itself: EXC_BAD_ACCESS inside Max's own outlet_cache/real_outlet_list
+// (a raw memmove onto a corrupted/wrapped-around address) -- an overflow
+// inside Max's C list-handling, not a catchable C++ exception. The whole
+// buffer is still encoded in ONE ONNX forward pass (no change to the
+// actual inference, so no chunk-boundary artifacts); the embeddings are
+// SENT out in pieces of at most kMaxChunkAtoms.
+//
+// Neither capping chunk size nor pacing to one send per tick was
+// sufficient on its own -- the crash reproduced even with a single small
+// (~18k atom) chunk, as long as it followed OTHER outlet.send() calls
+// (last_out, length_out) in the same flush_output() tick. So there is now
+// exactly ONE outlet, and every chunk is a single self-describing list:
+//   chunk_index, is_last (0/1), original_length, data...
+// -- all leading NUMBERS, deliberately no leading symbol: in Max, a
+// message whose first atom is a symbol is routed as a *named message
+// selector* (e.g. a leading "frame" atom makes Max look for a method
+// literally called "frame", not the generic list handler) -- confirmed
+// by "doesn't understand frame" once an earlier symbol-tagged version of
+// this format was tried. One outlet.send() per flush_output() tick,
+// nothing else touched.
+//
+// kMaxInputSamples is now just a generous sanity cap on ONNX inference
+// time/memory for one bang, not a crash-prevention limit.
+// A 400ms buffer (~15.4k atoms in one unchunked message) worked; slightly
+// larger buffers (still a single unchunked message, well under the old
+// 50k cap) crashed -- so the real ceiling on a single Max list message
+// is far lower than assumed. Dropping this an order of magnitude below
+// the last known-good point for real margin.
+static constexpr size_t kMaxChunkAtoms   = 4000;      // per list message
+static constexpr size_t kMaxInputSamples = 14400000;   // ~10min @ 24kHz
+
+struct OutChunk {
+    int chunk_index;
+    bool is_last;
+    int original_length;
+    std::vector<float> data;
+};
 
 class NcsSnac_24khEncode : public object<NcsSnac_24khEncode>
 {
@@ -49,8 +79,9 @@ public:
     MIN_TAGS            {"snac, onnx, audio"};
     MIN_AUTHOR          {"Behzad Haki"};
     inlet<> control_in{ this, "(set/bang/load) buffer name, trigger, or model path" };
-    outlet<> embeddings_out{ this, "(list) latent embeddings, channel-major flattened [768 x T]" };
-    outlet<> length_out{ this, "(int) original buffer length in samples, before padding" };
+    // Single self-describing outlet: chunk_index, is_last (0/1),
+    // original_length, then the embeddings data, channel-major [768 x T].
+    outlet<> embeddings_out{ this, "(list) chunk_index, is_last, original_length, embeddings data..." };
 
     buffer_reference buffer_ref_{ this };
 
@@ -116,8 +147,7 @@ public:
                 }
                 if (samples.size() > kMaxInputSamples) {
                     log_queue_.enqueue({true, "ncs.snac_24kh.encode: buffer is " + std::to_string(samples.size())
-                          + " samples, over the " + std::to_string(kMaxInputSamples)
-                          + "-sample (~2s) buffer-mode limit — split it into shorter chunks"});
+                          + " samples, over the " + std::to_string(kMaxInputSamples) + "-sample sanity limit"});
                     return {};
                 }
                 int original_length = static_cast<int>(samples.size());
@@ -150,8 +180,7 @@ private:
     std::atomic<bool> stop_{false};
 
     tsqueue<std::pair<std::vector<float>, int>> input_queue_;
-    tsqueue<std::vector<float>> output_queue_;
-    tsqueue<int> length_out_queue_;
+    tsqueue<OutChunk> output_queue_;
     tsqueue<std::string> load_queue_;
     tsqueue<std::pair<bool,std::string>> log_queue_;
 
@@ -210,31 +239,36 @@ private:
             log_queue_.enqueue({true, "ncs.snac_24kh.encode: inference failed"});
             return;
         }
-        output_queue_.enqueue(std::move(z));
-        length_out_queue_.enqueue(original_length);
+        auto chunks = ncs_chunk::split(z, kMaxChunkAtoms);
+        for (size_t i = 0; i < chunks.size(); ++i) {
+            bool is_last = (i + 1 == chunks.size());
+            output_queue_.enqueue({static_cast<int>(i), is_last, original_length, std::move(chunks[i])});
+        }
     }
 
     // Every crash seen so far traced back to a call to error() -- post()
     // has been reliable throughout. Route everything through post() with
     // an "ERROR:" prefix instead, to avoid whatever error() is doing
     // (likely highlighting the object in the patcher) that's unsafe here.
+    // Exactly ONE outlet.send() per tick, a single list carrying the
+    // header (chunk_index, is_last, original_length -- all numbers, no
+    // leading symbol, see the kMaxChunkAtoms comment above) and the data
+    // chunk together.
     void flush_output() {
         std::pair<bool,std::string> log_msg;
         while (log_queue_.try_dequeue(log_msg)) {
             if (log_msg.first) c74::max::post("%s", ("ERROR: " + log_msg.second).c_str());
             else c74::max::post("%s", log_msg.second.c_str());
         }
-        // fire the length outlet before the embeddings outlet so that a
-        // patch cord run in parallel to a downstream decode~'s length
-        // inlet is guaranteed to have the value cached before the
-        // embeddings arrive there (after the vq/embedcodes hop).
-        int len;
-        if (length_out_queue_.try_dequeue(len))
-            length_out.send(len);
-        std::vector<float> result;
-        if (output_queue_.try_dequeue(result)) {
-            atoms out_atoms(result.begin(), result.end());
-            embeddings_out.send(out_atoms);
+        OutChunk chunk;
+        if (output_queue_.try_dequeue(chunk)) {
+            atoms msg;
+            msg.reserve(3 + chunk.data.size());
+            msg.push_back(chunk.chunk_index);
+            msg.push_back(chunk.is_last ? 1 : 0);
+            msg.push_back(chunk.original_length);
+            for (float f : chunk.data) msg.push_back(f);
+            embeddings_out.send(msg);
         }
     }
 

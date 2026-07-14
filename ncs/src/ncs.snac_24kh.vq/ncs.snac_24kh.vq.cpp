@@ -32,16 +32,36 @@ using namespace c74::min;
 // expansion/interleaving is needed here.
 static constexpr int kNumLevels = 3;
 
+// A single "1-atom send followed by a large-list send" pattern crashed
+// Max regardless of size or which outlet was used (see
+// ncs.snac_24kh.encode.cpp's kMaxChunkAtoms comment for the full story).
+// So ncs.snac_24kh.encode now sends ONE self-describing list per chunk:
+//   chunk_index, is_last (0/1), original_length, data...
+// on a single outlet -- no separate last/length inlets here either. All
+// leading fields are NUMBERS, deliberately no leading symbol: a message
+// starting with a symbol is routed by Max as a named message selector,
+// not handed to the generic list handler (confirmed by a "doesn't
+// understand" error from an earlier symbol-tagged version of this
+// format). Codes (this module's own output) are ~768x smaller than
+// embeddings and never need chunking, but are still queued and sent ONE
+// OUTLET PER TICK (never more than one outlet.send() inside a single
+// flush_output() call), as a blanket precaution now that the exact
+// trigger condition inside Max's outlet_cache isn't fully understood.
+struct PendingSend {
+    int outlet_id; // 0 = level0, 1 = level1, 2 = level2
+    atoms data;    // original_length, codes...
+};
+
 class NcsSnac_24khVq : public object<NcsSnac_24khVq>
 {
 public:
     MIN_DESCRIPTION     {"SNAC 24kHz residual vector quantizer: embeddings -> per-level codes."};
     MIN_TAGS            {"snac, onnx"};
     MIN_AUTHOR          {"Behzad Haki"};
-    inlet<> control_in{ this, "(list/load) embeddings from ncs.snac_24kh.encode, or model path" };
-    outlet<> level0_out{ this, "(list) codebook level 0 codes (coarsest, stride 4)" };
-    outlet<> level1_out{ this, "(list) codebook level 1 codes (stride 2)" };
-    outlet<> level2_out{ this, "(list) codebook level 2 codes (finest, stride 1)" };
+    inlet<> control_in{ this, "(list/load) embeddings chunk from ncs.snac_24kh.encode, or model path" };
+    outlet<> level0_out{ this, "(list) original_length, codes... -- codebook level 0 (coarsest, stride 4)" };
+    outlet<> level1_out{ this, "(list) original_length, codes... -- codebook level 1 (stride 2)" };
+    outlet<> level2_out{ this, "(list) original_length, codes... -- codebook level 2 (finest, stride 1)" };
 
     // =====================================================================
     // CONSTRUCTOR / DESTRUCTOR
@@ -62,17 +82,29 @@ public:
         stop_output_timer();
     }
 
+    // Parses ncs.snac_24kh.encode's self-describing chunk format:
+    // chunk_index, is_last (0/1), original_length, data.... Chunks
+    // accumulate here; only once is_last=1 arrives is the full reassembled
+    // embeddings vector handed to the worker -- the ONNX inference itself
+    // always runs on the complete, non-chunked tensor, so there's no
+    // chunk-boundary artifact in the quantization.
     // Errors go through log_queue_ (not error() inline) -- this can fire
     // very early during patch load, and calling error() synchronously at
     // that point has crashed Max's console/UI; deferring it to the timer
     // callback avoids that.
-    message<> list_msg{this, "list", "Embeddings to quantize",
+    message<> list_msg{this, "list", "Embeddings chunk: chunk_index, is_last, original_length, data...",
         MIN_FUNCTION {
             try {
-                std::vector<float> emb(args.size());
-                for (size_t i = 0; i < args.size(); ++i)
-                    emb[i] = (float)args[i];
-                input_queue_.enqueue(std::move(emb));
+                // Header is 3 atoms: chunk_index, is_last, original_length.
+                if (args.size() < 3) return {};
+                bool is_last = (int)args[1] != 0;
+                original_length_ = (int)args[2];
+                for (size_t i = 3; i < args.size(); ++i)
+                    accum_z_.push_back((float)args[i]);
+                if (is_last) {
+                    input_queue_.enqueue({std::move(accum_z_), original_length_});
+                    accum_z_.clear();
+                }
             } catch (const std::exception& ex) {
                 log_queue_.enqueue({true, "ncs.snac_24kh.vq: list handling failed — " + std::string(ex.what())});
             }
@@ -97,8 +129,12 @@ private:
     std::atomic<bool> worker_running_{false};
     std::atomic<bool> stop_{false};
 
-    tsqueue<std::vector<float>> input_queue_;
-    tsqueue<std::vector<std::vector<int>>> output_queue_;
+    // Only ever touched from message handlers, i.e. the main thread.
+    std::vector<float> accum_z_;
+    int original_length_{0};
+
+    tsqueue<std::pair<std::vector<float>, int>> input_queue_;
+    tsqueue<PendingSend> output_queue_;
     tsqueue<std::string> load_queue_;
     tsqueue<std::pair<bool,std::string>> log_queue_;
 
@@ -136,56 +172,55 @@ private:
             std::string path;
             if (load_queue_.try_dequeue(path))
                 load_model(path);
-            std::vector<float> input;
-            if (!input_queue_.wait_dequeue(input, 100))
+            std::pair<std::vector<float>, int> item;
+            if (!input_queue_.wait_dequeue(item, 100))
                 continue;
-            std::vector<float> temp;
+            std::pair<std::vector<float>, int> temp;
             while (input_queue_.try_dequeue(temp))
-                input = std::move(temp);
-            process(input);
+                item = std::move(temp);
+            process(item.first, item.second);
         }
     }
 
-    void process(const std::vector<float>& msg) {
+    // Builds and queues one PendingSend per level, level2 first ... level0
+    // last, so that when flush_output() drains them one per tick, a
+    // downstream ncs.snac_24kh.embedcodes (whose leftmost/level0 inlet is
+    // hot) sees its cold level1/level2 inlets updated before the trigger.
+    void process(const std::vector<float>& z, int original_length) {
         if (!model_loaded_) {
             log_queue_.enqueue({true, "ncs.snac_24kh.vq: no model loaded"});
             return;
         }
-        auto result = run_onnx(msg);
-        if (result.empty()) {
+        auto result = run_onnx(z);
+        if (result.size() != kNumLevels) {
             log_queue_.enqueue({true, "ncs.snac_24kh.vq: inference failed"});
             return;
         }
-        output_queue_.enqueue(std::move(result));
+        for (int lvl = kNumLevels - 1; lvl >= 0; --lvl) {
+            atoms msg;
+            msg.reserve(1 + result[lvl].size());
+            msg.push_back(original_length);
+            for (int v : result[lvl]) msg.push_back(v);
+            output_queue_.enqueue({lvl, std::move(msg)});
+        }
     }
 
-    // Outlets fire right-to-left (level2 first, level0 last) -- the
-    // standard Max convention, and lets a downstream ncs.snac_24kh.embedcodes
-    // treat its leftmost (level0) inlet as the hot/triggering one once its
-    // cold level1/level2 inlets have already been updated.
     // Every crash seen so far traced back to a call to error() -- post()
     // has been reliable throughout. Route everything through post() with
     // an "ERROR:" prefix instead, to avoid whatever error() is doing
     // (likely highlighting the object in the patcher) that's unsafe here.
+    // Exactly ONE outlet.send() per tick (see PendingSend comment above).
     void flush_output() {
         std::pair<bool,std::string> log_msg;
         while (log_queue_.try_dequeue(log_msg)) {
             if (log_msg.first) c74::max::post("%s", ("ERROR: " + log_msg.second).c_str());
             else c74::max::post("%s", log_msg.second.c_str());
         }
-        std::vector<std::vector<int>> result;
-        if (output_queue_.try_dequeue(result)) {
-            std::vector<std::vector<int>> temp;
-            while (output_queue_.try_dequeue(temp))
-                result = std::move(temp);
-            if (result.size() == kNumLevels) {
-                atoms a2(result[2].begin(), result[2].end());
-                level2_out.send(a2);
-                atoms a1(result[1].begin(), result[1].end());
-                level1_out.send(a1);
-                atoms a0(result[0].begin(), result[0].end());
-                level0_out.send(a0);
-            }
+        PendingSend item;
+        if (output_queue_.try_dequeue(item)) {
+            if (item.outlet_id == 2) level2_out.send(item.data);
+            else if (item.outlet_id == 1) level1_out.send(item.data);
+            else level0_out.send(item.data);
         }
     }
 

@@ -12,6 +12,7 @@
 
 #include "../include/shared_external_helpers.h"
 #include "../include/onnx_helpers.h"
+#include "../include/chunk_helpers.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -34,9 +35,32 @@ using namespace c74::min;
 // here, with a per-level gain applied before summing.
 static constexpr int kNumLevels = 3;
 
+// A single "1-atom send followed by a large-list send" pattern crashed
+// Max regardless of size or which outlet was used (see
+// ncs.snac_24kh.encode.cpp's kMaxChunkAtoms comment for the full story).
+// So every input (from ncs.snac_24kh.vq) and output (to
+// ncs.snac_24kh.decode) here is ONE self-describing list, and
+// flush_output() sends AT MOST ONE outlet per tick, full stop. All
+// leading fields are NUMBERS, deliberately no leading symbol -- a
+// message starting with a symbol is routed by Max as a named message
+// selector, not handed to the generic list handler:
+//   codes in  (per level): original_length, codes...
+//   embeddings out (per level, chunked): chunk_index, is_last (0/1), original_length, data...
+// See ncs.snac_24kh.encode.cpp's kMaxChunkAtoms comment: the real ceiling
+// on a single Max list message turned out to be far lower than the old
+// 50k cap (a 400ms/~15.4k-atom unchunked message worked, slightly larger
+// unchunked ones didn't).
+static constexpr size_t kMaxChunkAtoms = 4000;
+
 struct EmbedRequest {
     std::vector<int64_t> codes[kNumLevels];
     double scale[kNumLevels];
+    int original_length;
+};
+
+struct PendingSend {
+    int outlet_id; // 0 = sum, 1 = level0, 2 = level1, 3 = level2
+    atoms data;
 };
 
 class NcsSnac_24khEmbedcodes : public object<NcsSnac_24khEmbedcodes>
@@ -50,17 +74,18 @@ public:
     // matches ncs.snac_24kh.vq, whose outlets fire right-to-left
     // (level2 first, level0 last), so a direct patch cord hookup lands
     // the cold values before the hot trigger arrives.
-    inlet<> level0_in{ this, "(list/load) codebook level 0 codes (coarsest, stride 4) -- hot, or model path" };
-    inlet<> level1_in{ this, "(list) codebook level 1 codes (stride 2) -- cold" };
-    inlet<> level2_in{ this, "(list) codebook level 2 codes (finest, stride 1) -- cold" };
+    inlet<> level0_in{ this, "(list/load) original_length, codes... from ncs.snac_24kh.vq level0 -- hot, or model path" };
+    inlet<> level1_in{ this, "(list) original_length, codes... from ncs.snac_24kh.vq level1 -- cold" };
+    inlet<> level2_in{ this, "(list) original_length, codes... from ncs.snac_24kh.vq level2 -- cold" };
 
     // Leftmost outlet is always the sum (each level scaled by its
     // level<N>_scale before summing); the rest are always the raw,
-    // unscaled per-level embeddings.
-    outlet<> sum_out{ this, "(list) summed embeddings (level0_scale*L0 + level1_scale*L1 + level2_scale*L2), channel-major [768 x T]" };
-    outlet<> level0_out{ this, "(list) level 0 embeddings, unscaled, channel-major [768 x T]" };
-    outlet<> level1_out{ this, "(list) level 1 embeddings, unscaled, channel-major [768 x T]" };
-    outlet<> level2_out{ this, "(list) level 2 embeddings, unscaled, channel-major [768 x T]" };
+    // unscaled per-level embeddings. Each carries chunk_index, is_last
+    // (0/1), original_length, then the data.
+    outlet<> sum_out{ this, "(list) summed embeddings chunk (level0_scale*L0 + level1_scale*L1 + level2_scale*L2), channel-major [768 x T]" };
+    outlet<> level0_out{ this, "(list) level 0 embeddings chunk, unscaled, channel-major [768 x T]" };
+    outlet<> level1_out{ this, "(list) level 1 embeddings chunk, unscaled, channel-major [768 x T]" };
+    outlet<> level2_out{ this, "(list) level 2 embeddings chunk, unscaled, channel-major [768 x T]" };
 
     attribute<number> level0_scale{ this, "level0_scale", 1.0,
         description{"Gain applied to codebook level 0 (coarsest) before summing into the sum outlet. Does not affect the raw level0 outlet."} };
@@ -88,16 +113,20 @@ public:
         stop_output_timer();
     }
 
+    // Parses ncs.snac_24kh.vq's format: original_length, codes....
     // Errors go through log_queue_ (not error() inline) -- this can fire
     // very early during patch load, and calling error() synchronously at
     // that point has crashed Max's console/UI; deferring it to the timer
     // callback avoids that.
-    message<> list_msg{this, "list", "Per-level codes (inlet 0 hot / 1-2 cold)",
+    message<> list_msg{this, "list", "Per-level codes: original_length, codes... (inlet 0 hot / 1-2 cold)",
         MIN_FUNCTION {
             try {
-                std::vector<int64_t> codes(args.size());
-                for (size_t i = 0; i < args.size(); ++i)
-                    codes[i] = (int64_t)(int)args[i];
+                // Header is 1 atom: original_length.
+                if (args.size() < 1) return {};
+                int length = (int)args[0];
+                std::vector<int64_t> codes(args.size() - 1);
+                for (size_t i = 1; i < args.size(); ++i)
+                    codes[i - 1] = (int64_t)(int)args[i];
                 if (inlet == 1) {
                     cached_level1_ = std::move(codes);
                 } else if (inlet == 2) {
@@ -121,6 +150,7 @@ public:
                     req.scale[0] = double(level0_scale);
                     req.scale[1] = double(level1_scale);
                     req.scale[2] = double(level2_scale);
+                    req.original_length = length;
                     input_queue_.enqueue(std::move(req));
                 }
             } catch (const std::exception& ex) {
@@ -152,7 +182,7 @@ private:
     std::vector<int64_t> cached_level2_;
 
     tsqueue<EmbedRequest> input_queue_;
-    tsqueue<std::vector<std::vector<float>>> output_queue_;
+    tsqueue<PendingSend> output_queue_;
     tsqueue<std::string> load_queue_;
     tsqueue<std::pair<bool,std::string>> log_queue_;
 
@@ -199,46 +229,59 @@ private:
         }
     }
 
+    static void enqueue_chunks(tsqueue<PendingSend>& q, int outlet_id, const std::vector<float>& data,
+                                size_t max_chunk_size, int original_length) {
+        auto chunks = ncs_chunk::split(data, max_chunk_size);
+        for (size_t i = 0; i < chunks.size(); ++i) {
+            bool is_last = (i + 1 == chunks.size());
+            atoms msg;
+            msg.reserve(3 + chunks[i].size());
+            msg.push_back(static_cast<int>(i));
+            msg.push_back(is_last ? 1 : 0);
+            msg.push_back(original_length);
+            for (float f : chunks[i]) msg.push_back(f);
+            q.enqueue({outlet_id, std::move(msg)});
+        }
+    }
+
     void process(const EmbedRequest& req) {
         if (!model_loaded_) {
             log_queue_.enqueue({true, "ncs.snac_24kh.embedcodes: no model loaded"});
             return;
         }
         auto result = run_onnx(req);
-        if (result.empty()) {
+        if (result.empty() || result.size() != kNumLevels + 1) {
             log_queue_.enqueue({true, "ncs.snac_24kh.embedcodes: inference failed"});
             return;
         }
-        output_queue_.enqueue(std::move(result));
+        // result[0]=sum, [1]=level0, [2]=level1, [3]=level2 -- outlet_id
+        // matches that same order (0=sum ... 3=level2).
+        for (int outlet_id = 0; outlet_id <= kNumLevels; ++outlet_id)
+            enqueue_chunks(output_queue_, outlet_id, result[outlet_id], kMaxChunkAtoms, req.original_length);
     }
 
     // Every crash seen so far traced back to a call to error() -- post()
     // has been reliable throughout. Route everything through post() with
     // an "ERROR:" prefix instead, to avoid whatever error() is doing
     // (likely highlighting the object in the patcher) that's unsafe here.
-    // Outlets fire right-to-left (level2, level1, level0, then sum last)
-    // so the sum outlet -- the one most patches key off of -- fires after
-    // the raw per-level data has already reached any downstream objects.
+    // Exactly ONE outlet.send() per tick (see PendingSend comment above)
+    // -- each outlet's own chunk stream carries its own frame/last header,
+    // so interleaving across outlets/chunks here doesn't affect
+    // correctness, only latency.
     void flush_output() {
         std::pair<bool,std::string> log_msg;
         while (log_queue_.try_dequeue(log_msg)) {
             if (log_msg.first) c74::max::post("%s", ("ERROR: " + log_msg.second).c_str());
             else c74::max::post("%s", log_msg.second.c_str());
         }
-        std::vector<std::vector<float>> result;
-        if (output_queue_.try_dequeue(result)) {
-            std::vector<std::vector<float>> temp;
-            while (output_queue_.try_dequeue(temp))
-                result = std::move(temp);
-            if (result.size() != kNumLevels + 1) return;
-            atoms a2(result[3].begin(), result[3].end());
-            level2_out.send(a2);
-            atoms a1(result[2].begin(), result[2].end());
-            level1_out.send(a1);
-            atoms a0(result[1].begin(), result[1].end());
-            level0_out.send(a0);
-            atoms asum(result[0].begin(), result[0].end());
-            sum_out.send(asum);
+        PendingSend item;
+        if (output_queue_.try_dequeue(item)) {
+            switch (item.outlet_id) {
+                case 1: level0_out.send(item.data); break;
+                case 2: level1_out.send(item.data); break;
+                case 3: level2_out.send(item.data); break;
+                default: sum_out.send(item.data); break;
+            }
         }
     }
 
