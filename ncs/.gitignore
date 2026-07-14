@@ -1,0 +1,8 @@
+build/
+cmake-build-*/
+.idea/
+.DS_Store
+*.mxo
+lib/max-sdk/
+onnxruntime-*.zip
+onnxruntime-*/
