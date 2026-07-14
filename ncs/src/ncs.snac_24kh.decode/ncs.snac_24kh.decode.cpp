@@ -27,39 +27,57 @@
 
 using namespace c74::min;
 
-// The model only outputs 24kHz audio; it's resampled to Max's live
-// samplerate here before being written to the output buffer~ -- a
-// one-shot src_simple() call per decode, not the persistent-state
-// streaming resampler real-time signal modules need. This object has no
-// signal inlet/outlet, so there's no per-object samplerate() (that's a
-// sample_operator/audio_bang thing) -- c74::max::sys_getsr() reads the
-// audio driver's current global samplerate instead, read in list_msg
-// (main thread, when the last chunk arrives) and carried into the
-// worker alongside the reassembled embeddings.
+// The model only outputs 24kHz audio; it's resampled to output_sr here
+// before being written to the output buffer~ -- a one-shot src_simple()
+// call per decode, not the persistent-state streaming resampler
+// real-time signal modules need. output_sr is the OUTPUT buffer~'s own
+// declared sample rate (queried in tensor_msg via
+// ncs_buffer::get_samplerate(), before there's anything to write), not
+// Max's live DSP driver rate -- this pipeline never requires DSP/audio to
+// be running, so the live driver rate can silently be stale/wrong; the
+// buffer's own declared rate has no such failure mode.
 static constexpr double kModelSampleRate = 24000.0;
 
 struct DecodeJob {
     std::vector<float> embeddings;
-    int original_length;  // in 24kHz-space, i.e. before the output resample
-    double host_sr;
+    int trim_samples;   // in output_sr-space (post-resample); <= 0 means "don't trim"
+    double output_sr;
 };
 
-// A single "1-atom send followed by a large-list send" pattern crashed
-// Max regardless of size or which outlet was used (see
-// ncs.snac_24kh.encode.cpp's kMaxChunkAtoms comment for the full story).
-// So there's only one inlet here now; ncs.snac_24kh.embedcodes sends its
-// (chunked) embeddings as a single self-describing list per chunk, all
-// leading fields NUMBERS (a leading symbol gets routed by Max as a named
-// message selector, not the generic list handler):
-//   chunk_index, is_last (0/1), original_length, data...
+// ncs.snac_24kh.embedcodes sends its (chunked) embeddings as a `frameix
+// <index>` message (index -1 = last chunk) immediately followed by
+// `tensor <data...>`, both real Max message selectors -- see
+// ncs.snac_24kh.encode.cpp's kMaxChunkAtoms comment for the full crash
+// history behind chunking and why real selectors (not a header baked
+// into a generic list) are used here.
+//
+// The source duration is NOT part of that chunk stream -- it arrives
+// separately, directly from ncs.snac_24kh.encode's second outlet (as
+// SECONDS, not a raw sample count -- see that outlet's comment for why),
+// on length_in below. trim_samples above is computed from that cached
+// duration times THIS object's own output buffer's sample rate, as the
+// last step in process(), after the 24kHz->output_sr resample -- not
+// before it -- so a single final rounding produces the trim count,
+// instead of carrying a value pre-rounded in a different (24kHz) domain
+// through a second, independent resample.
+//
+// That's a deliberate, accepted race (see ncs.snac_24kh.encode.cpp's
+// length_out comment): a second encode bang fired before a first bang's
+// data has finished threading through vq/embedcodes to here can
+// overwrite the cached duration before the first run's data arrives,
+// silently mistrimming it. Not a crash risk, and considered acceptable
+// for buffer-mode's typical bang/wait/use workflow. If length_in is
+// never connected/fed, no trim is applied at all -- just the raw model
+// output, resampled to output_sr.
 
-class NcsSnac_24khDecode : public object<NcsSnac_24khDecode>
+class NcsSnac_24khDecode : public object<NcsSnac_24khDecode>, public CancellableRun
 {
 public:
     MIN_DESCRIPTION     {"Runs the SNAC 24kHz decoder and writes the result to a named buffer~."};
     MIN_TAGS            {"snac, onnx, audio"};
     MIN_AUTHOR          {"Behzad Haki"};
-    inlet<> embeddings_in{ this, "(set/load/list) buffer name, model path, or chunk_index, is_last, original_length, data..." };
+    inlet<> embeddings_in{ this, "(set/load/frameix/tensor) buffer name, model path, or chunked embeddings from ncs.snac_24kh.embedcodes" };
+    inlet<> length_in{ this, "(float) source duration in seconds -- wire directly from ncs.snac_24kh.encode's second outlet" };
 
     buffer_reference buffer_ref_{ this };
 
@@ -96,32 +114,60 @@ public:
         stop_output_timer();
     }
 
-    // Parses ncs.snac_24kh.embedcodes's self-describing chunk format:
-    // chunk_index, is_last (0/1), original_length, data.... Chunks
-    // accumulate here; only once is_last=1 arrives does decode_audio.onnx
-    // actually run, on the full reassembled embeddings -- so there's no
+    // Chunks accumulate here; only once a tensor arrives whose preceding
+    // frameix was -1 (the last chunk) does decode_audio.onnx actually
+    // run, on the full reassembled embeddings -- so there's no
     // chunk-boundary artifact in the decoded audio, chunking is purely a
-    // transport concern. sys_getsr() is read here (main thread) at the
-    // same time. Errors go through log_queue_ (not error() inline) -- this can fire
-    // very early during patch load, and calling error() synchronously at
-    // that point has crashed Max's console/UI; deferring it to the timer
-    // callback avoids that.
-    message<> list_msg{this, "list", "Embeddings chunk: chunk_index, is_last, original_length, data...",
+    // transport concern. The output buffer's own sample rate and the
+    // cached source duration (from length_in) are read/used here (main
+    // thread) at the same time, and multiplied into a single trim sample
+    // count now (rather than in process()) so both the trim and the
+    // resample below have everything they need without re-touching the
+    // buffer~ from the worker thread. Errors go through log_queue_ (not
+    // error() inline) -- this can fire very early during patch load, and
+    // calling error() synchronously at that point has crashed Max's
+    // console/UI; deferring it to the timer callback avoids that.
+    message<> frameix_msg{this, "frameix", "Chunk index (-1 = last chunk)",
+        MIN_FUNCTION {
+            if (!args.empty())
+                pending_is_last_ = ((int)args[0] == -1);
+            return {};
+        }};
+
+    message<> tensor_msg{this, "tensor", "Embeddings chunk data",
         MIN_FUNCTION {
             try {
-                // Header is 3 atoms: chunk_index, is_last, original_length.
-                if (args.size() < 3) return {};
-                bool is_last = (int)args[1] != 0;
-                int length = (int)args[2];
-                for (size_t i = 3; i < args.size(); ++i)
-                    accum_embeddings_.push_back((float)args[i]);
-                if (is_last) {
-                    double host_sr = static_cast<double>(c74::max::sys_getsr());
-                    input_queue_.enqueue({std::move(accum_embeddings_), length, host_sr});
+                for (auto& a : args)
+                    accum_embeddings_.push_back((float)a);
+                if (pending_is_last_) {
+                    double output_sr = ncs_buffer::get_samplerate(buffer_ref_);
+                    int trim_samples = (has_length_ && output_sr > 0.0)
+                        ? static_cast<int>(std::llround(cached_duration_sec_ * output_sr))
+                        : -1;
+                    // A fresh reassembled tensor supersedes whatever the
+                    // worker is still doing -- see ncs.snac_24kh.encode's
+                    // bang_msg comment for why this cancels rather than
+                    // waits.
+                    cancel_active_run();
+                    input_queue_.enqueue({std::move(accum_embeddings_), trim_samples, output_sr});
                     accum_embeddings_.clear();
+                    pending_is_last_ = false;
                 }
             } catch (const std::exception& ex) {
-                log_queue_.enqueue({true, "ncs.snac_24kh.decode: list handling failed — " + std::string(ex.what())});
+                log_queue_.enqueue({true, "ncs.snac_24kh.decode: tensor handling failed — " + std::string(ex.what())});
+            }
+            return {};
+        }};
+
+    // Cold: caches the source duration (seconds) from
+    // ncs.snac_24kh.encode's second outlet, used (if ever received) by
+    // the next tensor completion above. See the class-level comment for
+    // the accepted race and the "not connected -> no trim" fallback.
+    message<> length_msg{this, "float", "Source duration in seconds, from ncs.snac_24kh.encode's second outlet",
+        MIN_FUNCTION {
+            if (inlet == 1 && !args.empty()) {
+                cached_duration_sec_ = (double)args[0];
+                has_length_ = true;
             }
             return {};
         }};
@@ -146,6 +192,9 @@ private:
 
     // Only ever touched from message handlers, i.e. the main thread.
     std::vector<float> accum_embeddings_;
+    bool pending_is_last_{false};
+    double cached_duration_sec_{0.0};
+    bool has_length_{false};
 
     tsqueue<DecodeJob> input_queue_;
     tsqueue<std::vector<float>> output_queue_;
@@ -197,10 +246,13 @@ private:
         }
     }
 
-    // Trim to original_length (still in 24kHz-space, i.e. before the
-    // pad ncs.snac_24kh.encode added) BEFORE resampling 24000 -> host_sr,
-    // so the trim always operates in the space the model actually
-    // produced -- resampling first would need a second, ratio-scaled trim.
+    // Resample 24000 -> output_sr FIRST, then trim to trim_samples (an
+    // output_sr-space count, already computed in tensor_msg) as the LAST
+    // step -- trim_samples was derived from the source duration in
+    // seconds, so it's only meaningful after the audio is actually in
+    // output_sr-space. Padding (added by ncs.snac_24kh.encode before
+    // encoding) always leaves the pre-trim audio at least as long as
+    // trim_samples, so this only ever shortens, never needs to lengthen.
     void process(const DecodeJob& job) {
         if (!model_loaded_) {
             log_queue_.enqueue({true, "ncs.snac_24kh.decode: no model loaded"});
@@ -211,10 +263,10 @@ private:
             log_queue_.enqueue({true, "ncs.snac_24kh.decode: inference failed"});
             return;
         }
-        if (job.original_length > 0 && static_cast<size_t>(job.original_length) < audio.size())
-            audio.resize(static_cast<size_t>(job.original_length));
-        if (job.host_sr > 0.0)
-            audio = ncs_resample::resample_simple(audio, job.host_sr / kModelSampleRate);
+        if (job.output_sr > 0.0)
+            audio = ncs_resample::resample_simple(audio, job.output_sr / kModelSampleRate);
+        if (job.trim_samples > 0 && static_cast<size_t>(job.trim_samples) < audio.size())
+            audio.resize(static_cast<size_t>(job.trim_samples));
         output_queue_.enqueue(std::move(audio));
     }
 
@@ -240,10 +292,8 @@ private:
             // -- an exception escaping it does not unwind cleanly, it hits
             // std::terminate() and takes the whole host process down.
             // write_mono() already catches internally; this wraps the
-            // name/post formatting too, defensively. Trimming and the
-            // output resample already happened in process() (worker
-            // thread), since both need original_length/host_sr which are
-            // only meaningful in 24kHz-space right after inference.
+            // name/post formatting too, defensively. Resampling and
+            // trimming already happened in process() (worker thread).
             try {
                 if (!ncs_buffer::write_mono(buffer_ref_, audio)) {
                     c74::max::post("%s", "ERROR: ncs.snac_24kh.decode: output buffer not found — use 'set <name>' first");
@@ -305,6 +355,8 @@ private:
 
     std::vector<float> run_onnx(const std::vector<float>& input) {
         if (!session_ || !model_loaded_) return {};
+        Ort::RunOptions opts;
+        register_run(&opts);
         try {
             std::vector<int64_t> shape = input_dims_;
             if (!shape.empty() && shape[0] == -1) shape[0] = 1;
@@ -322,12 +374,14 @@ private:
             auto tensor = vector_to_tensor(input, shape, allocator_);
             const char* in_names[]  = {input_name_.c_str()};
             const char* out_names[] = {output_name_.c_str()};
-            Ort::RunOptions opts;
             auto outputs = session_->Run(opts, in_names, &tensor, 1,
                                            out_names, 1);
+            clear_run();
             if (outputs.size() > 0)
                 return tensor_to_vector(outputs[0]);
-        } catch (const std::exception&) {}
+        } catch (const std::exception&) {
+            clear_run();
+        }
         return {};
     }
 };

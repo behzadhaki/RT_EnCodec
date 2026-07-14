@@ -35,27 +35,25 @@ using namespace c74::min;
 // here, with a per-level gain applied before summing.
 static constexpr int kNumLevels = 3;
 
-// A single "1-atom send followed by a large-list send" pattern crashed
-// Max regardless of size or which outlet was used (see
-// ncs.snac_24kh.encode.cpp's kMaxChunkAtoms comment for the full story).
-// So every input (from ncs.snac_24kh.vq) and output (to
-// ncs.snac_24kh.decode) here is ONE self-describing list, and
-// flush_output() sends AT MOST ONE outlet per tick, full stop. All
-// leading fields are NUMBERS, deliberately no leading symbol -- a
-// message starting with a symbol is routed by Max as a named message
-// selector, not handed to the generic list handler:
-//   codes in  (per level): original_length, codes...
-//   embeddings out (per level, chunked): chunk_index, is_last (0/1), original_length, data...
-// See ncs.snac_24kh.encode.cpp's kMaxChunkAtoms comment: the real ceiling
-// on a single Max list message turned out to be far lower than the old
-// 50k cap (a 400ms/~15.4k-atom unchunked message worked, slightly larger
-// unchunked ones didn't).
+// Codes in (from ncs.snac_24kh.vq, per level) are a single bare
+// (headerless) list -- vq never chunks its output, so no frame/last
+// protocol is needed there. Embeddings out (to ncs.snac_24kh.decode and
+// friends, per level, chunked) mirror ncs.snac_24kh.encode's data_out
+// format: a `frameix <index>` message (index -1 = last chunk) immediately
+// followed by `tensor <data...>`, both real Max message selectors rather
+// than a header baked into a generic list (see
+// ncs.snac_24kh.encode.cpp's kMaxChunkAtoms comment for why that matters
+// and for the crash history behind chunking at all). total
+// original_length is not threaded through here in either direction --
+// ncs.snac_24kh.decode gets it directly from ncs.snac_24kh.encode's
+// second outlet. flush_output() still sends AT MOST ONE outlet per tick,
+// full stop, as a blanket precaution now that the exact trigger
+// condition inside Max's outlet_cache isn't fully understood.
 static constexpr size_t kMaxChunkAtoms = 4000;
 
 struct EmbedRequest {
     std::vector<int64_t> codes[kNumLevels];
     double scale[kNumLevels];
-    int original_length;
 };
 
 struct PendingSend {
@@ -63,7 +61,7 @@ struct PendingSend {
     atoms data;
 };
 
-class NcsSnac_24khEmbedcodes : public object<NcsSnac_24khEmbedcodes>
+class NcsSnac_24khEmbedcodes : public object<NcsSnac_24khEmbedcodes>, public CancellableRun
 {
 public:
     MIN_DESCRIPTION     {"SNAC 24kHz codebook lookup: per-level codes -> summed + per-level quantized embeddings."};
@@ -74,18 +72,18 @@ public:
     // matches ncs.snac_24kh.vq, whose outlets fire right-to-left
     // (level2 first, level0 last), so a direct patch cord hookup lands
     // the cold values before the hot trigger arrives.
-    inlet<> level0_in{ this, "(list/load) original_length, codes... from ncs.snac_24kh.vq level0 -- hot, or model path" };
-    inlet<> level1_in{ this, "(list) original_length, codes... from ncs.snac_24kh.vq level1 -- cold" };
-    inlet<> level2_in{ this, "(list) original_length, codes... from ncs.snac_24kh.vq level2 -- cold" };
+    inlet<> level0_in{ this, "(list/load) codes... from ncs.snac_24kh.vq level0 -- hot, or model path" };
+    inlet<> level1_in{ this, "(list) codes... from ncs.snac_24kh.vq level1 -- cold" };
+    inlet<> level2_in{ this, "(list) codes... from ncs.snac_24kh.vq level2 -- cold" };
 
     // Leftmost outlet is always the sum (each level scaled by its
     // level<N>_scale before summing); the rest are always the raw,
-    // unscaled per-level embeddings. Each carries chunk_index, is_last
-    // (0/1), original_length, then the data.
-    outlet<> sum_out{ this, "(list) summed embeddings chunk (level0_scale*L0 + level1_scale*L1 + level2_scale*L2), channel-major [768 x T]" };
-    outlet<> level0_out{ this, "(list) level 0 embeddings chunk, unscaled, channel-major [768 x T]" };
-    outlet<> level1_out{ this, "(list) level 1 embeddings chunk, unscaled, channel-major [768 x T]" };
-    outlet<> level2_out{ this, "(list) level 2 embeddings chunk, unscaled, channel-major [768 x T]" };
+    // unscaled per-level embeddings. Each is a frameix/tensor chunked
+    // stream, same format as ncs.snac_24kh.encode's data_out.
+    outlet<> sum_out{ this, "(frameix/tensor) summed embeddings chunk (level0_scale*L0 + level1_scale*L1 + level2_scale*L2), channel-major [768 x T]" };
+    outlet<> level0_out{ this, "(frameix/tensor) level 0 embeddings chunk, unscaled, channel-major [768 x T]" };
+    outlet<> level1_out{ this, "(frameix/tensor) level 1 embeddings chunk, unscaled, channel-major [768 x T]" };
+    outlet<> level2_out{ this, "(frameix/tensor) level 2 embeddings chunk, unscaled, channel-major [768 x T]" };
 
     attribute<number> level0_scale{ this, "level0_scale", 1.0,
         description{"Gain applied to codebook level 0 (coarsest) before summing into the sum outlet. Does not affect the raw level0 outlet."} };
@@ -113,20 +111,17 @@ public:
         stop_output_timer();
     }
 
-    // Parses ncs.snac_24kh.vq's format: original_length, codes....
-    // Errors go through log_queue_ (not error() inline) -- this can fire
-    // very early during patch load, and calling error() synchronously at
-    // that point has crashed Max's console/UI; deferring it to the timer
-    // callback avoids that.
-    message<> list_msg{this, "list", "Per-level codes: original_length, codes... (inlet 0 hot / 1-2 cold)",
+    // Parses ncs.snac_24kh.vq's format: a bare (headerless) codes list per
+    // level. Errors go through log_queue_ (not error() inline) -- this
+    // can fire very early during patch load, and calling error()
+    // synchronously at that point has crashed Max's console/UI;
+    // deferring it to the timer callback avoids that.
+    message<> list_msg{this, "list", "Per-level codes (inlet 0 hot / 1-2 cold)",
         MIN_FUNCTION {
             try {
-                // Header is 1 atom: original_length.
-                if (args.size() < 1) return {};
-                int length = (int)args[0];
-                std::vector<int64_t> codes(args.size() - 1);
-                for (size_t i = 1; i < args.size(); ++i)
-                    codes[i - 1] = (int64_t)(int)args[i];
+                std::vector<int64_t> codes(args.size());
+                for (size_t i = 0; i < args.size(); ++i)
+                    codes[i] = (int64_t)(int)args[i];
                 if (inlet == 1) {
                     cached_level1_ = std::move(codes);
                 } else if (inlet == 2) {
@@ -150,7 +145,10 @@ public:
                     req.scale[0] = double(level0_scale);
                     req.scale[1] = double(level1_scale);
                     req.scale[2] = double(level2_scale);
-                    req.original_length = length;
+                    // A fresh request supersedes whatever the worker is
+                    // still doing -- see ncs.snac_24kh.encode's bang_msg
+                    // comment for why this cancels rather than waits.
+                    cancel_active_run();
                     input_queue_.enqueue(std::move(req));
                 }
             } catch (const std::exception& ex) {
@@ -230,17 +228,22 @@ private:
     }
 
     static void enqueue_chunks(tsqueue<PendingSend>& q, int outlet_id, const std::vector<float>& data,
-                                size_t max_chunk_size, int original_length) {
+                                size_t max_chunk_size) {
         auto chunks = ncs_chunk::split(data, max_chunk_size);
         for (size_t i = 0; i < chunks.size(); ++i) {
             bool is_last = (i + 1 == chunks.size());
-            atoms msg;
-            msg.reserve(3 + chunks[i].size());
-            msg.push_back(static_cast<int>(i));
-            msg.push_back(is_last ? 1 : 0);
-            msg.push_back(original_length);
-            for (float f : chunks[i]) msg.push_back(f);
-            q.enqueue({outlet_id, std::move(msg)});
+            int idx = is_last ? -1 : static_cast<int>(i);
+
+            atoms frameix_msg;
+            frameix_msg.push_back(symbol("frameix"));
+            frameix_msg.push_back(idx);
+            q.enqueue({outlet_id, std::move(frameix_msg)});
+
+            atoms tensor_msg;
+            tensor_msg.reserve(1 + chunks[i].size());
+            tensor_msg.push_back(symbol("tensor"));
+            for (float f : chunks[i]) tensor_msg.push_back(f);
+            q.enqueue({outlet_id, std::move(tensor_msg)});
         }
     }
 
@@ -257,7 +260,7 @@ private:
         // result[0]=sum, [1]=level0, [2]=level1, [3]=level2 -- outlet_id
         // matches that same order (0=sum ... 3=level2).
         for (int outlet_id = 0; outlet_id <= kNumLevels; ++outlet_id)
-            enqueue_chunks(output_queue_, outlet_id, result[outlet_id], kMaxChunkAtoms, req.original_length);
+            enqueue_chunks(output_queue_, outlet_id, result[outlet_id], kMaxChunkAtoms);
     }
 
     // Every crash seen so far traced back to a call to error() -- post()
@@ -346,6 +349,8 @@ private:
     // indices 1-3 = each level's raw, unscaled embedding.
     std::vector<std::vector<float>> run_onnx(const EmbedRequest& req) {
         if (!session_ || !model_loaded_) return {};
+        Ort::RunOptions opts;
+        register_run(&opts);
         try {
             std::vector<Ort::Value> in_tensors;
             in_tensors.reserve(kNumLevels);
@@ -358,9 +363,9 @@ private:
             std::vector<const char*> out_names;
             for (auto& n : output_names_) out_names.push_back(n.c_str());
 
-            Ort::RunOptions opts;
             auto outputs = session_->Run(opts, in_names.data(), in_tensors.data(), in_tensors.size(),
                                           out_names.data(), out_names.size());
+            clear_run();
             if (outputs.size() != kNumLevels) return {};
 
             std::vector<float> zq[kNumLevels];
@@ -381,7 +386,9 @@ private:
             for (int lvl = 0; lvl < kNumLevels; ++lvl)
                 result.push_back(std::move(zq[lvl]));
             return result;
-        } catch (const std::exception&) {}
+        } catch (const std::exception&) {
+            clear_run();
+        }
         return {};
     }
 };

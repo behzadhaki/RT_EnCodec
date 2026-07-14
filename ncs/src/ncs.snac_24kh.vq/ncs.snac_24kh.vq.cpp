@@ -32,36 +32,35 @@ using namespace c74::min;
 // expansion/interleaving is needed here.
 static constexpr int kNumLevels = 3;
 
-// A single "1-atom send followed by a large-list send" pattern crashed
-// Max regardless of size or which outlet was used (see
-// ncs.snac_24kh.encode.cpp's kMaxChunkAtoms comment for the full story).
-// So ncs.snac_24kh.encode now sends ONE self-describing list per chunk:
-//   chunk_index, is_last (0/1), original_length, data...
-// on a single outlet -- no separate last/length inlets here either. All
-// leading fields are NUMBERS, deliberately no leading symbol: a message
-// starting with a symbol is routed by Max as a named message selector,
-// not handed to the generic list handler (confirmed by a "doesn't
-// understand" error from an earlier symbol-tagged version of this
-// format). Codes (this module's own output) are ~768x smaller than
-// embeddings and never need chunking, but are still queued and sent ONE
-// OUTLET PER TICK (never more than one outlet.send() inside a single
-// flush_output() call), as a blanket precaution now that the exact
-// trigger condition inside Max's outlet_cache isn't fully understood.
+// ncs.snac_24kh.encode sends chunked embeddings as a `frameix <index>`
+// message (index -1 = last chunk) immediately followed by a `tensor
+// <data...>` message, both from its single data outlet -- real Max
+// message selectors, not a header baked into a generic list, so the
+// handlers below get already-header-free args for free. total
+// original_length is NOT part of this stream (it never was needed here --
+// it's only ever a pass-through for ncs.snac_24kh.decode's final trim,
+// which now gets it directly from ncs.snac_24kh.encode's second outlet).
+// Codes (this module's own output) are ~768x smaller than embeddings and
+// never need chunking -- sent as a single bare (headerless) list per
+// level -- but are still queued and sent ONE OUTLET PER TICK (never more
+// than one outlet.send() inside a single flush_output() call), as a
+// blanket precaution now that the exact trigger condition inside Max's
+// outlet_cache isn't fully understood.
 struct PendingSend {
     int outlet_id; // 0 = level0, 1 = level1, 2 = level2
-    atoms data;    // original_length, codes...
+    atoms data;    // codes...
 };
 
-class NcsSnac_24khVq : public object<NcsSnac_24khVq>
+class NcsSnac_24khVq : public object<NcsSnac_24khVq>, public CancellableRun
 {
 public:
     MIN_DESCRIPTION     {"SNAC 24kHz residual vector quantizer: embeddings -> per-level codes."};
     MIN_TAGS            {"snac, onnx"};
     MIN_AUTHOR          {"Behzad Haki"};
-    inlet<> control_in{ this, "(list/load) embeddings chunk from ncs.snac_24kh.encode, or model path" };
-    outlet<> level0_out{ this, "(list) original_length, codes... -- codebook level 0 (coarsest, stride 4)" };
-    outlet<> level1_out{ this, "(list) original_length, codes... -- codebook level 1 (stride 2)" };
-    outlet<> level2_out{ this, "(list) original_length, codes... -- codebook level 2 (finest, stride 1)" };
+    inlet<> control_in{ this, "(frameix/tensor/load) embeddings chunk from ncs.snac_24kh.encode, or model path" };
+    outlet<> level0_out{ this, "(list) codes... -- codebook level 0 (coarsest, stride 4)" };
+    outlet<> level1_out{ this, "(list) codes... -- codebook level 1 (stride 2)" };
+    outlet<> level2_out{ this, "(list) codes... -- codebook level 2 (finest, stride 1)" };
 
     // =====================================================================
     // CONSTRUCTOR / DESTRUCTOR
@@ -82,31 +81,39 @@ public:
         stop_output_timer();
     }
 
-    // Parses ncs.snac_24kh.encode's self-describing chunk format:
-    // chunk_index, is_last (0/1), original_length, data.... Chunks
-    // accumulate here; only once is_last=1 arrives is the full reassembled
-    // embeddings vector handed to the worker -- the ONNX inference itself
-    // always runs on the complete, non-chunked tensor, so there's no
+    // Chunks accumulate here; only once a tensor arrives whose preceding
+    // frameix was -1 (the last chunk) is the full reassembled embeddings
+    // vector handed to the worker -- the ONNX inference itself always
+    // runs on the complete, non-chunked tensor, so there's no
     // chunk-boundary artifact in the quantization.
     // Errors go through log_queue_ (not error() inline) -- this can fire
     // very early during patch load, and calling error() synchronously at
     // that point has crashed Max's console/UI; deferring it to the timer
     // callback avoids that.
-    message<> list_msg{this, "list", "Embeddings chunk: chunk_index, is_last, original_length, data...",
+    message<> frameix_msg{this, "frameix", "Chunk index (-1 = last chunk)",
+        MIN_FUNCTION {
+            if (!args.empty())
+                pending_is_last_ = ((int)args[0] == -1);
+            return {};
+        }};
+
+    message<> tensor_msg{this, "tensor", "Embeddings chunk data",
         MIN_FUNCTION {
             try {
-                // Header is 3 atoms: chunk_index, is_last, original_length.
-                if (args.size() < 3) return {};
-                bool is_last = (int)args[1] != 0;
-                original_length_ = (int)args[2];
-                for (size_t i = 3; i < args.size(); ++i)
-                    accum_z_.push_back((float)args[i]);
-                if (is_last) {
-                    input_queue_.enqueue({std::move(accum_z_), original_length_});
+                for (auto& a : args)
+                    accum_z_.push_back((float)a);
+                if (pending_is_last_) {
+                    // A fresh reassembled tensor supersedes whatever the
+                    // worker is still doing -- see ncs.snac_24kh.encode's
+                    // bang_msg comment for why this cancels rather than
+                    // waits.
+                    cancel_active_run();
+                    input_queue_.enqueue(std::move(accum_z_));
                     accum_z_.clear();
+                    pending_is_last_ = false;
                 }
             } catch (const std::exception& ex) {
-                log_queue_.enqueue({true, "ncs.snac_24kh.vq: list handling failed — " + std::string(ex.what())});
+                log_queue_.enqueue({true, "ncs.snac_24kh.vq: tensor handling failed — " + std::string(ex.what())});
             }
             return {};
         }};
@@ -131,9 +138,9 @@ private:
 
     // Only ever touched from message handlers, i.e. the main thread.
     std::vector<float> accum_z_;
-    int original_length_{0};
+    bool pending_is_last_{false};
 
-    tsqueue<std::pair<std::vector<float>, int>> input_queue_;
+    tsqueue<std::vector<float>> input_queue_;
     tsqueue<PendingSend> output_queue_;
     tsqueue<std::string> load_queue_;
     tsqueue<std::pair<bool,std::string>> log_queue_;
@@ -172,13 +179,13 @@ private:
             std::string path;
             if (load_queue_.try_dequeue(path))
                 load_model(path);
-            std::pair<std::vector<float>, int> item;
+            std::vector<float> item;
             if (!input_queue_.wait_dequeue(item, 100))
                 continue;
-            std::pair<std::vector<float>, int> temp;
+            std::vector<float> temp;
             while (input_queue_.try_dequeue(temp))
                 item = std::move(temp);
-            process(item.first, item.second);
+            process(item);
         }
     }
 
@@ -186,7 +193,7 @@ private:
     // last, so that when flush_output() drains them one per tick, a
     // downstream ncs.snac_24kh.embedcodes (whose leftmost/level0 inlet is
     // hot) sees its cold level1/level2 inlets updated before the trigger.
-    void process(const std::vector<float>& z, int original_length) {
+    void process(const std::vector<float>& z) {
         if (!model_loaded_) {
             log_queue_.enqueue({true, "ncs.snac_24kh.vq: no model loaded"});
             return;
@@ -198,8 +205,7 @@ private:
         }
         for (int lvl = kNumLevels - 1; lvl >= 0; --lvl) {
             atoms msg;
-            msg.reserve(1 + result[lvl].size());
-            msg.push_back(original_length);
+            msg.reserve(result[lvl].size());
             for (int v : result[lvl]) msg.push_back(v);
             output_queue_.enqueue({lvl, std::move(msg)});
         }
@@ -281,6 +287,8 @@ private:
     // vector (index 0 = coarsest/stride 4 ... index 2 = finest/stride 1).
     std::vector<std::vector<int>> run_onnx(const std::vector<float>& z) {
         if (!session_ || !model_loaded_) return {};
+        Ort::RunOptions opts;
+        register_run(&opts);
         try {
             std::vector<int64_t> shape = input_dims_;
             if (!shape.empty() && shape[0] == -1) shape[0] = 1;
@@ -295,9 +303,9 @@ private:
             std::vector<const char*> out_names;
             for (auto& n : output_names_) out_names.push_back(n.c_str());
 
-            Ort::RunOptions opts;
             auto outputs = session_->Run(opts, in_names, &tensor, 1,
                                           out_names.data(), out_names.size());
+            clear_run();
             if (outputs.size() != kNumLevels) return {};
 
             std::vector<std::vector<int>> result(kNumLevels);
@@ -306,7 +314,9 @@ private:
                 result[lvl].assign(raw.begin(), raw.end());
             }
             return result;
-        } catch (const std::exception&) {}
+        } catch (const std::exception&) {
+            clear_run();
+        }
         return {};
     }
 };

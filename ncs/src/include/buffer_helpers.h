@@ -22,13 +22,21 @@ namespace ncs_buffer {
 // multi-gigabyte vector::resize() attempt.
 static constexpr size_t kMaxReasonableFrames = 100'000'000; // ~1000s @ 96kHz
 
-inline std::vector<float> read_mono(c74::min::buffer_reference& ref) {
+// sr_out, if given, receives the buffer~'s OWN declared sample rate
+// (t_buffer_info.b_sr) -- distinct from and independent of Max's live DSP
+// driver rate. This pipeline is buffer-mode and never requires DSP/audio
+// to be running, so the live driver rate (c74::max::sys_getsr()) can
+// silently return a stale/default value; the buffer's own declared rate
+// doesn't have that failure mode, since it's just data stored on the
+// buffer~ itself.
+inline std::vector<float> read_mono(c74::min::buffer_reference& ref, double* sr_out = nullptr) {
     using namespace c74::min;
     try {
         std::vector<float> out;
         if (!ref) return out;
         buffer_lock<false> b{ref};
         if (!b.valid()) return out;
+        if (sr_out) *sr_out = b.samplerate();
         size_t frames = b.frame_count();
         if (frames == 0 || frames > kMaxReasonableFrames) return out;
         out.resize(frames);
@@ -37,6 +45,22 @@ inline std::vector<float> read_mono(c74::min::buffer_reference& ref) {
         return out;
     } catch (const std::exception&) {
         return {};
+    }
+}
+
+// Same rationale as read_mono's sr_out -- queries the buffer~'s own
+// declared sample rate without reading/writing its sample data, so
+// ncs.snac_24kh.decode can pick its resample target before it has
+// anything to write yet. Returns 0.0 if the buffer isn't set/valid.
+inline double get_samplerate(c74::min::buffer_reference& ref) {
+    using namespace c74::min;
+    try {
+        if (!ref) return 0.0;
+        buffer_lock<false> b{ref};
+        if (!b.valid()) return 0.0;
+        return b.samplerate();
+    } catch (const std::exception&) {
+        return 0.0;
     }
 }
 
