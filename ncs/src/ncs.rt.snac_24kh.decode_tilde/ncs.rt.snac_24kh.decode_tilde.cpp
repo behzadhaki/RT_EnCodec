@@ -12,6 +12,7 @@
 
 #include "../include/shared_external_helpers.h"
 #include "../include/onnx_helpers.h"
+#include "../include/resample_helpers.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -25,13 +26,47 @@
 
 using namespace c74::min;
 
+// SNAC 24kHz decoder, real-time variant. Mirrors ncs.rt.snac_24kh.encode~'s
+// windowed context-trim approach (see that file's class comment for the
+// full rationale: no incremental/cached-state ONNX graph exists for
+// SNAC, so decode_audio.onnx -- the SAME graph the buffer module uses --
+// runs its whole conv stack fresh on [context + new] every block, and
+// only the newly-computed audio is kept). Two differences from encode~:
+//
+// 1. The "new" unit here is a MESSAGE (quantized embeddings from
+//    ncs.rt.snac_24kh.embedcodes), not a signal -- so the context
+//    bookkeeping lives in the "list" message handler (main thread)
+//    instead of operator() (audio thread).
+// 2. Decoded audio must become a continuous SIGNAL. On top of the
+//    context-trim (which addresses correctness -- the retained frames'
+//    receptive field is anchored in real preceding audio), this also
+//    applies a short causal overlap-add crossfade (kOlaSamples) purely
+//    as a numerical safety net against residual seam clicks, exactly the
+//    same idea already proven for the web SNAC chunked-decode path. The
+//    crossfade looks BACKWARD into the context region (never forward),
+//    so it adds no algorithmic latency beyond the context window itself.
+static constexpr int64_t kHopLength     = 512;
+static constexpr int64_t kBlockFrames   = 4;                          // expected frames per block
+static constexpr int64_t kContextFrames = kBlockFrames;               // one block of trailing zq context
+static constexpr int64_t kLatentDim     = 768;
+static constexpr int64_t kOlaSamples    = 256;                        // ~10.7ms @ 24kHz crossfade
+
+static constexpr double kModelSampleRate = 24000.0;
+
+struct DecodeJob {
+    std::vector<float> combined; // channel-major [768 x (kContextFrames+T_block)]
+    int64_t t_block{0};          // number of NEW frames appended this call
+    double host_sr{0.0};         // host DSP samplerate at the moment this block arrived
+};
+
 class NcsRtSnac_24khDecode : public object<NcsRtSnac_24khDecode>
     , public sample_operator<0, 1>
 {
 public:
-    MIN_DESCRIPTION     {""};
-    MIN_TAGS            {""};
+    MIN_DESCRIPTION     {"Runs the SNAC 24kHz decoder continuously from a streamed quantized-embeddings message (windowed context-trim streaming)."};
+    MIN_TAGS            {"snac, onnx, audio"};
     MIN_AUTHOR          {"Behzad Haki"};
+    inlet<> embeddings_in{ this, "(list/load/reset) quantized embeddings block from ncs.rt.snac_24kh.embedcodes, channel-major [768 x T], or model path" };
     outlet<> signal_out{ this, "(signal) audio output", "signal" };
 
     // =====================================================================
@@ -40,8 +75,14 @@ public:
     NcsRtSnac_24khDecode()
         : output_timer_{this, MIN_FUNCTION { flush_output(); output_timer_.delay(10); return {}; }}
     {
+        context_zq_.assign(static_cast<size_t>(kLatentDim * kContextFrames), 0.0f);
         start_worker();
         start_output_timer();
+        // Auto-load the model shipped alongside this external -- the
+        // SAME decode_audio.onnx the buffer module uses. `load <path>`
+        // still works afterwards to point at a different model.
+        load_queue_.enqueue(BundleResourceLoader::get_resource_path(
+            "models/snac_onnx_exports/24khz/decode_audio.onnx"));
     }
 
     ~NcsRtSnac_24khDecode() {
@@ -49,8 +90,29 @@ public:
         stop_output_timer();
     }
 
+    // Normally runs on the AUDIO THREAD only, and only ever from one
+    // thread at a time -- but Max recompiles the DSP chain (and
+    // re-registers this same perform callback) on every DSP on/off
+    // toggle without destroying/recreating this object, and a toggle can
+    // land in a narrow window where the previous chain's audio callback
+    // hasn't fully quiesced before the new one starts. audio_mutex_
+    // guards against that: if operator() is ever (re-)entered
+    // concurrently, one call simply waits a few instructions for the
+    // other instead of two threads mutating output_chunk_/output_pos_ at
+    // once -- which, left unguarded, is exactly the kind of race that
+    // corrupts a std::vector's heap-allocated buffer. Never blocks,
+    // never calls into ONNX, or anything else that can lock/allocate
+    // unpredictably (log_queue_.enqueue() is the same brief queue-push
+    // the rest of this codebase already treats as audio-thread-safe).
     sample operator()() {
-        // Serve samples from the current generated chunk; when it runs
+        std::lock_guard<std::mutex> lock(audio_mutex_);
+        if (playback_reset_pending_.exchange(false)) {
+            output_chunk_.clear();
+            output_pos_ = 0;
+            std::vector<float> discard;
+            while (output_queue_.try_dequeue(discard)) {}
+        }
+        // Serve samples from the current decoded chunk; when it runs
         // out, pull the next available chunk from the worker thread.
         if (output_pos_ >= output_chunk_.size()) {
             std::vector<float> next;
@@ -59,33 +121,98 @@ public:
                 output_pos_ = 0;
             }
         }
-        if (output_pos_ < output_chunk_.size())
+        if (output_pos_ < output_chunk_.size()) {
+            if (was_underrun_) {
+                was_underrun_ = false;
+                log_queue_.enqueue({false, "ncs.rt.snac_24kh.decode~: recovered from underrun"});
+            }
             return output_chunk_[output_pos_++];
+        }
+        // Underrun: nothing decoded yet -- output silence rather than
+        // block waiting on the worker. Logged once per episode (not
+        // every sample) to avoid flooding the console.
+        if (!was_underrun_) {
+            was_underrun_ = true;
+            log_queue_.enqueue({true, "ncs.rt.snac_24kh.decode~: underrun — outputting silence (worker/model too slow, or nothing decoded yet)"});
+        }
         return 0.0;
     }
 
-    message<> number{ this, "number", "Control-rate input value",
+    // Parses ncs.rt.snac_24kh.embedcodes' sum_out format: a bare
+    // (headerless) list, channel-major [768 x T]. Builds this call's
+    // [context + new] window, hands it to the worker, then updates the
+    // trailing context to the last kContextFrames frames of that same
+    // window (so it's always real audio history, whether it came from
+    // the previous new block or -- if T is ever smaller than
+    // kContextFrames -- partly from the context before that).
+    message<> list_msg{this, "list", "Quantized embeddings block, channel-major [768 x T]",
         MIN_FUNCTION {
-            if (args.size() < 1) return {};
-            input_queue_.enqueue(std::vector<float>{ (float)args[0] });
+            try {
+                std::vector<float> new_zq(args.size());
+                for (size_t i = 0; i < args.size(); ++i)
+                    new_zq[i] = (float)args[i];
+                int64_t T_block = static_cast<int64_t>(new_zq.size()) / kLatentDim;
+                if (T_block <= 0 || T_block * kLatentDim != static_cast<int64_t>(new_zq.size())) {
+                    log_queue_.enqueue({true, "ncs.rt.snac_24kh.decode~: embeddings block size is not a multiple of 768 channels"});
+                    return {};
+                }
+
+                int64_t T_in = kContextFrames + T_block;
+                std::vector<float> combined(static_cast<size_t>(kLatentDim * T_in));
+                for (int64_t c = 0; c < kLatentDim; ++c) {
+                    float* dst = &combined[static_cast<size_t>(c * T_in)];
+                    std::copy(context_zq_.begin() + static_cast<size_t>(c * kContextFrames),
+                              context_zq_.begin() + static_cast<size_t>(c * kContextFrames + kContextFrames),
+                              dst);
+                    std::copy(new_zq.begin() + static_cast<size_t>(c * T_block),
+                              new_zq.begin() + static_cast<size_t>(c * T_block + T_block),
+                              dst + kContextFrames);
+                }
+
+                // Strict FIFO -- every block in this stream matters, none
+                // can be dropped or collapsed (see ncs.rt.snac_24kh.vq's
+                // class-level comment).
+                input_queue_.enqueue({combined, T_block, samplerate()});
+
+                std::vector<float> new_context(static_cast<size_t>(kLatentDim * kContextFrames));
+                for (int64_t c = 0; c < kLatentDim; ++c) {
+                    const float* src = &combined[static_cast<size_t>(c * T_in + (T_in - kContextFrames))];
+                    std::copy(src, src + kContextFrames, new_context.begin() + static_cast<size_t>(c * kContextFrames));
+                }
+                context_zq_ = std::move(new_context);
+            } catch (const std::exception& ex) {
+                log_queue_.enqueue({true, "ncs.rt.snac_24kh.decode~: list handling failed — " + std::string(ex.what())});
+            }
             return {};
         }};
 
+    // Clears the streaming context (trailing zq history, crossfade tail,
+    // resampler filter state, currently-playing/queued audio, and any
+    // not-yet-decoded blocks) -- there's no real conv state to reset
+    // (SNAC's ONNX graphs aren't stateful), so this just re-primes the
+    // windowed context-trim and OLA bookkeeping for a fresh stream.
+    // context_zq_ is main-thread-owned (touched only here and in
+    // list_msg, both on the main thread) so it's safe to clear directly;
+    // the worker- and audio-thread-owned pieces go through their own
+    // atomic flags, consumed by the thread that actually owns them.
+    message<> reset_msg{this, "reset", "Clear streaming context, crossfade tail, and any queued/buffered audio",
+        MIN_FUNCTION {
+            context_zq_.assign(static_cast<size_t>(kLatentDim * kContextFrames), 0.0f);
+            input_queue_.clear();
+            worker_reset_pending_.store(true);
+            playback_reset_pending_.store(true);
+            return {};
+        }};
 
     message<> load{this, "load", "Load an ONNX model (.onnx)",
         MIN_FUNCTION {
             if (args.size() < 1) {
-                error("ncs.rt.snac_24kh.decode~: load requires a file path");
+                log_queue_.enqueue({true, "ncs.rt.snac_24kh.decode~: load requires a file path"});
                 return {};
             }
             load_queue_.enqueue((std::string)args[0]);
             return {};
         }};
-
-    // =====================================================================
-    // BANG
-    // =====================================================================
-    void bang() {}
 
 // =============================================================================
 // PRIVATE
@@ -95,14 +222,29 @@ private:
     std::atomic<bool> worker_running_{false};
     std::atomic<bool> stop_{false};
 
-    tsqueue<std::vector<float>> input_queue_;
+    // Main-thread-only (touched only in list_msg/reset_msg).
+    std::vector<float> context_zq_;
+
+    tsqueue<DecodeJob> input_queue_;
     tsqueue<std::vector<float>> output_queue_;
     tsqueue<std::string> load_queue_;
     tsqueue<std::pair<bool,std::string>> log_queue_;
 
-    // Audio-out: chunk currently being streamed to the DSP vector
+    // Audio-thread-only (touched only inside operator(), under
+    // audio_mutex_ -- see operator()'s comment for why the mutex exists
+    // despite this normally being single-threaded).
+    std::mutex audio_mutex_;
     std::vector<float> output_chunk_;
     size_t output_pos_{0};
+    bool was_underrun_{false};
+    std::atomic<bool> playback_reset_pending_{false};
+
+    // Worker-thread-only (touched only inside process(), which only ever
+    // runs sequentially on worker_thread_).
+    ncs_resample::StreamingResampler decode_resampler_;
+    double last_decode_sr_seen_{-1.0};
+    std::vector<float> held_tail_; // last kOlaSamples of the previous block's own output, not yet emitted
+    std::atomic<bool> worker_reset_pending_{false};
 
     timer<> output_timer_;
 
@@ -134,32 +276,80 @@ private:
         worker_running_ = false;
     }
 
+    // Strict FIFO, no collapse-to-latest -- see the class-level comment.
     void worker_loop() {
         while (!stop_) {
             std::string path;
             if (load_queue_.try_dequeue(path))
                 load_model(path);
-            std::vector<float> input;
-            if (!input_queue_.wait_dequeue(input, 100))
+            if (worker_reset_pending_.exchange(false)) {
+                held_tail_.clear();
+                decode_resampler_.reset_state();
+                last_decode_sr_seen_ = -1.0;
+            }
+            DecodeJob item;
+            if (!input_queue_.wait_dequeue(item, 100))
                 continue;
-            std::vector<float> temp;
-            while (input_queue_.try_dequeue(temp))
-                input = std::move(temp);
-            process(input);
+            process(item);
         }
     }
 
-    void process(const std::vector<float>& msg) {
-        if (model_loaded_) {
-            auto result = run_onnx(msg);
-            output_queue_.enqueue(std::move(result));
+    // Runs the full [context(kContextFrames) + new(T_block)] window
+    // through decode_audio.onnx, keeps the tail (new samples plus
+    // kOlaSamples of look-back into the context-derived output),
+    // crossfades that look-back region against the previous call's held
+    // tail (causal OLA -- no added latency beyond the context window),
+    // and resamples the result to the host's live DSP rate with a
+    // persistent-state resampler (unlike the buffer module's one-shot
+    // call, this runs every block, so filter continuity across blocks
+    // matters).
+    void process(const DecodeJob& job) {
+        if (!model_loaded_) {
+            log_queue_.enqueue({true, "ncs.rt.snac_24kh.decode~: no model loaded"});
+            return;
         }
+        auto audio = run_onnx(job.combined);
+        if (audio.empty()) {
+            log_queue_.enqueue({true, "ncs.rt.snac_24kh.decode~: inference failed"});
+            return;
+        }
+        int64_t total_samples = static_cast<int64_t>(audio.size());
+        int64_t hop = job.t_block * kHopLength;
+        int64_t boundary = total_samples - hop; // == kContextFrames*kHopLength in the normal case
+        if (boundary < 0 || hop <= 0) {
+            log_queue_.enqueue({true, "ncs.rt.snac_24kh.decode~: unexpected output length"});
+            return;
+        }
+        int64_t ola = std::min<int64_t>(kOlaSamples, boundary);
+        int64_t keep_start = boundary - ola;
+
+        std::vector<float> kept(audio.begin() + keep_start, audio.end()); // length hop+ola
+        std::vector<float> finalized(static_cast<size_t>(hop));
+        for (int64_t i = 0; i < ola; ++i) {
+            float t = (ola > 1) ? static_cast<float>(i) / static_cast<float>(ola - 1) : 1.0f;
+            float old_v = (i < static_cast<int64_t>(held_tail_.size())) ? held_tail_[static_cast<size_t>(i)] : 0.0f;
+            finalized[static_cast<size_t>(i)] = old_v * (1.0f - t) + kept[static_cast<size_t>(i)] * t;
+        }
+        if (hop > ola)
+            std::copy(kept.begin() + ola, kept.begin() + hop, finalized.begin() + ola);
+        held_tail_.assign(kept.begin() + hop, kept.end()); // length ola, held for the NEXT call
+
+        if (job.host_sr != last_decode_sr_seen_) {
+            decode_resampler_.reset_state();
+            last_decode_sr_seen_ = job.host_sr;
+        }
+        double ratio = (job.host_sr > 0.0) ? (job.host_sr / kModelSampleRate) : 1.0;
+        auto resampled = decode_resampler_.process(finalized, ratio);
+        output_queue_.enqueue(std::move(resampled));
     }
 
+    // Every crash seen so far in the buffer modules traced back to a call
+    // to error() -- post() has been reliable throughout. Route everything
+    // through post() with an "ERROR:" prefix instead.
     void flush_output() {
         std::pair<bool,std::string> log_msg;
         while (log_queue_.try_dequeue(log_msg)) {
-            if (log_msg.first) error(log_msg.second);
+            if (log_msg.first) c74::max::post("%s", ("ERROR: " + log_msg.second).c_str());
             else c74::max::post("%s", log_msg.second.c_str());
         }
     }
@@ -189,6 +379,21 @@ private:
             session_options_.SetIntraOpNumThreads(1);
             session_options_.SetGraphOptimizationLevel(
                 GraphOptimizationLevel::ORT_ENABLE_EXTENDED);
+            // Every ncs.*/ncs.rt.* module shares one process-wide
+            // Ort::Env (ONNXManager, shared_external_helpers.h); the
+            // default CPU memory arena + memory-pattern planner mutate
+            // shared allocator bookkeeping under concurrent Run() calls
+            // across sessions on different worker threads. Buffer mode's
+            // rare one-shot-bang calls never hit this, but rt~'s
+            // continuous Run()-every-block cadence caused a heap
+            // corruption inside ONNX Runtime's own mem-pattern planner
+            // (confirmed via crash report: abort() in malloc's free-list
+            // checksum check, inside MemPatternPlanner::GenerateMemPattern(),
+            // on a different rt module's worker thread mid-Run()).
+            // Disabling both removes that shared/mutated code path; the
+            // cost is moot given how small these tensors are.
+            session_options_.DisableCpuMemArena();
+            session_options_.DisableMemPattern();
             session_ = std::make_unique<Ort::Session>(*env, path.c_str(),
                                                        session_options_);
             ONNXManager::instance().release_env();
@@ -214,8 +419,16 @@ private:
         try {
             std::vector<int64_t> shape = input_dims_;
             if (!shape.empty() && shape[0] == -1) shape[0] = 1;
-            if (!shape.empty() && shape.back() == -1)
-                shape.back() = static_cast<int64_t>(input.size());
+            if (!shape.empty() && shape.back() == -1) {
+                // z_q is [B, 768, T] -- the flattened input covers every
+                // dim, so the dynamic trailing dim is input.size() divided
+                // by the product of the static middle dims (768), not
+                // input.size() itself.
+                int64_t known = 1;
+                for (size_t i = 1; i + 1 < shape.size(); ++i) known *= shape[i];
+                shape.back() = known > 0 ? static_cast<int64_t>(input.size()) / known
+                                         : static_cast<int64_t>(input.size());
+            }
 
             auto tensor = vector_to_tensor(input, shape, allocator_);
             const char* in_names[]  = {input_name_.c_str()};

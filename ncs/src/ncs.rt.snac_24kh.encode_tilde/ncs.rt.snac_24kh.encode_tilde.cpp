@@ -12,6 +12,7 @@
 
 #include "../include/shared_external_helpers.h"
 #include "../include/onnx_helpers.h"
+#include "../include/resample_helpers.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -25,15 +26,51 @@
 
 using namespace c74::min;
 
+// SNAC 24kHz encoder, real-time variant. There is no incremental/cached
+// conv-state ONNX graph for SNAC (unlike EnCodec's LSTM h/c) -- the same
+// encode_audio_segment.onnx the buffer module uses always runs its whole
+// conv stack fresh on whatever's handed to it. So "streaming" here means
+// windowed context-trim: each new kBlockSize-sample block is prepended
+// with the PREVIOUS block (kContextSize == kBlockSize, one block of real
+// trailing audio) before Run(), and only the newly-computed frames
+// (covering just the new block) are kept -- the leading, context-derived
+// frames are discarded every time. This needs no changes to the
+// exported ONNX graph and reuses the exact weights/graph already
+// validated in the buffer module; the cost is discarding half the
+// compute (context frames) every block, and a latency floor of one block
+// (kBlockSize samples @ 24kHz) before the first embeddings can appear.
+//
+// kBlockSize is chosen as one preprocess_pad multiple (2048 samples ==
+// hop_length(512) * vq_strides[0](4), matching ncs.snac_24kh.encode's
+// padding rule) so every block's frame count stays aligned with the VQ
+// stride grouping without needing extra padding logic here.
+static constexpr int64_t kHopLength    = 512;
+static constexpr int64_t kBlockFrames  = 4;                          // frames per block
+static constexpr int64_t kBlockSize    = kHopLength * kBlockFrames;  // 2048 samples
+static constexpr int64_t kContextSize  = kBlockSize;                 // one block of trailing context
+static constexpr int64_t kLatentDim    = 768;
+
+// The model only works at 24kHz; the live host DSP rate is whatever
+// Max's signal chain is running at. Unlike the buffer module's one-shot
+// src_simple() call, this runs continuously block after block, so the
+// resampler here must carry its filter state across calls (see
+// ncs_resample::StreamingResampler) or every block boundary would click.
+static constexpr double kModelSampleRate = 24000.0;
+
+// Granularity (in HOST-rate samples) at which incoming audio is handed
+// to the streaming resampler -- independent of Max's DSP vector size, so
+// behavior doesn't change if the user changes their signal vector size.
+static constexpr size_t kHostFlushSamples = 256;
+
 class NcsRtSnac_24khEncode : public object<NcsRtSnac_24khEncode>
     , public sample_operator<1, 0>
 {
 public:
-    MIN_DESCRIPTION     {""};
-    MIN_TAGS            {""};
+    MIN_DESCRIPTION     {"Runs the SNAC 24kHz encoder continuously on a live audio signal (windowed context-trim streaming)."};
+    MIN_TAGS            {"snac, onnx, audio"};
     MIN_AUTHOR          {"Behzad Haki"};
     inlet<> signal_in{ this, "(signal) audio input" };
-    outlet<> result_out{ this, "(list) inference result" };
+    outlet<> data_out{ this, "(list) embeddings block, channel-major [768 x T], one message per block" };
 
     // =====================================================================
     // CONSTRUCTOR / DESTRUCTOR
@@ -41,8 +78,14 @@ public:
     NcsRtSnac_24khEncode()
         : output_timer_{this, MIN_FUNCTION { flush_output(); output_timer_.delay(10); return {}; }}
     {
+        context_.assign(static_cast<size_t>(kContextSize), 0.0f);
         start_worker();
         start_output_timer();
+        // Auto-load the model shipped alongside this external -- the
+        // SAME encode_audio_segment.onnx the buffer module uses. `load
+        // <path>` still works afterwards to point at a different model.
+        load_queue_.enqueue(BundleResourceLoader::get_resource_path(
+            "models/snac_onnx_exports/24khz/encode_audio_segment.onnx"));
     }
 
     ~NcsRtSnac_24khEncode() {
@@ -50,33 +93,80 @@ public:
         stop_output_timer();
     }
 
+    // Normally runs on the AUDIO THREAD only, and only ever from one
+    // thread at a time -- but Max recompiles the DSP chain (and
+    // re-registers this same perform callback) on every DSP on/off
+    // toggle without destroying/recreating this object, and a toggle can
+    // land in a narrow window where the previous chain's audio callback
+    // hasn't fully quiesced before the new one starts. audio_mutex_
+    // guards against that: if operator() is ever (re-)entered
+    // concurrently, one call simply waits a few instructions for the
+    // other instead of two threads mutating raw_accum_/model_pending_/
+    // context_ at once -- which, left unguarded, is exactly the kind of
+    // race that corrupts a std::vector's heap-allocated buffer. Never
+    // calls into ONNX, min-api's error()/post(), or anything else that
+    // can block/allocate unpredictably.
     sample operator()(sample in) {
-        // Accumulate incoming samples into a block and ship it to the
-        // worker thread the moment it's full — no extra buffering.
-        input_accum_.push_back(static_cast<float>(in));
-        if (input_accum_.size() >= kBlockSize) {
-            input_queue_.enqueue(std::move(input_accum_));
-            input_accum_.clear();
-            input_accum_.reserve(kBlockSize);
+        std::lock_guard<std::mutex> lock(audio_mutex_);
+        double sr = samplerate();
+        if (reset_requested_.exchange(false) || sr != last_sr_seen_) {
+            resampler_.reset_state();
+            raw_accum_.clear();
+            model_pending_.clear();
+            context_.assign(static_cast<size_t>(kContextSize), 0.0f);
+            last_sr_seen_ = sr;
+        }
+
+        raw_accum_.push_back(static_cast<float>(in));
+        if (raw_accum_.size() >= kHostFlushSamples) {
+            double ratio = (sr > 0.0) ? (kModelSampleRate / sr) : 1.0;
+            auto resampled = resampler_.process(raw_accum_, ratio);
+            raw_accum_.clear();
+            model_pending_.insert(model_pending_.end(), resampled.begin(), resampled.end());
+        }
+
+        while (model_pending_.size() >= static_cast<size_t>(kBlockSize)) {
+            std::vector<float> new_block(model_pending_.begin(), model_pending_.begin() + kBlockSize);
+            model_pending_.erase(model_pending_.begin(), model_pending_.begin() + kBlockSize);
+
+            std::vector<float> combined;
+            combined.reserve(static_cast<size_t>(kContextSize + kBlockSize));
+            combined.insert(combined.end(), context_.begin(), context_.end());
+            combined.insert(combined.end(), new_block.begin(), new_block.end());
+
+            // Strict FIFO -- every block in this stream matters, none can
+            // be dropped or collapsed (unlike buffer mode's bang-
+            // supersedes-bang queues; see ncs.rt.snac_24kh.vq's
+            // class-level comment).
+            input_queue_.enqueue(std::move(combined));
+            context_ = std::move(new_block);
         }
         return 0.0;
     }
 
+    // Clears the streaming context (trailing audio history, resampler
+    // filter state, and any not-yet-processed blocks) -- there's no real
+    // conv state to reset (SNAC's ONNX graphs aren't stateful), so this
+    // just re-primes the windowed context-trim bookkeeping for a fresh
+    // stream. Safe to call at any time: reset_requested_ is only ever
+    // consumed by the audio thread itself, so there's no race with the
+    // buffers it guards (all of which are audio-thread-only).
+    message<> reset_msg{this, "reset", "Clear streaming context and any queued (not-yet-encoded) blocks",
+        MIN_FUNCTION {
+            reset_requested_.store(true);
+            input_queue_.clear();
+            return {};
+        }};
 
     message<> load{this, "load", "Load an ONNX model (.onnx)",
         MIN_FUNCTION {
             if (args.size() < 1) {
-                error("ncs.rt.snac_24kh.encode~: load requires a file path");
+                log_queue_.enqueue({true, "ncs.rt.snac_24kh.encode~: load requires a file path"});
                 return {};
             }
             load_queue_.enqueue((std::string)args[0]);
             return {};
         }};
-
-    // =====================================================================
-    // BANG
-    // =====================================================================
-    void bang() {}
 
 // =============================================================================
 // PRIVATE
@@ -91,9 +181,16 @@ private:
     tsqueue<std::string> load_queue_;
     tsqueue<std::pair<bool,std::string>> log_queue_;
 
-    // Audio-in accumulation block (sent to the worker as soon as it's full)
-    static constexpr size_t kBlockSize = 512;
-    std::vector<float> input_accum_;
+    // Audio-thread-only state (touched exclusively inside operator(),
+    // under audio_mutex_ -- see operator()'s comment for why the mutex
+    // exists despite this normally being single-threaded).
+    std::mutex audio_mutex_;
+    ncs_resample::StreamingResampler resampler_;
+    std::vector<float> raw_accum_;      // host-rate samples awaiting resample
+    std::vector<float> model_pending_;  // resampled (24kHz) samples awaiting a full block
+    std::vector<float> context_;        // trailing kContextSize samples from the previous block
+    double last_sr_seen_{-1.0};
+    std::atomic<bool> reset_requested_{false};
 
     timer<> output_timer_;
 
@@ -125,41 +222,60 @@ private:
         worker_running_ = false;
     }
 
+    // Strict FIFO, no collapse-to-latest -- see operator()'s comment.
     void worker_loop() {
         while (!stop_) {
             std::string path;
             if (load_queue_.try_dequeue(path))
                 load_model(path);
-            std::vector<float> input;
-            if (!input_queue_.wait_dequeue(input, 100))
+            std::vector<float> item;
+            if (!input_queue_.wait_dequeue(item, 100))
                 continue;
-            std::vector<float> temp;
-            while (input_queue_.try_dequeue(temp))
-                input = std::move(temp);
-            process(input);
+            process(item);
         }
     }
 
-    void process(const std::vector<float>& msg) {
-        if (model_loaded_) {
-            auto result = run_onnx(msg);
-            output_queue_.enqueue(std::move(result));
+    // Runs the full [context(kContextSize) + new(kBlockSize)] window
+    // through encode_audio_segment.onnx, then keeps only the LAST
+    // kBlockFrames time-steps of the channel-major [768 x T] output --
+    // the frames whose receptive field is anchored in real (context)
+    // audio rather than the model's own zero-init edge behavior.
+    void process(const std::vector<float>& combined) {
+        if (!model_loaded_) {
+            log_queue_.enqueue({true, "ncs.rt.snac_24kh.encode~: no model loaded"});
+            return;
         }
+        auto z = run_onnx(combined);
+        if (z.empty()) {
+            log_queue_.enqueue({true, "ncs.rt.snac_24kh.encode~: inference failed"});
+            return;
+        }
+        int64_t T_total = static_cast<int64_t>(z.size()) / kLatentDim;
+        if (T_total < kBlockFrames) {
+            log_queue_.enqueue({true, "ncs.rt.snac_24kh.encode~: unexpected output length"});
+            return;
+        }
+        std::vector<float> trimmed(static_cast<size_t>(kLatentDim * kBlockFrames));
+        for (int64_t c = 0; c < kLatentDim; ++c) {
+            const float* src = &z[static_cast<size_t>(c * T_total + (T_total - kBlockFrames))];
+            std::copy(src, src + kBlockFrames, trimmed.begin() + static_cast<size_t>(c * kBlockFrames));
+        }
+        output_queue_.enqueue(std::move(trimmed));
     }
 
+    // Every crash seen so far in the buffer modules traced back to a call
+    // to error() -- post() has been reliable throughout. Route everything
+    // through post() with an "ERROR:" prefix instead.
     void flush_output() {
         std::pair<bool,std::string> log_msg;
         while (log_queue_.try_dequeue(log_msg)) {
-            if (log_msg.first) error(log_msg.second);
+            if (log_msg.first) c74::max::post("%s", ("ERROR: " + log_msg.second).c_str());
             else c74::max::post("%s", log_msg.second.c_str());
         }
         std::vector<float> result;
         if (output_queue_.try_dequeue(result)) {
-            std::vector<float> temp;
-            while (output_queue_.try_dequeue(temp))
-                result = std::move(temp);
-            atoms out_atoms(result.begin(), result.end());
-            result_out.send(out_atoms);
+            atoms out(result.begin(), result.end());
+            data_out.send(out);
         }
     }
 
@@ -188,6 +304,22 @@ private:
             session_options_.SetIntraOpNumThreads(1);
             session_options_.SetGraphOptimizationLevel(
                 GraphOptimizationLevel::ORT_ENABLE_EXTENDED);
+            // This session shares one process-wide Ort::Env (ONNXManager,
+            // in shared_external_helpers.h) with every other ncs.*/
+            // ncs.rt.* module loaded at the same time, each running Run()
+            // on its own worker thread. The default CPU memory arena +
+            // memory-pattern planner mutate shared allocator bookkeeping
+            // under concurrent Run() calls across sessions -- fine at
+            // buffer mode's rare one-shot-bang call rate, but rt~'s
+            // continuous Run()-every-block cadence hit a heap corruption
+            // inside ONNX Runtime's own mem-pattern planner (confirmed
+            // via a crash report: abort() in malloc's free-list checksum
+            // check, inside MemPatternPlanner::GenerateMemPattern(),
+            // while this module's worker thread was mid-Run()).
+            // Disabling both here removes that whole shared/mutated code
+            // path; the cost is moot given how small these tensors are.
+            session_options_.DisableCpuMemArena();
+            session_options_.DisableMemPattern();
             session_ = std::make_unique<Ort::Session>(*env, path.c_str(),
                                                        session_options_);
             ONNXManager::instance().release_env();
@@ -213,8 +345,15 @@ private:
         try {
             std::vector<int64_t> shape = input_dims_;
             if (!shape.empty() && shape[0] == -1) shape[0] = 1;
-            if (!shape.empty() && shape.back() == -1)
-                shape.back() = static_cast<int64_t>(input.size());
+            if (!shape.empty() && shape.back() == -1) {
+                // audio is [B, 1, T] -- the dynamic trailing dim is
+                // input.size() divided by the product of the static
+                // middle dims (1 here, but computed generically).
+                int64_t known = 1;
+                for (size_t i = 1; i + 1 < shape.size(); ++i) known *= shape[i];
+                shape.back() = known > 0 ? static_cast<int64_t>(input.size()) / known
+                                         : static_cast<int64_t>(input.size());
+            }
 
             auto tensor = vector_to_tensor(input, shape, allocator_);
             const char* in_names[]  = {input_name_.c_str()};

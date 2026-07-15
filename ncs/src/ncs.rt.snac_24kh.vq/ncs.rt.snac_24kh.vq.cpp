@@ -25,14 +25,39 @@
 
 using namespace c74::min;
 
+// SNAC 24kHz quantizer, real-time variant: identical math to
+// ncs.snac_24kh.vq (same quantize_encodings.onnx graph -- quantization is
+// a pointwise per-frame lookup with no temporal receptive field of its
+// own, so running it continuously on small rt~ blocks is exactly as
+// correct as running it once on a whole buffer~). The only real
+// difference from the buffer module is the transport: ncs.rt.snac_24kh.encode~
+// hands off one small block's worth of embeddings at a time (a few
+// frames, well under a thousand floats), so there's no need for the
+// buffer module's messageix/tensor chunking protocol -- a plain "list"
+// message in, three plain "list" messages out.
+//
+// UNLIKE the buffer module, this is a continuous stream: every block
+// must be quantized in order, none can be dropped (dropping one would
+// desync ncs.rt.snac_24kh.embedcodes/decode~'s context from
+// ncs.rt.snac_24kh.encode~'s). So the worker loop below deliberately does
+// NOT collapse its queue to "only the latest" the way every buffer-mode
+// module does (that pattern fits a bang superseding a stale one; it does
+// not fit a running audio stream) -- it processes exactly what's
+// enqueued, one at a time, in order. For the same reason, there's no
+// CancellableRun here: a mid-stream Run() is never stale, it always
+// needs to finish.
+static constexpr int kNumLevels = 3;
+
 class NcsRtSnac_24khVq : public object<NcsRtSnac_24khVq>
 {
 public:
-    MIN_DESCRIPTION     {""};
-    MIN_TAGS            {""};
+    MIN_DESCRIPTION     {"SNAC 24kHz residual vector quantizer (real-time): embeddings block -> per-level codes."};
+    MIN_TAGS            {"snac, onnx"};
     MIN_AUTHOR          {"Behzad Haki"};
-    inlet<> control_in{ this, "(number) control-rate input value" };
-    outlet<> result_out{ this, "(list) inference result" };
+    inlet<> control_in{ this, "(list/load) embeddings block from ncs.rt.snac_24kh.encode~, or model path" };
+    outlet<> level0_out{ this, "(list) codes... -- codebook level 0 (coarsest, stride 4)" };
+    outlet<> level1_out{ this, "(list) codes... -- codebook level 1 (stride 2)" };
+    outlet<> level2_out{ this, "(list) codes... -- codebook level 2 (finest, stride 1)" };
 
     // =====================================================================
     // CONSTRUCTOR / DESTRUCTOR
@@ -42,6 +67,11 @@ public:
     {
         start_worker();
         start_output_timer();
+        // Auto-load the model shipped alongside this external -- the
+        // SAME quantize_encodings.onnx the buffer module uses. `load
+        // <path>` still works afterwards to point at a different model.
+        load_queue_.enqueue(BundleResourceLoader::get_resource_path(
+            "models/snac_onnx_exports/24khz/quantize_encodings.onnx"));
     }
 
     ~NcsRtSnac_24khVq() {
@@ -49,30 +79,32 @@ public:
         stop_output_timer();
     }
 
-
-
-    message<> number{ this, "number", "Control-rate input value",
+    // Errors go through log_queue_ (not error() inline) -- this can fire
+    // very early during patch load, and calling error() synchronously at
+    // that point has crashed Max's console/UI; deferring it to the timer
+    // callback avoids that.
+    message<> list_msg{this, "list", "Embeddings block, channel-major [768 x T]",
         MIN_FUNCTION {
-            if (args.size() < 1) return {};
-            input_queue_.enqueue(std::vector<float>{ (float)args[0] });
+            try {
+                std::vector<float> z(args.size());
+                for (size_t i = 0; i < args.size(); ++i)
+                    z[i] = (float)args[i];
+                input_queue_.enqueue(std::move(z));
+            } catch (const std::exception& ex) {
+                log_queue_.enqueue({true, "ncs.rt.snac_24kh.vq: list handling failed — " + std::string(ex.what())});
+            }
             return {};
         }};
-
 
     message<> load{this, "load", "Load an ONNX model (.onnx)",
         MIN_FUNCTION {
             if (args.size() < 1) {
-                error("ncs.rt.snac_24kh.vq: load requires a file path");
+                log_queue_.enqueue({true, "ncs.rt.snac_24kh.vq: load requires a file path"});
                 return {};
             }
             load_queue_.enqueue((std::string)args[0]);
             return {};
         }};
-
-    // =====================================================================
-    // BANG
-    // =====================================================================
-    void bang() {}
 
 // =============================================================================
 // PRIVATE
@@ -83,7 +115,7 @@ private:
     std::atomic<bool> stop_{false};
 
     tsqueue<std::vector<float>> input_queue_;
-    tsqueue<std::vector<float>> output_queue_;
+    tsqueue<std::pair<int, atoms>> output_queue_; // outlet_id (0-2), codes...
     tsqueue<std::string> load_queue_;
     tsqueue<std::pair<bool,std::string>> log_queue_;
 
@@ -94,9 +126,8 @@ private:
     Ort::SessionOptions session_options_;
     Ort::AllocatorWithDefaultOptions allocator_;
     std::string input_name_;
-    std::string output_name_;
     std::vector<int64_t> input_dims_;
-    std::vector<int64_t> output_dims_;
+    std::vector<std::string> output_names_;
 
     void start_worker() {
         if (worker_running_.exchange(true)) return;
@@ -117,41 +148,62 @@ private:
         worker_running_ = false;
     }
 
+    // Strict FIFO, no collapse-to-latest -- see the class-level comment
+    // for why (this is a running stream, not a bang-supersedes-bang UI
+    // trigger).
     void worker_loop() {
         while (!stop_) {
             std::string path;
             if (load_queue_.try_dequeue(path))
                 load_model(path);
-            std::vector<float> input;
-            if (!input_queue_.wait_dequeue(input, 100))
+            std::vector<float> item;
+            if (!input_queue_.wait_dequeue(item, 100))
                 continue;
-            std::vector<float> temp;
-            while (input_queue_.try_dequeue(temp))
-                input = std::move(temp);
-            process(input);
+            process(item);
         }
     }
 
-    void process(const std::vector<float>& msg) {
-        if (model_loaded_) {
-            auto result = run_onnx(msg);
-            output_queue_.enqueue(std::move(result));
+    // Builds and queues one PendingSend per level, level2 first ... level0
+    // last, so that when flush_output() drains them one per tick, a
+    // downstream ncs.rt.snac_24kh.embedcodes (whose leftmost/level0 inlet
+    // is hot) sees its cold level1/level2 inlets updated before the
+    // trigger.
+    void process(const std::vector<float>& z) {
+        if (!model_loaded_) {
+            log_queue_.enqueue({true, "ncs.rt.snac_24kh.vq: no model loaded"});
+            return;
+        }
+        auto result = run_onnx(z);
+        if (result.size() != kNumLevels) {
+            log_queue_.enqueue({true, "ncs.rt.snac_24kh.vq: inference failed"});
+            return;
+        }
+        for (int lvl = kNumLevels - 1; lvl >= 0; --lvl) {
+            atoms msg;
+            msg.reserve(result[lvl].size());
+            for (int v : result[lvl]) msg.push_back(v);
+            output_queue_.enqueue({lvl, std::move(msg)});
         }
     }
 
+    // Every crash seen so far in the buffer modules traced back to a call
+    // to error() -- post() has been reliable throughout. Route everything
+    // through post() with an "ERROR:" prefix instead. Exactly ONE outlet
+    // per tick (unlike the correctness requirement in the worker loop
+    // above, this is just the same "never seen the exact trigger
+    // condition inside Max's outlet_cache" precaution the buffer modules
+    // use).
     void flush_output() {
         std::pair<bool,std::string> log_msg;
         while (log_queue_.try_dequeue(log_msg)) {
-            if (log_msg.first) error(log_msg.second);
+            if (log_msg.first) c74::max::post("%s", ("ERROR: " + log_msg.second).c_str());
             else c74::max::post("%s", log_msg.second.c_str());
         }
-        std::vector<float> result;
-        if (output_queue_.try_dequeue(result)) {
-            std::vector<float> temp;
-            while (output_queue_.try_dequeue(temp))
-                result = std::move(temp);
-            atoms out_atoms(result.begin(), result.end());
-            result_out.send(out_atoms);
+        std::pair<int, atoms> item;
+        if (output_queue_.try_dequeue(item)) {
+            if (item.first == 2) level2_out.send(item.second);
+            else if (item.first == 1) level1_out.send(item.second);
+            else level0_out.send(item.second);
         }
     }
 
@@ -163,12 +215,6 @@ private:
         output_timer_.stop();
     }
 
-    // min-api's error()/post() are only safe to call from the main thread —
-    // calling them directly here (this runs on worker_thread_) can throw
-    // from inside min-api itself, and an exception escaping a std::thread's
-    // entry point is an instant abort(). So log_queue_ carries the message
-    // to flush_output(), which the output_timer_ only ever runs on the main
-    // thread, and it does the actual error()/post() call from there.
     void load_model(const std::string& path) {
         try {
             session_.reset();
@@ -180,6 +226,21 @@ private:
             session_options_.SetIntraOpNumThreads(1);
             session_options_.SetGraphOptimizationLevel(
                 GraphOptimizationLevel::ORT_ENABLE_EXTENDED);
+            // Every ncs.*/ncs.rt.* module shares one process-wide
+            // Ort::Env (ONNXManager, shared_external_helpers.h); the
+            // default CPU memory arena + memory-pattern planner mutate
+            // shared allocator bookkeeping under concurrent Run() calls
+            // across sessions on different worker threads. Buffer mode's
+            // rare one-shot-bang calls never hit this, but rt~'s
+            // continuous Run()-every-block cadence caused a heap
+            // corruption inside ONNX Runtime's own mem-pattern planner
+            // (confirmed via crash report: abort() in malloc's free-list
+            // checksum check, inside MemPatternPlanner::GenerateMemPattern(),
+            // on a different rt module's worker thread mid-Run()).
+            // Disabling both removes that shared/mutated code path; the
+            // cost is moot given how small these tensors are.
+            session_options_.DisableCpuMemArena();
+            session_options_.DisableMemPattern();
             session_ = std::make_unique<Ort::Session>(*env, path.c_str(),
                                                        session_options_);
             ONNXManager::instance().release_env();
@@ -188,9 +249,16 @@ private:
             input_name_ = session_->GetInputNameAllocated(0, allocator_).get();
             input_dims_ = input_type.GetTensorTypeAndShapeInfo().GetShape();
 
-            auto output_type = session_->GetOutputTypeInfo(0);
-            output_name_ = session_->GetOutputNameAllocated(0, allocator_).get();
-            output_dims_ = output_type.GetTensorTypeAndShapeInfo().GetShape();
+            size_t n_out = session_->GetOutputCount();
+            output_names_.clear();
+            for (size_t i = 0; i < n_out; ++i)
+                output_names_.push_back(session_->GetOutputNameAllocated(i, allocator_).get());
+            if (output_names_.size() != kNumLevels) {
+                log_queue_.enqueue({true, "ncs.rt.snac_24kh.vq: expected " + std::to_string(kNumLevels)
+                                            + " codebook outputs, model has " + std::to_string(output_names_.size())});
+                model_loaded_ = false;
+                return;
+            }
 
             model_loaded_ = true;
             log_queue_.enqueue({false, "ncs.rt.snac_24kh.vq: loaded model (" + path + ")"});
@@ -200,22 +268,36 @@ private:
         }
     }
 
-    std::vector<float> run_onnx(const std::vector<float>& input) {
+    // Runs quantize_encodings.onnx on flattened [768 x T] embeddings and
+    // returns each level's native-resolution codes as a separate int
+    // vector (index 0 = coarsest/stride 4 ... index 2 = finest/stride 1).
+    std::vector<std::vector<int>> run_onnx(const std::vector<float>& z) {
         if (!session_ || !model_loaded_) return {};
         try {
             std::vector<int64_t> shape = input_dims_;
             if (!shape.empty() && shape[0] == -1) shape[0] = 1;
-            if (!shape.empty() && shape.back() == -1)
-                shape.back() = static_cast<int64_t>(input.size());
+            int64_t known = 1;
+            for (size_t i = 1; i + 1 < shape.size(); ++i) known *= shape[i];
+            int64_t T_b = known > 0 ? static_cast<int64_t>(z.size()) / known
+                                     : static_cast<int64_t>(z.size());
+            if (!shape.empty() && shape.back() == -1) shape.back() = T_b;
 
-            auto tensor = vector_to_tensor(input, shape, allocator_);
-            const char* in_names[]  = {input_name_.c_str()};
-            const char* out_names[] = {output_name_.c_str()};
+            auto tensor = vector_to_tensor(z, shape, allocator_);
+            const char* in_names[] = {input_name_.c_str()};
+            std::vector<const char*> out_names;
+            for (auto& n : output_names_) out_names.push_back(n.c_str());
+
             Ort::RunOptions opts;
             auto outputs = session_->Run(opts, in_names, &tensor, 1,
-                                           out_names, 1);
-            if (outputs.size() > 0)
-                return tensor_to_vector(outputs[0]);
+                                          out_names.data(), out_names.size());
+            if (outputs.size() != kNumLevels) return {};
+
+            std::vector<std::vector<int>> result(kNumLevels);
+            for (int lvl = 0; lvl < kNumLevels; ++lvl) {
+                auto raw = tensor_to_vector_i64(outputs[lvl]);
+                result[lvl].assign(raw.begin(), raw.end());
+            }
+            return result;
         } catch (const std::exception&) {}
         return {};
     }
