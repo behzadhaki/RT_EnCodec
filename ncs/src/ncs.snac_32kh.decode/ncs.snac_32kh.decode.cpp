@@ -12,6 +12,8 @@
 
 #include "../include/shared_external_helpers.h"
 #include "../include/onnx_helpers.h"
+#include "../include/buffer_helpers.h"
+#include "../include/resample_helpers.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -25,14 +27,76 @@
 
 using namespace c74::min;
 
-class NcsSnac_32khDecode : public object<NcsSnac_32khDecode>
+// The model only outputs 32kHz audio; it's resampled to output_sr here
+// before being written to the output buffer~ -- a one-shot src_simple()
+// call per decode, not the persistent-state streaming resampler
+// real-time signal modules need. output_sr is the OUTPUT buffer~'s own
+// declared sample rate (queried in tensor_msg via
+// ncs_buffer::get_samplerate(), before there's anything to write), not
+// Max's live DSP driver rate -- this pipeline never requires DSP/audio to
+// be running, so the live driver rate can silently be stale/wrong; the
+// buffer's own declared rate has no such failure mode. Identical network
+// to snac_44kh (only sampling rate and weights differ) -- see
+// ncs.snac_24kh.decode.cpp for the full design rationale this module
+// mirrors.
+static constexpr double kModelSampleRate = 32000.0;
+
+struct DecodeJob {
+    std::vector<float> embeddings;
+    int trim_samples;   // in output_sr-space (post-resample); <= 0 means "don't trim"
+    double output_sr;
+};
+
+// ncs.snac_32kh.embedcodes sends its (chunked) embeddings as a `messageix
+// <index>` message (index -1 = last chunk) immediately followed by
+// `tensor <data...>`, both real Max message selectors -- see
+// ncs.snac_24kh.encode.cpp's kMaxChunkAtoms comment for the full crash
+// history behind chunking and why real selectors (not a header baked
+// into a generic list) are used here.
+//
+// The source duration is NOT part of that chunk stream -- it arrives
+// separately, directly from ncs.snac_32kh.encode's second outlet (as
+// SECONDS, not a raw sample count -- see that outlet's comment for why),
+// on length_in below. trim_samples above is computed from that cached
+// duration times THIS object's own output buffer's sample rate, as the
+// last step in process(), after the 32kHz->output_sr resample -- not
+// before it -- so a single final rounding produces the trim count,
+// instead of carrying a value pre-rounded in a different (32kHz) domain
+// through a second, independent resample.
+//
+// That's a deliberate, accepted race (see ncs.snac_24kh.encode.cpp's
+// length_out comment): a second encode bang fired before a first bang's
+// data has finished threading through vq/embedcodes to here can
+// overwrite the cached duration before the first run's data arrives,
+// silently mistrimming it. Not a crash risk, and considered acceptable
+// for buffer-mode's typical bang/wait/use workflow. If length_in is
+// never connected/fed, no trim is applied at all -- just the raw model
+// output, resampled to output_sr.
+
+class NcsSnac_32khDecode : public object<NcsSnac_32khDecode>, public CancellableRun
 {
 public:
-    MIN_DESCRIPTION     {""};
-    MIN_TAGS            {""};
+    MIN_DESCRIPTION     {"Runs the SNAC 32kHz decoder and writes the result to a named buffer~."};
+    MIN_TAGS            {"snac, onnx, audio"};
     MIN_AUTHOR          {"Behzad Haki"};
-    inlet<> control_in{ this, "(number) control-rate input value" };
-    outlet<> result_out{ this, "(list) inference result" };
+    inlet<> embeddings_in{ this, "(set/load/messageix/tensor) buffer name, model path, or chunked embeddings from ncs.snac_32kh.embedcodes" };
+    inlet<> length_in{ this, "(float) source duration in seconds -- wire directly from ncs.snac_32kh.encode's second outlet" };
+
+    buffer_reference buffer_ref_{ this };
+
+    // @buffername lets the output buffer~ be set as an object-box argument
+    // (@buffername myBuf) or attribute message, alongside the 'set'
+    // message buffer_reference already provides. An attribute's setter
+    // runs immediately at construction with its default value ("" here)
+    // -- guard against binding an empty-named buffer, an untested call
+    // into Max's buffer subsystem that crashed on patch load.
+    attribute<symbol> buffername{ this, "buffername", "", description{"Name of the buffer~ to write to."},
+        setter{ MIN_FUNCTION {
+            symbol name = (symbol)args[0];
+            if (name != symbol(""))
+                buffer_ref_.set(name);
+            return {args};
+        }}};
 
     // =====================================================================
     // CONSTRUCTOR / DESTRUCTOR
@@ -42,6 +106,10 @@ public:
     {
         start_worker();
         start_output_timer();
+        // Auto-load the model shipped alongside this external. `load
+        // <path>` still works afterwards to point at a different model.
+        load_queue_.enqueue(BundleResourceLoader::get_resource_path(
+            "models/snac_onnx_exports/32khz/decode_audio.onnx"));
     }
 
     ~NcsSnac_32khDecode() {
@@ -49,30 +117,73 @@ public:
         stop_output_timer();
     }
 
-
-
-    message<> number{ this, "number", "Control-rate input value",
+    // Chunks accumulate here; only once a tensor arrives whose preceding
+    // messageix was -1 (the last chunk) does decode_audio.onnx actually
+    // run, on the full reassembled embeddings -- so there's no
+    // chunk-boundary artifact in the decoded audio, chunking is purely a
+    // transport concern. The output buffer's own sample rate and the
+    // cached source duration (from length_in) are read/used here (main
+    // thread) at the same time, and multiplied into a single trim sample
+    // count now (rather than in process()) so both the trim and the
+    // resample below have everything they need without re-touching the
+    // buffer~ from the worker thread. Errors go through log_queue_ (not
+    // error() inline) -- this can fire very early during patch load, and
+    // calling error() synchronously at that point has crashed Max's
+    // console/UI; deferring it to the timer callback avoids that.
+    message<> messageix_msg{this, "messageix", "Chunk index (-1 = last chunk)",
         MIN_FUNCTION {
-            if (args.size() < 1) return {};
-            input_queue_.enqueue(std::vector<float>{ (float)args[0] });
+            if (!args.empty())
+                pending_is_last_ = ((int)args[0] == -1);
             return {};
         }};
 
+    message<> tensor_msg{this, "tensor", "Embeddings chunk data",
+        MIN_FUNCTION {
+            try {
+                for (auto& a : args)
+                    accum_embeddings_.push_back((float)a);
+                if (pending_is_last_) {
+                    double output_sr = ncs_buffer::get_samplerate(buffer_ref_);
+                    int trim_samples = (has_length_ && output_sr > 0.0)
+                        ? static_cast<int>(std::llround(cached_duration_sec_ * output_sr))
+                        : -1;
+                    // A fresh reassembled tensor supersedes whatever the
+                    // worker is still doing -- see ncs.snac_32kh.encode's
+                    // bang_msg comment for why this cancels rather than
+                    // waits.
+                    cancel_active_run();
+                    input_queue_.enqueue({std::move(accum_embeddings_), trim_samples, output_sr});
+                    accum_embeddings_.clear();
+                    pending_is_last_ = false;
+                }
+            } catch (const std::exception& ex) {
+                log_queue_.enqueue({true, "ncs.snac_32kh.decode: tensor handling failed — " + std::string(ex.what())});
+            }
+            return {};
+        }};
+
+    // Cold: caches the source duration (seconds) from
+    // ncs.snac_32kh.encode's second outlet, used (if ever received) by
+    // the next tensor completion above. See the class-level comment for
+    // the accepted race and the "not connected -> no trim" fallback.
+    message<> length_msg{this, "float", "Source duration in seconds, from ncs.snac_32kh.encode's second outlet",
+        MIN_FUNCTION {
+            if (inlet == 1 && !args.empty()) {
+                cached_duration_sec_ = (double)args[0];
+                has_length_ = true;
+            }
+            return {};
+        }};
 
     message<> load{this, "load", "Load an ONNX model (.onnx)",
         MIN_FUNCTION {
             if (args.size() < 1) {
-                error("ncs.snac_32kh.decode: load requires a file path");
+                log_queue_.enqueue({true, "ncs.snac_32kh.decode: load requires a file path"});
                 return {};
             }
             load_queue_.enqueue((std::string)args[0]);
             return {};
         }};
-
-    // =====================================================================
-    // BANG
-    // =====================================================================
-    void bang() {}
 
 // =============================================================================
 // PRIVATE
@@ -82,7 +193,13 @@ private:
     std::atomic<bool> worker_running_{false};
     std::atomic<bool> stop_{false};
 
-    tsqueue<std::vector<float>> input_queue_;
+    // Only ever touched from message handlers, i.e. the main thread.
+    std::vector<float> accum_embeddings_;
+    bool pending_is_last_{false};
+    double cached_duration_sec_{0.0};
+    bool has_length_{false};
+
+    tsqueue<DecodeJob> input_queue_;
     tsqueue<std::vector<float>> output_queue_;
     tsqueue<std::string> load_queue_;
     tsqueue<std::pair<bool,std::string>> log_queue_;
@@ -122,36 +239,75 @@ private:
             std::string path;
             if (load_queue_.try_dequeue(path))
                 load_model(path);
-            std::vector<float> input;
-            if (!input_queue_.wait_dequeue(input, 100))
+            DecodeJob item;
+            if (!input_queue_.wait_dequeue(item, 100))
                 continue;
-            std::vector<float> temp;
+            DecodeJob temp;
             while (input_queue_.try_dequeue(temp))
-                input = std::move(temp);
-            process(input);
+                item = std::move(temp);
+            process(item);
         }
     }
 
-    void process(const std::vector<float>& msg) {
-        if (model_loaded_) {
-            auto result = run_onnx(msg);
-            output_queue_.enqueue(std::move(result));
+    // Resample 32000 -> output_sr FIRST, then trim to trim_samples (an
+    // output_sr-space count, already computed in tensor_msg) as the LAST
+    // step -- trim_samples was derived from the source duration in
+    // seconds, so it's only meaningful after the audio is actually in
+    // output_sr-space. Padding (added by ncs.snac_32kh.encode before
+    // encoding) always leaves the pre-trim audio at least as long as
+    // trim_samples, so this only ever shortens, never needs to lengthen.
+    void process(const DecodeJob& job) {
+        if (!model_loaded_) {
+            log_queue_.enqueue({true, "ncs.snac_32kh.decode: no model loaded"});
+            return;
         }
+        auto audio = run_onnx(job.embeddings);
+        if (audio.empty()) {
+            log_queue_.enqueue({true, "ncs.snac_32kh.decode: inference failed"});
+            return;
+        }
+        if (job.output_sr > 0.0)
+            audio = ncs_resample::resample_simple(audio, job.output_sr / kModelSampleRate);
+        if (job.trim_samples > 0 && static_cast<size_t>(job.trim_samples) < audio.size())
+            audio.resize(static_cast<size_t>(job.trim_samples));
+        output_queue_.enqueue(std::move(audio));
     }
 
+    // buffer~ access must happen on the main thread -- min-api's
+    // buffer_lock wraps Max's buffer_edit_begin/buffer_edit_end, which are
+    // not safe to call from an arbitrary spawned std::thread. The write
+    // happens here, since output_timer_ only ever fires on the main
+    // thread; trimming/resampling already happened in the worker's
+    // process() (see the comment there for why).
+    // Every crash seen so far traced back to a call to error() -- post()
+    // has been reliable throughout. Route everything through post() with
+    // an "ERROR:" prefix instead, to avoid whatever error() is doing
+    // (likely highlighting the object in the patcher) that's unsafe here.
     void flush_output() {
         std::pair<bool,std::string> log_msg;
         while (log_queue_.try_dequeue(log_msg)) {
-            if (log_msg.first) error(log_msg.second);
+            if (log_msg.first) c74::max::post("%s", ("ERROR: " + log_msg.second).c_str());
             else c74::max::post("%s", log_msg.second.c_str());
         }
-        std::vector<float> result;
-        if (output_queue_.try_dequeue(result)) {
-            std::vector<float> temp;
-            while (output_queue_.try_dequeue(temp))
-                result = std::move(temp);
-            atoms out_atoms(result.begin(), result.end());
-            result_out.send(out_atoms);
+        std::vector<float> audio;
+        if (output_queue_.try_dequeue(audio)) {
+            // This runs inside Max's own C dispatch loop (via output_timer_)
+            // -- an exception escaping it does not unwind cleanly, it hits
+            // std::terminate() and takes the whole host process down.
+            // write_mono() already catches internally; this wraps the
+            // name/post formatting too, defensively. Resampling and
+            // trimming already happened in process() (worker thread).
+            try {
+                if (!ncs_buffer::write_mono(buffer_ref_, audio)) {
+                    c74::max::post("%s", "ERROR: ncs.snac_32kh.decode: output buffer not found — use 'set <name>' first");
+                    return;
+                }
+                std::string msg = "ncs.snac_32kh.decode: wrote " + std::to_string(audio.size())
+                                   + " samples to buffer '" + std::string(buffer_ref_.name()) + "'";
+                c74::max::post("%s", msg.c_str());
+            } catch (const std::exception& ex) {
+                c74::max::post("%s", ("ERROR: ncs.snac_32kh.decode: write failed — " + std::string(ex.what())).c_str());
+            }
         }
     }
 
@@ -202,21 +358,33 @@ private:
 
     std::vector<float> run_onnx(const std::vector<float>& input) {
         if (!session_ || !model_loaded_) return {};
+        Ort::RunOptions opts;
+        register_run(&opts);
         try {
             std::vector<int64_t> shape = input_dims_;
             if (!shape.empty() && shape[0] == -1) shape[0] = 1;
-            if (!shape.empty() && shape.back() == -1)
-                shape.back() = static_cast<int64_t>(input.size());
+            if (!shape.empty() && shape.back() == -1) {
+                // z_q is [B, 1024, T] -- the flattened input covers every
+                // dim, so the dynamic trailing dim is input.size() divided
+                // by the product of the static middle dims (1024), not
+                // input.size() itself.
+                int64_t known = 1;
+                for (size_t i = 1; i + 1 < shape.size(); ++i) known *= shape[i];
+                shape.back() = known > 0 ? static_cast<int64_t>(input.size()) / known
+                                         : static_cast<int64_t>(input.size());
+            }
 
             auto tensor = vector_to_tensor(input, shape, allocator_);
             const char* in_names[]  = {input_name_.c_str()};
             const char* out_names[] = {output_name_.c_str()};
-            Ort::RunOptions opts;
             auto outputs = session_->Run(opts, in_names, &tensor, 1,
                                            out_names, 1);
+            clear_run();
             if (outputs.size() > 0)
                 return tensor_to_vector(outputs[0]);
-        } catch (const std::exception&) {}
+        } catch (const std::exception&) {
+            clear_run();
+        }
         return {};
     }
 };

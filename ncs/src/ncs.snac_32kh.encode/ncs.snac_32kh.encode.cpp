@@ -12,6 +12,9 @@
 
 #include "../include/shared_external_helpers.h"
 #include "../include/onnx_helpers.h"
+#include "../include/buffer_helpers.h"
+#include "../include/chunk_helpers.h"
+#include "../include/resample_helpers.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -25,14 +28,75 @@
 
 using namespace c74::min;
 
-class NcsSnac_32khEncode : public object<NcsSnac_32khEncode>
+// SNAC 32kHz: hop_length=384, vq_strides=[8,4,2,1], attn_window_size=32.
+// preprocess() in the reference model pads audio to a multiple of
+// hop_length * lcm(vq_strides[0], attn_window_size) = 384 * lcm(8,32)
+// = 384 * 32 = 12288. Same identical network as 44kHz (only sampling
+// rate and weights differ) -- see ncs.snac_24kh.encode.cpp for the full
+// design rationale this module mirrors (chunked output, buffer~ access
+// rules, length_out race, etc.); only the constants below and the model
+// path change. The attention is windowed (32 frames, non-overlapping)
+// but that's entirely internal to the ONNX graph -- buffer mode runs the
+// whole padded signal through one forward pass, so no chunk-boundary
+// handling is needed here for attention (unlike the rt~ variant, which
+// must accumulate a full 32-frame window before it can run).
+static constexpr int64_t kHopLength   = 384;
+static constexpr int64_t kPadMultiple = 12288;
+
+// See ncs.snac_24kh.encode.cpp for the crash history behind these caps.
+static constexpr size_t kMaxChunkAtoms   = 4000;      // per tensor message
+static constexpr size_t kMaxInputSamples = 19200000;   // ~10min @ 32kHz
+
+// The model only works at 32kHz; buffer~ content is read at whatever
+// sample rate that buffer~ itself is stored at (see buffer_sr below), and
+// resampled to 32kHz here before padding/inference -- a one-shot
+// src_simple() call per bang, not the persistent-state streaming
+// resampler real-time signal modules need.
+static constexpr double kModelSampleRate = 32000.0;
+
+// length_out carries the input buffer~'s duration (in SECONDS, not a raw
+// sample count) directly to ncs.snac_32kh.decode's second inlet,
+// bypassing ncs.snac_32kh.vq/embedcodes entirely -- see
+// ncs.snac_24kh.encode.cpp's length_out comment for the full rationale
+// (rate-independence, the accepted race with a second bang, etc.), which
+// applies here unchanged.
+struct PendingSend {
+    atoms data; // always for data_out -- length_out is sent directly, see above
+};
+
+class NcsSnac_32khEncode : public object<NcsSnac_32khEncode>, public CancellableRun
 {
 public:
-    MIN_DESCRIPTION     {""};
-    MIN_TAGS            {""};
+    MIN_DESCRIPTION     {"Reads a named buffer~, runs the SNAC 32kHz encoder."};
+    MIN_TAGS            {"snac, onnx, audio"};
     MIN_AUTHOR          {"Behzad Haki"};
-    inlet<> control_in{ this, "(number) control-rate input value" };
-    outlet<> result_out{ this, "(list) inference result" };
+    inlet<> control_in{ this, "(set/bang/load) buffer name, trigger, or model path" };
+    outlet<> data_out{ this, "(messageix/tensor) chunked embeddings, channel-major [1024 x T]" };
+    outlet<> length_out{ this, "(float) source duration in seconds -- wire directly to ncs.snac_32kh.decode's second inlet" };
+
+    buffer_reference buffer_ref_{ this };
+
+    // @buffername lets the input buffer~ be set as an object-box argument
+    // (@buffername myBuf) or attribute message, alongside the 'set'
+    // message buffer_reference already provides. An attribute's setter
+    // runs immediately at construction with its default value ("" here)
+    // -- guard against binding an empty-named buffer, an untested call
+    // into Max's buffer subsystem that crashed on patch load.
+    attribute<symbol> buffername{ this, "buffername", "", description{"Name of the buffer~ to read from."},
+        setter{ MIN_FUNCTION {
+            symbol name = (symbol)args[0];
+            if (name != symbol(""))
+                buffer_ref_.set(name);
+            return {args};
+        }}};
+
+    // A long buffer means a long ONNX Run() -- @max_dur is a user-facing,
+    // adjustable safety valve on top of the hard kMaxInputSamples sanity
+    // cap, so a bang on an accidentally huge buffer~ doesn't tie up the
+    // worker thread for the full length by default. 0 (or negative)
+    // disables it, leaving only the kMaxInputSamples cap.
+    attribute<int> max_dur{ this, "max_dur", 10000,
+        description{"Maximum duration (milliseconds) of buffer~ content to read and encode; longer buffers are truncated to this length. 0 disables the cap. Default 10000 (10s)."} };
 
     // =====================================================================
     // CONSTRUCTOR / DESTRUCTOR
@@ -42,6 +106,12 @@ public:
     {
         start_worker();
         start_output_timer();
+        // Auto-load the model shipped alongside this external -- resolves
+        // to <package>/models/snac_onnx_exports/32khz/encode_audio_segment.onnx
+        // relative to the deployed .mxo bundle. `load <path>` still works
+        // afterwards to point at a different model.
+        load_queue_.enqueue(BundleResourceLoader::get_resource_path(
+            "models/snac_onnx_exports/32khz/encode_audio_segment.onnx"));
     }
 
     ~NcsSnac_32khEncode() {
@@ -49,30 +119,81 @@ public:
         stop_output_timer();
     }
 
-
-
-    message<> number{ this, "number", "Control-rate input value",
+    // buffer~ access must happen on the main thread -- min-api's
+    // buffer_lock wraps Max's buffer_edit_begin/buffer_edit_end, which are
+    // not safe to call from an arbitrary spawned std::thread (only the
+    // main thread or the audio thread, per every min-api/min-devkit
+    // example). So the read happens here, synchronously, and only the
+    // raw samples (pure data) cross over to the worker thread for
+    // resampling + padding + the actual (slow) ONNX inference.
+    // buffer_sr is the buffer~'s OWN declared sample rate (read alongside
+    // the samples, see read_mono's sr_out param), not Max's live DSP
+    // driver rate -- this pipeline never requires DSP/audio to be
+    // running, so the live driver rate can silently be stale/wrong; the
+    // buffer's own declared rate has no such failure mode.
+    // This handler runs inside Max's own C dispatch loop -- an exception
+    // escaping it does not unwind cleanly, it hits std::terminate() and
+    // takes the whole host process down. read_mono() already catches
+    // internally, but the resize/enqueue below is wrapped too, defensively.
+    // Error reporting is routed through log_queue_ + flush_output() rather
+    // than calling error() inline here: a bang can arrive very early
+    // (e.g. from a loadbang, before the buffer is even set), and calling
+    // error() synchronously at that point crashed Max's console/UI --
+    // deferring it to the timer callback (the same path already used for
+    // worker-thread errors) avoids that.
+    message<> bang_msg{this, "bang", "Read the referenced buffer~ and run the encoder",
         MIN_FUNCTION {
-            if (args.size() < 1) return {};
-            input_queue_.enqueue(std::vector<float>{ (float)args[0] });
+            try {
+                double buffer_sr = 0.0;
+                auto samples = ncs_buffer::read_mono(buffer_ref_, &buffer_sr);
+                if (samples.empty()) {
+                    log_queue_.enqueue({true, "ncs.snac_32kh.encode: buffer not found or empty"});
+                    return {};
+                }
+                int max_dur_ms = static_cast<int>(max_dur);
+                if (max_dur_ms > 0 && buffer_sr > 0.0) {
+                    auto max_dur_samples = static_cast<size_t>(static_cast<double>(max_dur_ms) * buffer_sr / 1000.0);
+                    if (samples.size() > max_dur_samples) {
+                        samples.resize(max_dur_samples);
+                        log_queue_.enqueue({false, "ncs.snac_32kh.encode: buffer truncated to " + std::to_string(max_dur_ms)
+                              + "ms (@max_dur; raise it to encode more)"});
+                    }
+                }
+                if (samples.size() > kMaxInputSamples) {
+                    log_queue_.enqueue({true, "ncs.snac_32kh.encode: buffer is " + std::to_string(samples.size())
+                          + " samples, over the " + std::to_string(kMaxInputSamples) + "-sample sanity limit"});
+                    return {};
+                }
+                // Sent immediately (as a duration in seconds, not a raw
+                // sample count -- see the length_out comment above) --
+                // right after reading, before the worker has even started
+                // resampling, so decode's cached length is as fresh as
+                // possible for the accepted race described there.
+                if (buffer_sr > 0.0)
+                    length_out.send(static_cast<double>(samples.size()) / buffer_sr);
+                // A new bang always supersedes whatever the worker is
+                // still doing -- cancel any in-flight Run() from a
+                // previous (now-stale) bang rather than waiting for it to
+                // finish; input_queue_ already collapses to the latest
+                // queued item on its own, this just stops wasting time on
+                // one that's already running.
+                cancel_active_run();
+                input_queue_.enqueue({std::move(samples), buffer_sr});
+            } catch (const std::exception& ex) {
+                log_queue_.enqueue({true, "ncs.snac_32kh.encode: bang failed — " + std::string(ex.what())});
+            }
             return {};
         }};
-
 
     message<> load{this, "load", "Load an ONNX model (.onnx)",
         MIN_FUNCTION {
             if (args.size() < 1) {
-                error("ncs.snac_32kh.encode: load requires a file path");
+                log_queue_.enqueue({true, "ncs.snac_32kh.encode: load requires a file path"});
                 return {};
             }
             load_queue_.enqueue((std::string)args[0]);
             return {};
         }};
-
-    // =====================================================================
-    // BANG
-    // =====================================================================
-    void bang() {}
 
 // =============================================================================
 // PRIVATE
@@ -82,8 +203,8 @@ private:
     std::atomic<bool> worker_running_{false};
     std::atomic<bool> stop_{false};
 
-    tsqueue<std::vector<float>> input_queue_;
-    tsqueue<std::vector<float>> output_queue_;
+    tsqueue<std::pair<std::vector<float>, double>> input_queue_;
+    tsqueue<PendingSend> output_queue_;
     tsqueue<std::string> load_queue_;
     tsqueue<std::pair<bool,std::string>> log_queue_;
 
@@ -122,37 +243,72 @@ private:
             std::string path;
             if (load_queue_.try_dequeue(path))
                 load_model(path);
-            std::vector<float> input;
-            if (!input_queue_.wait_dequeue(input, 100))
+            std::pair<std::vector<float>, double> item;
+            if (!input_queue_.wait_dequeue(item, 100))
                 continue;
-            std::vector<float> temp;
+            std::pair<std::vector<float>, double> temp;
             while (input_queue_.try_dequeue(temp))
-                input = std::move(temp);
-            process(input);
+                item = std::move(temp);
+            process(item.first, item.second);
         }
     }
 
-    void process(const std::vector<float>& msg) {
-        if (model_loaded_) {
-            auto result = run_onnx(msg);
-            output_queue_.enqueue(std::move(result));
+    // Resample buffer_sr -> 32kHz, then pad to kPadMultiple for the
+    // model. The resulting (post-resample, pre-pad) sample count is only
+    // needed locally here to compute the padding -- it's no longer sent
+    // anywhere (decode gets the duration directly from bang_msg instead,
+    // see length_out's comment).
+    void process(const std::vector<float>& raw_samples, double buffer_sr) {
+        if (!model_loaded_) {
+            log_queue_.enqueue({true, "ncs.snac_32kh.encode: no model loaded"});
+            return;
+        }
+        std::vector<float> samples = (buffer_sr > 0.0)
+            ? ncs_resample::resample_simple(raw_samples, kModelSampleRate / buffer_sr)
+            : raw_samples;
+        int64_t padded_length = ((static_cast<int64_t>(samples.size()) + kPadMultiple - 1)
+                                  / kPadMultiple) * kPadMultiple;
+        samples.resize(static_cast<size_t>(padded_length), 0.0f);
+
+        auto z = run_onnx(samples);
+        if (z.empty()) {
+            log_queue_.enqueue({true, "ncs.snac_32kh.encode: inference failed"});
+            return;
+        }
+
+        auto chunks = ncs_chunk::split(z, kMaxChunkAtoms);
+        for (size_t i = 0; i < chunks.size(); ++i) {
+            bool is_last = (i + 1 == chunks.size());
+            int idx = is_last ? -1 : static_cast<int>(i);
+
+            atoms messageix_msg;
+            messageix_msg.push_back(symbol("messageix"));
+            messageix_msg.push_back(idx);
+            output_queue_.enqueue({std::move(messageix_msg)});
+
+            atoms tensor_msg;
+            tensor_msg.reserve(1 + chunks[i].size());
+            tensor_msg.push_back(symbol("tensor"));
+            for (float f : chunks[i]) tensor_msg.push_back(f);
+            output_queue_.enqueue({std::move(tensor_msg)});
         }
     }
 
+    // Every crash seen so far traced back to a call to error() -- post()
+    // has been reliable throughout. Route everything through post() with
+    // an "ERROR:" prefix instead, to avoid whatever error() is doing
+    // (likely highlighting the object in the patcher) that's unsafe here.
+    // Exactly ONE outlet.send() per tick. length_out is sent directly
+    // from bang_msg (see its comment), not through this queue.
     void flush_output() {
         std::pair<bool,std::string> log_msg;
         while (log_queue_.try_dequeue(log_msg)) {
-            if (log_msg.first) error(log_msg.second);
+            if (log_msg.first) c74::max::post("%s", ("ERROR: " + log_msg.second).c_str());
             else c74::max::post("%s", log_msg.second.c_str());
         }
-        std::vector<float> result;
-        if (output_queue_.try_dequeue(result)) {
-            std::vector<float> temp;
-            while (output_queue_.try_dequeue(temp))
-                result = std::move(temp);
-            atoms out_atoms(result.begin(), result.end());
-            result_out.send(out_atoms);
-        }
+        PendingSend item;
+        if (output_queue_.try_dequeue(item))
+            data_out.send(item.data);
     }
 
     void start_output_timer() {
@@ -202,21 +358,32 @@ private:
 
     std::vector<float> run_onnx(const std::vector<float>& input) {
         if (!session_ || !model_loaded_) return {};
+        Ort::RunOptions opts;
+        register_run(&opts);
         try {
             std::vector<int64_t> shape = input_dims_;
             if (!shape.empty() && shape[0] == -1) shape[0] = 1;
-            if (!shape.empty() && shape.back() == -1)
-                shape.back() = static_cast<int64_t>(input.size());
+            if (!shape.empty() && shape.back() == -1) {
+                // audio is [B, 1, T] -- the dynamic trailing dim is
+                // input.size() divided by the product of the static
+                // middle dims (1 here, but computed generically).
+                int64_t known = 1;
+                for (size_t i = 1; i + 1 < shape.size(); ++i) known *= shape[i];
+                shape.back() = known > 0 ? static_cast<int64_t>(input.size()) / known
+                                         : static_cast<int64_t>(input.size());
+            }
 
             auto tensor = vector_to_tensor(input, shape, allocator_);
             const char* in_names[]  = {input_name_.c_str()};
             const char* out_names[] = {output_name_.c_str()};
-            Ort::RunOptions opts;
             auto outputs = session_->Run(opts, in_names, &tensor, 1,
                                            out_names, 1);
+            clear_run();
             if (outputs.size() > 0)
                 return tensor_to_vector(outputs[0]);
-        } catch (const std::exception&) {}
+        } catch (const std::exception&) {
+            clear_run();
+        }
         return {};
     }
 };
