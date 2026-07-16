@@ -12,6 +12,7 @@
 
 #include "../include/shared_external_helpers.h"
 #include "../include/onnx_helpers.h"
+#include "../include/chunk_helpers.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -29,10 +30,13 @@ using namespace c74::min;
 // ncs.snac_24kh.embedcodes (same decode_codes.onnx graph -- the codebook
 // lookup + Tile-based per-level upsample is pointwise per output frame,
 // no temporal receptive field, so it's exactly as correct running
-// continuously on small rt~ blocks as on a whole buffer~). Only the
-// transport differs from the buffer module: codes in and embeddings out
-// are both plain "list" messages here -- no messageix/tensor chunking
-// (a block's embeddings are a few frames, well under a thousand floats).
+// continuously on small rt~ blocks as on a whole buffer~). The codes
+// INPUT stays a plain "list" per level (tiny regardless of rate, same as
+// 32k/44k). The embeddings OUTPUT goes out as the messageix/tensor
+// protocol too (always exactly one chunk -- a 24k block's embeddings are
+// only a few frames, well under the chunking threshold), purely so this
+// rate speaks the identical wire format as ncs.rt.snac_32kh/44kh.embedcodes,
+// letting modules across all three rates be mixed and matched.
 //
 // UNLIKE the buffer module, this is a continuous stream feeding
 // ncs.rt.snac_24kh.decode~'s running context -- every block must be
@@ -48,6 +52,11 @@ static constexpr int kNumLevels = 3;
 // as the divisor for @monitor_rtf's real-time factor (see
 // PerformanceMonitorScope in shared_external_helpers.h).
 static constexpr double kBlockDurationMs = 2048.0 / 24000.0 * 1000.0;
+
+// See the class comment: this block's embeddings (768 x 4 = 3072 atoms)
+// never actually need splitting, but kMaxChunkAtoms is kept at the same
+// value as ncs.rt.snac_32kh/44kh.embedcodes for consistency.
+static constexpr size_t kMaxChunkAtoms = 12000;
 
 struct EmbedRequest {
     std::vector<int64_t> codes[kNumLevels];
@@ -74,10 +83,10 @@ public:
     // feeds ncs.rt.snac_24kh.decode~; the rest are always the raw,
     // unscaled per-level embeddings, for auditioning a single codebook
     // level in isolation.
-    outlet<> sum_out{ this, "(list) summed embeddings block (level0_scale*L0 + level1_scale*L1 + level2_scale*L2), channel-major [768 x T]" };
-    outlet<> level0_out{ this, "(list) level 0 embeddings block, unscaled, channel-major [768 x T]" };
-    outlet<> level1_out{ this, "(list) level 1 embeddings block, unscaled, channel-major [768 x T]" };
-    outlet<> level2_out{ this, "(list) level 2 embeddings block, unscaled, channel-major [768 x T]" };
+    outlet<> sum_out{ this, "(messageix/tensor) summed embeddings chunk (level0_scale*L0 + level1_scale*L1 + level2_scale*L2), channel-major [768 x T]" };
+    outlet<> level0_out{ this, "(messageix/tensor) level 0 embeddings chunk, unscaled, channel-major [768 x T]" };
+    outlet<> level1_out{ this, "(messageix/tensor) level 1 embeddings chunk, unscaled, channel-major [768 x T]" };
+    outlet<> level2_out{ this, "(messageix/tensor) level 2 embeddings chunk, unscaled, channel-major [768 x T]" };
     // Declarative thread-safe outlet (see min-api's GuideToThreading,
     // "High-Level Outlet Threading Specification"): process() runs on
     // worker_thread_, not the main thread, so this defers the send to
@@ -230,6 +239,26 @@ private:
         }
     }
 
+    static void enqueue_chunks(tsqueue<std::pair<int, atoms>>& q, int outlet_id, const std::vector<float>& data,
+                                size_t max_chunk_size) {
+        auto chunks = ncs_chunk::split(data, max_chunk_size);
+        for (size_t i = 0; i < chunks.size(); ++i) {
+            bool is_last = (i + 1 == chunks.size());
+            int idx = is_last ? -1 : static_cast<int>(i);
+
+            atoms messageix_msg;
+            messageix_msg.push_back(symbol("messageix"));
+            messageix_msg.push_back(idx);
+            q.enqueue({outlet_id, std::move(messageix_msg)});
+
+            atoms tensor_msg;
+            tensor_msg.reserve(1 + chunks[i].size());
+            tensor_msg.push_back(symbol("tensor"));
+            for (float f : chunks[i]) tensor_msg.push_back(f);
+            q.enqueue({outlet_id, std::move(tensor_msg)});
+        }
+    }
+
     void process(const EmbedRequest& req) {
         PerformanceMonitorScope<decltype(timing_out)> perf_scope(bool(monitor_rtf), timing_out, kBlockDurationMs);
 
@@ -243,11 +272,10 @@ private:
             return;
         }
         // result[0]=sum, [1]=level0, [2]=level1, [3]=level2 -- outlet_id
-        // matches that same order (0=sum ... 3=level2).
-        for (int outlet_id = 0; outlet_id <= kNumLevels; ++outlet_id) {
-            atoms msg(result[outlet_id].begin(), result[outlet_id].end());
-            output_queue_.enqueue({outlet_id, std::move(msg)});
-        }
+        // matches that same order (0=sum ... 3=level2). Each is chunked
+        // (see kMaxChunkAtoms' comment) rather than sent as one big list.
+        for (int outlet_id = 0; outlet_id <= kNumLevels; ++outlet_id)
+            enqueue_chunks(output_queue_, outlet_id, result[outlet_id], kMaxChunkAtoms);
     }
 
     // Every crash seen so far in the buffer modules traced back to a call

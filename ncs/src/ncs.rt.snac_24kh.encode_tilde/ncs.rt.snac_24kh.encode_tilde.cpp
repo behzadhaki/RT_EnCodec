@@ -13,6 +13,7 @@
 #include "../include/shared_external_helpers.h"
 #include "../include/onnx_helpers.h"
 #include "../include/resample_helpers.h"
+#include "../include/chunk_helpers.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -49,6 +50,17 @@ static constexpr int64_t kBlockFrames  = 4;                          // frames p
 static constexpr int64_t kBlockSize    = kHopLength * kBlockFrames;  // 2048 samples
 static constexpr int64_t kContextSize  = kBlockSize;                 // one block of trailing context
 static constexpr int64_t kLatentDim    = 768;
+
+// Each block's trimmed output is kLatentDim*kBlockFrames = 3072 floats --
+// well under the ~15k-20k atom crash threshold documented in
+// ncs.snac_24kh.encode.cpp, so a single plain "list" message was safe
+// here and never needed chunking. data_out nonetheless sends the SAME
+// messageix/tensor protocol ncs.rt.snac_32kh/44kh.encode~ use (always
+// exactly one chunk, since 3072 << kMaxChunkAtoms) purely so
+// ncs.rt.snac_24kh.vq speaks the identical wire format as its 32k/44k
+// counterparts -- letting any receiver built against one rate's
+// messageix/tensor protocol work unmodified against all three.
+static constexpr size_t kMaxChunkAtoms = 12000;
 
 // The model only works at 24kHz; the live host DSP rate is whatever
 // Max's signal chain is running at. Unlike the buffer module's one-shot
@@ -88,7 +100,7 @@ public:
     MIN_TAGS            {"snac, onnx, audio"};
     MIN_AUTHOR          {"Behzad Haki"};
     inlet<> signal_in{ this, "(signal) audio input" };
-    outlet<> data_out{ this, "(list) embeddings block, channel-major [768 x T], one message per block" };
+    outlet<> data_out{ this, "(messageix/tensor) chunked embeddings block, channel-major [768 x T], one block per messageix/tensor sequence" };
     // Declarative thread-safe outlet (see min-api's GuideToThreading,
     // "High-Level Outlet Threading Specification"): process() runs on
     // worker_thread_, not the main thread, so this defers the send to
@@ -210,7 +222,7 @@ private:
     std::atomic<bool> stop_{false};
 
     tsqueue<EncodeJob> input_queue_;
-    tsqueue<std::vector<float>> output_queue_;
+    tsqueue<atoms> output_queue_; // one messageix or tensor message per entry
     tsqueue<std::string> load_queue_;
     tsqueue<std::pair<bool,std::string>> log_queue_;
 
@@ -298,23 +310,46 @@ private:
             const float* src = &z[static_cast<size_t>(c * T_total + (T_total - kBlockFrames))];
             std::copy(src, src + kBlockFrames, trimmed.begin() + static_cast<size_t>(c * kBlockFrames));
         }
-        output_queue_.enqueue(std::move(trimmed));
+
+        // See kMaxChunkAtoms' comment: this block (3072 atoms) never
+        // actually needs splitting, but goes out as the messageix/tensor
+        // protocol anyway (always exactly one chunk) so this rate's wire
+        // format matches ncs.rt.snac_32kh/44kh.encode~'s.
+        auto chunks = ncs_chunk::split(trimmed, kMaxChunkAtoms);
+        for (size_t i = 0; i < chunks.size(); ++i) {
+            bool is_last = (i + 1 == chunks.size());
+            int idx = is_last ? -1 : static_cast<int>(i);
+
+            atoms messageix_msg;
+            messageix_msg.push_back(symbol("messageix"));
+            messageix_msg.push_back(idx);
+            output_queue_.enqueue(std::move(messageix_msg));
+
+            atoms tensor_msg;
+            tensor_msg.reserve(1 + chunks[i].size());
+            tensor_msg.push_back(symbol("tensor"));
+            for (float f : chunks[i]) tensor_msg.push_back(f);
+            output_queue_.enqueue(std::move(tensor_msg));
+        }
     }
 
     // Every crash seen so far in the buffer modules traced back to a call
     // to error() -- post() has been reliable throughout. Route everything
-    // through post() with an "ERROR:" prefix instead.
+    // through post() with an "ERROR:" prefix instead. Exactly ONE outlet
+    // per tick, same "never seen the exact trigger condition inside
+    // Max's outlet_cache" precaution the buffer modules use -- each
+    // chunk stream carries its own messageix/tensor header, so
+    // interleaving across ticks doesn't affect correctness, only
+    // latency.
     void flush_output() {
         std::pair<bool,std::string> log_msg;
         while (log_queue_.try_dequeue(log_msg)) {
             if (log_msg.first) c74::max::post("%s", ("ERROR: " + log_msg.second).c_str());
             else c74::max::post("%s", log_msg.second.c_str());
         }
-        std::vector<float> result;
-        if (output_queue_.try_dequeue(result)) {
-            atoms out(result.begin(), result.end());
+        atoms out;
+        if (output_queue_.try_dequeue(out))
             data_out.send(out);
-        }
     }
 
     void start_output_timer() {

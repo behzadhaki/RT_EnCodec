@@ -35,8 +35,13 @@ using namespace c74::min;
 //
 // 1. The "new" unit here is a MESSAGE (quantized embeddings from
 //    ncs.rt.snac_24kh.embedcodes), not a signal -- so the context
-//    bookkeeping lives in the "list" message handler (main thread)
-//    instead of operator() (audio thread).
+//    bookkeeping lives in the tensor_msg handler (main thread) instead
+//    of operator() (audio thread). Embeddings arrive as the
+//    messageix/tensor protocol (always exactly one chunk -- a 24k
+//    block is small enough to never actually need splitting) purely so
+//    this rate speaks the identical wire format as
+//    ncs.rt.snac_32kh/44kh.decode~, letting modules across all three
+//    rates be mixed and matched.
 // 2. Decoded audio must become a continuous SIGNAL. On top of the
 //    context-trim (which addresses correctness -- the retained frames'
 //    receptive field is anchored in real preceding audio), this also
@@ -74,7 +79,7 @@ public:
     MIN_DESCRIPTION     {"Runs the SNAC 24kHz decoder continuously from a streamed quantized-embeddings message (windowed context-trim streaming)."};
     MIN_TAGS            {"snac, onnx, audio"};
     MIN_AUTHOR          {"Behzad Haki"};
-    inlet<> embeddings_in{ this, "(list/load/reset) quantized embeddings block from ncs.rt.snac_24kh.embedcodes, channel-major [768 x T], or model path" };
+    inlet<> embeddings_in{ this, "(messageix/tensor/load/reset) quantized embeddings chunk from ncs.rt.snac_24kh.embedcodes, channel-major [768 x T], or model path" };
     outlet<> signal_out{ this, "(signal) audio output", "signal" };
     // Declarative thread-safe outlet (see min-api's GuideToThreading,
     // "High-Level Outlet Threading Specification"): calls made from the
@@ -188,22 +193,38 @@ public:
         return 0.0;
     }
 
-    // Parses ncs.rt.snac_24kh.embedcodes' sum_out format: a bare
-    // (headerless) list, channel-major [768 x T]. Builds this call's
-    // [context + new] window, hands it to the worker, then updates the
-    // trailing context to the last kContextFrames frames of that same
-    // window (so it's always real audio history, whether it came from
-    // the previous new block or -- if T is ever smaller than
-    // kContextFrames -- partly from the context before that).
-    message<> list_msg{this, "list", "Quantized embeddings block, channel-major [768 x T]",
+    // ncs.rt.snac_24kh.embedcodes sends its sum_out embeddings as a
+    // chunked `messageix <index>` (index -1 = last chunk) immediately
+    // followed by `tensor <data...>`, both real Max message selectors --
+    // the same protocol ncs.rt.snac_32kh/44kh.decode~ use, adopted here
+    // purely for wire-format compatibility across rates (a 24k block
+    // never actually splits into more than one chunk). Once the last
+    // chunk arrives, this builds the call's [context + new] window,
+    // hands it to the worker, then updates the trailing context to the
+    // last kContextFrames frames of that same window (so it's always
+    // real audio history, whether it came from the previous new block
+    // or -- if T is ever smaller than kContextFrames -- partly from the
+    // context before that).
+    message<> messageix_msg{this, "messageix", "Chunk index (-1 = last chunk)",
+        MIN_FUNCTION {
+            if (!args.empty())
+                pending_is_last_ = ((int)args[0] == -1);
+            return {};
+        }};
+
+    message<> tensor_msg{this, "tensor", "Quantized embeddings chunk data",
         MIN_FUNCTION {
             try {
-                std::vector<float> new_zq(args.size());
-                for (size_t i = 0; i < args.size(); ++i)
-                    new_zq[i] = (float)args[i];
+                for (auto& a : args)
+                    accum_embeddings_.push_back((float)a);
+                if (!pending_is_last_)
+                    return {};
+                std::vector<float>& new_zq = accum_embeddings_;
                 int64_t T_block = static_cast<int64_t>(new_zq.size()) / kLatentDim;
                 if (T_block <= 0 || T_block * kLatentDim != static_cast<int64_t>(new_zq.size())) {
                     log_queue_.enqueue({true, "ncs.rt.snac_24kh.decode~: embeddings block size is not a multiple of 768 channels"});
+                    accum_embeddings_.clear();
+                    pending_is_last_ = false;
                     return {};
                 }
 
@@ -230,8 +251,13 @@ public:
                     std::copy(src, src + kContextFrames, new_context.begin() + static_cast<size_t>(c * kContextFrames));
                 }
                 context_zq_ = std::move(new_context);
+
+                accum_embeddings_.clear();
+                pending_is_last_ = false;
             } catch (const std::exception& ex) {
-                log_queue_.enqueue({true, "ncs.rt.snac_24kh.decode~: list handling failed — " + std::string(ex.what())});
+                log_queue_.enqueue({true, "ncs.rt.snac_24kh.decode~: tensor handling failed — " + std::string(ex.what())});
+                accum_embeddings_.clear();
+                pending_is_last_ = false;
             }
             return {};
         }};
@@ -241,13 +267,16 @@ public:
     // not-yet-decoded blocks) -- there's no real conv state to reset
     // (SNAC's ONNX graphs aren't stateful), so this just re-primes the
     // windowed context-trim and OLA bookkeeping for a fresh stream.
-    // context_zq_ is main-thread-owned (touched only here and in
-    // list_msg, both on the main thread) so it's safe to clear directly;
-    // the worker- and audio-thread-owned pieces go through their own
-    // atomic flags, consumed by the thread that actually owns them.
+    // context_zq_/accum_embeddings_/pending_is_last_ are all main-thread-
+    // owned (touched only here and in messageix_msg/tensor_msg, both on
+    // the main thread) so they're safe to clear directly; the worker-
+    // and audio-thread-owned pieces go through their own atomic flags,
+    // consumed by the thread that actually owns them.
     message<> reset_msg{this, "reset", "Clear streaming context, crossfade tail, and any queued/buffered audio",
         MIN_FUNCTION {
             context_zq_.assign(static_cast<size_t>(kLatentDim * kContextFrames), 0.0f);
+            accum_embeddings_.clear();
+            pending_is_last_ = false;
             input_queue_.clear();
             worker_reset_pending_.store(true);
             playback_reset_pending_.store(true);
@@ -272,8 +301,10 @@ private:
     std::atomic<bool> worker_running_{false};
     std::atomic<bool> stop_{false};
 
-    // Main-thread-only (touched only in list_msg/reset_msg).
+    // Main-thread-only (touched only in messageix_msg/tensor_msg/reset_msg).
     std::vector<float> context_zq_;
+    std::vector<float> accum_embeddings_;
+    bool pending_is_last_{false};
 
     tsqueue<DecodeJob> input_queue_;
     tsqueue<std::vector<float>> output_queue_;

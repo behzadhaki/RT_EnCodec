@@ -29,12 +29,15 @@ using namespace c74::min;
 // ncs.snac_24kh.vq (same quantize_encodings.onnx graph -- quantization is
 // a pointwise per-frame lookup with no temporal receptive field of its
 // own, so running it continuously on small rt~ blocks is exactly as
-// correct as running it once on a whole buffer~). The only real
-// difference from the buffer module is the transport: ncs.rt.snac_24kh.encode~
+// correct as running it once on a whole buffer~). ncs.rt.snac_24kh.encode~
 // hands off one small block's worth of embeddings at a time (a few
-// frames, well under a thousand floats), so there's no need for the
-// buffer module's messageix/tensor chunking protocol -- a plain "list"
-// message in, three plain "list" messages out.
+// frames, well under a thousand floats) -- small enough that chunking is
+// never actually needed here -- but it still arrives as the
+// messageix/tensor protocol (always exactly one chunk) so this rate
+// speaks the identical wire format as ncs.rt.snac_32kh/44kh.vq, letting
+// modules across all three rates be mixed and matched. Per-level codes
+// out stay plain "list" messages (tiny regardless of rate, same as
+// 32k/44k).
 //
 // UNLIKE the buffer module, this is a continuous stream: every block
 // must be quantized in order, none can be dropped (dropping one would
@@ -61,7 +64,7 @@ public:
     MIN_DESCRIPTION     {"SNAC 24kHz residual vector quantizer (real-time): embeddings block -> per-level codes."};
     MIN_TAGS            {"snac, onnx"};
     MIN_AUTHOR          {"Behzad Haki"};
-    inlet<> control_in{ this, "(list/load) embeddings block from ncs.rt.snac_24kh.encode~, or model path" };
+    inlet<> control_in{ this, "(messageix/tensor/load) embeddings chunk from ncs.rt.snac_24kh.encode~, or model path" };
     outlet<> level0_out{ this, "(list) codes... -- codebook level 0 (coarsest, stride 4)" };
     outlet<> level1_out{ this, "(list) codes... -- codebook level 1 (stride 2)" };
     outlet<> level2_out{ this, "(list) codes... -- codebook level 2 (finest, stride 1)" };
@@ -96,19 +99,36 @@ public:
         stop_output_timer();
     }
 
-    // Errors go through log_queue_ (not error() inline) -- this can fire
-    // very early during patch load, and calling error() synchronously at
-    // that point has crashed Max's console/UI; deferring it to the timer
-    // callback avoids that.
-    message<> list_msg{this, "list", "Embeddings block, channel-major [768 x T]",
+    // ncs.rt.snac_24kh.encode~ sends its embeddings block as a chunked
+    // `messageix <index>` (index -1 = last chunk) immediately followed
+    // by `tensor <data...>`, both real Max message selectors -- the same
+    // protocol ncs.rt.snac_32kh/44kh.vq use, adopted here purely for
+    // wire-format compatibility across rates (a 24k block never actually
+    // splits into more than one chunk). Errors go through log_queue_
+    // (not error() inline) -- this can fire very early during patch
+    // load, and calling error() synchronously at that point has crashed
+    // Max's console/UI; deferring it to the timer callback avoids that.
+    message<> messageix_msg{this, "messageix", "Chunk index (-1 = last chunk)",
+        MIN_FUNCTION {
+            if (!args.empty())
+                pending_is_last_ = ((int)args[0] == -1);
+            return {};
+        }};
+
+    message<> tensor_msg{this, "tensor", "Embeddings chunk data",
         MIN_FUNCTION {
             try {
-                std::vector<float> z(args.size());
-                for (size_t i = 0; i < args.size(); ++i)
-                    z[i] = (float)args[i];
-                input_queue_.enqueue(std::move(z));
+                for (auto& a : args)
+                    accum_z_.push_back((float)a);
+                if (pending_is_last_) {
+                    // Strict FIFO -- every block in this stream matters;
+                    // see the class-level comment.
+                    input_queue_.enqueue(std::move(accum_z_));
+                    accum_z_.clear();
+                    pending_is_last_ = false;
+                }
             } catch (const std::exception& ex) {
-                log_queue_.enqueue({true, "ncs.rt.snac_24kh.vq: list handling failed — " + std::string(ex.what())});
+                log_queue_.enqueue({true, "ncs.rt.snac_24kh.vq: tensor handling failed — " + std::string(ex.what())});
             }
             return {};
         }};
@@ -130,6 +150,10 @@ private:
     std::thread worker_thread_;
     std::atomic<bool> worker_running_{false};
     std::atomic<bool> stop_{false};
+
+    // Only ever touched from message handlers, i.e. the main thread.
+    std::vector<float> accum_z_;
+    bool pending_is_last_{false};
 
     tsqueue<std::vector<float>> input_queue_;
     tsqueue<std::pair<int, atoms>> output_queue_; // outlet_id (0-2), codes...
