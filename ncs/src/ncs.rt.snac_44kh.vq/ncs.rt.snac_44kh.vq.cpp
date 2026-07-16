@@ -51,6 +51,13 @@ using namespace c74::min;
 // needs to finish.
 static constexpr int kNumLevels = 4;
 
+// Real-time duration one block represents -- matches
+// ncs.rt.snac_44kh.encode_tilde.cpp's kBlockSize(12288)/kModelSampleRate(44100);
+// this module doesn't otherwise need those constants, only their ratio,
+// as the divisor for @monitor_rtf's real-time factor (see
+// PerformanceMonitorScope in shared_external_helpers.h).
+static constexpr double kBlockDurationMs = 12288.0 / 44100.0 * 1000.0;
+
 class NcsRtSnac_44khVq : public object<NcsRtSnac_44khVq>
 {
 public:
@@ -62,6 +69,15 @@ public:
     outlet<> level1_out{ this, "(list) codes... -- codebook level 1 (stride 4)" };
     outlet<> level2_out{ this, "(list) codes... -- codebook level 2 (stride 2)" };
     outlet<> level3_out{ this, "(list) codes... -- codebook level 3 (finest, stride 1)" };
+    // Declarative thread-safe outlet (see min-api's GuideToThreading,
+    // "High-Level Outlet Threading Specification"): process() runs on
+    // worker_thread_, not the main thread, so this defers the send to
+    // the scheduler thread automatically.
+    outlet<thread_check::scheduler, thread_action::fifo> timing_out{
+        this, "(float) real-time factor or process time in ms, per @monitor_rtf, emitted on every block" };
+
+    attribute<bool> monitor_rtf{ this, "monitor_rtf", true,
+        description{"Always emits this module's process() wall-clock cost out the rightmost outlet. On (default): emitted as a real-time factor (elapsed/block-duration; >=1.0 means this stage alone can't keep up). Off: emitted as raw milliseconds."} };
 
     // =====================================================================
     // CONSTRUCTOR / DESTRUCTOR
@@ -74,8 +90,9 @@ public:
         // Auto-load the model shipped alongside this external -- the
         // SAME quantize_encodings.onnx the buffer module uses. `load
         // <path>` still works afterwards to point at a different model.
-        load_queue_.enqueue(BundleResourceLoader::get_resource_path(
-            "models/snac_onnx_exports/44khz/quantize_encodings.onnx"));
+        default_model_path_ = BundleResourceLoader::get_resource_path(
+            "models/snac_onnx_exports/44khz/quantize_encodings.onnx");
+        load_queue_.enqueue(default_model_path_);
     }
 
     ~NcsRtSnac_44khVq() {
@@ -148,6 +165,7 @@ private:
     timer<> output_timer_;
 
     bool model_loaded_{false};
+    std::string default_model_path_;
     std::unique_ptr<Ort::Session> session_;
     Ort::SessionOptions session_options_;
     Ort::AllocatorWithDefaultOptions allocator_;
@@ -195,6 +213,8 @@ private:
     // is hot) sees its cold level1/level2/level3 inlets updated before
     // the trigger.
     void process(const std::vector<float>& z) {
+        PerformanceMonitorScope<decltype(timing_out)> perf_scope(bool(monitor_rtf), timing_out, kBlockDurationMs);
+
         if (!model_loaded_) {
             log_queue_.enqueue({true, "ncs.rt.snac_44kh.vq: no model loaded"});
             return;
@@ -214,11 +234,18 @@ private:
 
     // Every crash seen so far in the buffer modules traced back to a call
     // to error() -- post() has been reliable throughout. Route everything
-    // through post() with an "ERROR:" prefix instead. Exactly ONE outlet
-    // per tick (unlike the correctness requirement in the worker loop
-    // above, this is just the same "never seen the exact trigger
-    // condition inside Max's outlet_cache" precaution the buffer modules
-    // use).
+    // through post() with an "ERROR:" prefix instead.
+    //
+    // UNLIKE the buffer modules' large chunked payloads (where "exactly
+    // ONE outlet per tick" is a deliberate precaution against a
+    // documented Max outlet_cache crash near the ~15k-20k atom mark), the
+    // 4 messages queued here per block are tiny (at most T_block ints
+    // each, nowhere near that threshold) -- there is no crash-safety
+    // reason to throttle them. Diagnostic timing measured this exact
+    // one-per-tick pacing costing ~30-40ms of pure transport latency per
+    // block (4 messages x up to 10ms/tick) on the path to
+    // ncs.rt.snac_44kh.embedcodes, out of a 279ms budget -- draining the
+    // whole queue every tick removes that cost for free.
     void flush_output() {
         std::pair<bool,std::string> log_msg;
         while (log_queue_.try_dequeue(log_msg)) {
@@ -226,7 +253,7 @@ private:
             else c74::max::post("%s", log_msg.second.c_str());
         }
         std::pair<int, atoms> item;
-        if (output_queue_.try_dequeue(item)) {
+        while (output_queue_.try_dequeue(item)) {
             switch (item.first) {
                 case 3: level3_out.send(item.second); break;
                 case 2: level2_out.send(item.second); break;
@@ -256,7 +283,7 @@ private:
             // (see ncs.rt.snac_44kh.encode_tilde.cpp's comment) -- this
             // Run() itself is cheap (pointwise quantization), so it's not
             // the bottleneck, but there's no reason to leave it at 1.
-            session_options_.SetIntraOpNumThreads(4);
+            session_options_.SetIntraOpNumThreads(adaptive_intra_op_threads());
             session_options_.SetGraphOptimizationLevel(
                 GraphOptimizationLevel::ORT_ENABLE_EXTENDED);
             // Every ncs.*/ncs.rt.* module shares one process-wide
@@ -294,9 +321,10 @@ private:
             }
 
             model_loaded_ = true;
-            log_queue_.enqueue({false, "ncs.rt.snac_44kh.vq: loaded model (" + path + ")"});
         } catch (const std::exception& ex) {
-            log_queue_.enqueue({true, "ncs.rt.snac_44kh.vq: failed to load model — " + std::string(ex.what())});
+            log_queue_.enqueue({true, "ncs.rt.snac_44kh.vq: failed to load model (" + path + ") — "
+                                        + std::string(ex.what()) + ". Models are expected at "
+                                        + default_model_path_ + "."});
             model_loaded_ = false;
         }
     }

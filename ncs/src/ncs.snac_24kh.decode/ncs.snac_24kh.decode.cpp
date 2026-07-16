@@ -105,8 +105,9 @@ public:
         start_output_timer();
         // Auto-load the model shipped alongside this external. `load
         // <path>` still works afterwards to point at a different model.
-        load_queue_.enqueue(BundleResourceLoader::get_resource_path(
-            "models/snac_onnx_exports/24khz/decode_audio.onnx"));
+        default_model_path_ = BundleResourceLoader::get_resource_path(
+            "models/snac_onnx_exports/24khz/decode_audio.onnx");
+        load_queue_.enqueue(default_model_path_);
     }
 
     ~NcsSnac_24khDecode() {
@@ -204,6 +205,7 @@ private:
     timer<> output_timer_;
 
     bool model_loaded_{false};
+    std::string default_model_path_;
     std::unique_ptr<Ort::Session> session_;
     Ort::SessionOptions session_options_;
     Ort::AllocatorWithDefaultOptions allocator_;
@@ -346,9 +348,10 @@ private:
             output_dims_ = output_type.GetTensorTypeAndShapeInfo().GetShape();
 
             model_loaded_ = true;
-            log_queue_.enqueue({false, "ncs.snac_24kh.decode: loaded model (" + path + ")"});
         } catch (const std::exception& ex) {
-            log_queue_.enqueue({true, "ncs.snac_24kh.decode: failed to load model — " + std::string(ex.what())});
+            log_queue_.enqueue({true, "ncs.snac_24kh.decode: failed to load model (" + path + ") — "
+                                        + std::string(ex.what()) + ". Models are expected at "
+                                        + default_model_path_ + "."});
             model_loaded_ = false;
         }
     }

@@ -42,6 +42,13 @@ using namespace c74::min;
 // mid-stream Run() is never stale.
 static constexpr int kNumLevels = 3;
 
+// Real-time duration one block represents -- matches
+// ncs.rt.snac_24kh.encode_tilde.cpp's kBlockSize(2048)/kModelSampleRate(24000);
+// this module doesn't otherwise need those constants, only their ratio,
+// as the divisor for @monitor_rtf's real-time factor (see
+// PerformanceMonitorScope in shared_external_helpers.h).
+static constexpr double kBlockDurationMs = 2048.0 / 24000.0 * 1000.0;
+
 struct EmbedRequest {
     std::vector<int64_t> codes[kNumLevels];
     double scale[kNumLevels];
@@ -71,6 +78,15 @@ public:
     outlet<> level0_out{ this, "(list) level 0 embeddings block, unscaled, channel-major [768 x T]" };
     outlet<> level1_out{ this, "(list) level 1 embeddings block, unscaled, channel-major [768 x T]" };
     outlet<> level2_out{ this, "(list) level 2 embeddings block, unscaled, channel-major [768 x T]" };
+    // Declarative thread-safe outlet (see min-api's GuideToThreading,
+    // "High-Level Outlet Threading Specification"): process() runs on
+    // worker_thread_, not the main thread, so this defers the send to
+    // the scheduler thread automatically.
+    outlet<thread_check::scheduler, thread_action::fifo> timing_out{
+        this, "(float) real-time factor or process time in ms, per @monitor_rtf, emitted on every block" };
+
+    attribute<bool> monitor_rtf{ this, "monitor_rtf", true,
+        description{"Always emits this module's process() wall-clock cost out the rightmost outlet. On (default): emitted as a real-time factor (elapsed/block-duration; >=1.0 means this stage alone can't keep up). Off: emitted as raw milliseconds."} };
 
     attribute<number> level0_scale{ this, "level0_scale", 1.0,
         description{"Gain applied to codebook level 0 (coarsest) before summing into the sum outlet. Does not affect the raw level0 outlet."} };
@@ -90,8 +106,9 @@ public:
         // Auto-load the model shipped alongside this external -- the
         // SAME decode_codes.onnx the buffer module uses. `load <path>`
         // still works afterwards to point at a different model.
-        load_queue_.enqueue(BundleResourceLoader::get_resource_path(
-            "models/snac_onnx_exports/24khz/decode_codes.onnx"));
+        default_model_path_ = BundleResourceLoader::get_resource_path(
+            "models/snac_onnx_exports/24khz/decode_codes.onnx");
+        load_queue_.enqueue(default_model_path_);
     }
 
     ~NcsRtSnac_24khEmbedcodes() {
@@ -174,6 +191,7 @@ private:
     timer<> output_timer_;
 
     bool model_loaded_{false};
+    std::string default_model_path_;
     std::unique_ptr<Ort::Session> session_;
     Ort::SessionOptions session_options_;
     Ort::AllocatorWithDefaultOptions allocator_;
@@ -213,6 +231,8 @@ private:
     }
 
     void process(const EmbedRequest& req) {
+        PerformanceMonitorScope<decltype(timing_out)> perf_scope(bool(monitor_rtf), timing_out, kBlockDurationMs);
+
         if (!model_loaded_) {
             log_queue_.enqueue({true, "ncs.rt.snac_24kh.embedcodes: no model loaded"});
             return;
@@ -308,9 +328,10 @@ private:
             }
 
             model_loaded_ = true;
-            log_queue_.enqueue({false, "ncs.rt.snac_24kh.embedcodes: loaded model (" + path + ")"});
         } catch (const std::exception& ex) {
-            log_queue_.enqueue({true, "ncs.rt.snac_24kh.embedcodes: failed to load model — " + std::string(ex.what())});
+            log_queue_.enqueue({true, "ncs.rt.snac_24kh.embedcodes: failed to load model (" + path + ") — "
+                                        + std::string(ex.what()) + ". Models are expected at "
+                                        + default_model_path_ + "."});
             model_loaded_ = false;
         }
     }

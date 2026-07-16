@@ -55,6 +55,14 @@ static constexpr int64_t kOlaSamples    = 256;                        // ~5.8ms 
 
 static constexpr double kModelSampleRate = 44100.0;
 
+// Real-time duration one block of NEW audio represents -- the divisor
+// for @monitor_rtf's real-time factor (see PerformanceMonitorScope in
+// shared_external_helpers.h). Unlike encode~, no separate resample-time
+// folding is needed here: decode_resampler_.process() already runs
+// inside process() (see its call site below), so this scope's own
+// elapsed time already covers Run() + OLA + resampling in full.
+static constexpr double kBlockDurationMs = static_cast<double>(kBlockFrames * kHopLength) / kModelSampleRate * 1000.0;
+
 struct DecodeJob {
     std::vector<float> combined; // channel-major [1024 x (kContextFrames+T_block)]
     int64_t t_block{0};          // number of NEW frames appended this call
@@ -78,6 +86,24 @@ public:
     outlet<thread_check::scheduler, thread_action::fifo> underrun_out{
         this, "(bang) underrun state changed -- entering underrun (silence) or recovering from it" };
 
+    // Number of decoded blocks to accumulate in the output queue before
+    // (re)starting playback. 0 (default) disables this -- audio plays as
+    // soon as the first block is ready, identical to prior behavior.
+    // Raising it trades added startup/resume latency (N blocks, i.e.
+    // N * ~279ms@44k) for headroom against transient processing
+    // slowdowns: a reserve this deep has to be exhausted, not just
+    // momentarily late, before playback runs dry.
+    attribute<int> prebuffer_blocks{ this, "prebuffer_blocks", 0,
+        description{"Number of decoded blocks to accumulate before playback starts (or resumes after an underrun), absorbing transient processing slowdowns at the cost of added latency. 0 (default) disables prebuffering."} };
+
+    // Declarative thread-safe outlet, same pattern as underrun_out above:
+    // process() runs on worker_thread_, not the main thread.
+    outlet<thread_check::scheduler, thread_action::fifo> timing_out{
+        this, "(float) real-time factor or process time in ms, per @monitor_rtf, emitted on every block" };
+
+    attribute<bool> monitor_rtf{ this, "monitor_rtf", true,
+        description{"Always emits this module's per-block cost (Run() plus OLA plus resampling) out the rightmost outlet. On (default): emitted as a real-time factor (elapsed/block-duration; >=1.0 means this stage alone can't keep up). Off: emitted as raw milliseconds."} };
+
     // =====================================================================
     // CONSTRUCTOR / DESTRUCTOR
     // =====================================================================
@@ -90,8 +116,9 @@ public:
         // Auto-load the model shipped alongside this external -- the
         // SAME decode_audio.onnx the buffer module uses. `load <path>`
         // still works afterwards to point at a different model.
-        load_queue_.enqueue(BundleResourceLoader::get_resource_path(
-            "models/snac_onnx_exports/44khz/decode_audio.onnx"));
+        default_model_path_ = BundleResourceLoader::get_resource_path(
+            "models/snac_onnx_exports/44khz/decode_audio.onnx");
+        load_queue_.enqueue(default_model_path_);
     }
 
     ~NcsRtSnac_44khDecode() {
@@ -120,6 +147,20 @@ public:
             output_pos_ = 0;
             std::vector<float> discard;
             while (output_queue_.try_dequeue(discard)) {}
+            prebuffering_ = true;
+        }
+        // Pre-roll: while prebuffering, hold silence without consuming
+        // from output_queue_ until it holds prebuffer_blocks worth of
+        // decoded chunks (0 -- the default -- is always satisfied, so
+        // this is a no-op unless the attribute is raised). output_queue_
+        // is only touched here and just below via try_dequeue -- both
+        // already-established audio-thread-safe brief-lock operations
+        // (see the class comment above operator()).
+        if (prebuffering_) {
+            if (output_pos_ >= output_chunk_.size()
+                && output_queue_.size() < static_cast<size_t>(std::max(0, static_cast<int>(prebuffer_blocks))))
+                return 0.0;
+            prebuffering_ = false;
         }
         // Serve samples from the current decoded chunk; when it runs
         // out, pull the next available chunk from the worker thread.
@@ -138,10 +179,13 @@ public:
             return output_chunk_[output_pos_++];
         }
         // Underrun: nothing decoded yet -- output silence rather than
-        // block waiting on the worker.
+        // block waiting on the worker. Re-arms prebuffering (if enabled)
+        // so playback resumes with a fresh reserve instead of immediately
+        // racing the worker again one sample at a time.
         if (!was_underrun_) {
             was_underrun_ = true;
             notify_underrun_transition();
+            prebuffering_ = true;
         }
         return 0.0;
     }
@@ -272,6 +316,7 @@ private:
     std::vector<float> output_chunk_;
     size_t output_pos_{0};
     bool was_underrun_{false};
+    bool prebuffering_{true};
     std::chrono::steady_clock::time_point last_underrun_event_{};
     std::atomic<bool> playback_reset_pending_{false};
 
@@ -285,6 +330,7 @@ private:
     timer<> output_timer_;
 
     bool model_loaded_{false};
+    std::string default_model_path_;
     std::unique_ptr<Ort::Session> session_;
     Ort::SessionOptions session_options_;
     Ort::AllocatorWithDefaultOptions allocator_;
@@ -340,6 +386,8 @@ private:
     // call, this runs every block, so filter continuity across blocks
     // matters).
     void process(const DecodeJob& job) {
+        PerformanceMonitorScope<decltype(timing_out)> perf_scope(bool(monitor_rtf), timing_out, kBlockDurationMs);
+
         if (!model_loaded_) {
             log_queue_.enqueue({true, "ncs.rt.snac_44kh.decode~: no model loaded"});
             return;
@@ -434,10 +482,11 @@ private:
                 log_queue_.enqueue({true, "ncs.rt.snac_44kh.decode~: ONNX Runtime not available"});
                 return;
             }
-            // 4 intra-op threads -- see ncs.rt.snac_44kh.encode_tilde.cpp's
-            // comment: this is the OTHER compute-heavy Run() (context+new
-            // through the decoder), same real-time budget pressure.
-            session_options_.SetIntraOpNumThreads(4);
+            // Adaptive intra-op threads -- see
+            // ncs.rt.snac_44kh.encode_tilde.cpp's comment: this is the
+            // OTHER compute-heavy Run() (context+new through the
+            // decoder), same real-time budget pressure.
+            session_options_.SetIntraOpNumThreads(adaptive_intra_op_threads());
             session_options_.SetGraphOptimizationLevel(
                 GraphOptimizationLevel::ORT_ENABLE_EXTENDED);
             // Every ncs.*/ncs.rt.* module shares one process-wide
@@ -468,9 +517,10 @@ private:
             output_dims_ = output_type.GetTensorTypeAndShapeInfo().GetShape();
 
             model_loaded_ = true;
-            log_queue_.enqueue({false, "ncs.rt.snac_44kh.decode~: loaded model (" + path + ")"});
         } catch (const std::exception& ex) {
-            log_queue_.enqueue({true, "ncs.rt.snac_44kh.decode~: failed to load model — " + std::string(ex.what())});
+            log_queue_.enqueue({true, "ncs.rt.snac_44kh.decode~: failed to load model (" + path + ") — "
+                                        + std::string(ex.what()) + ". Models are expected at "
+                                        + default_model_path_ + "."});
             model_loaded_ = false;
         }
     }

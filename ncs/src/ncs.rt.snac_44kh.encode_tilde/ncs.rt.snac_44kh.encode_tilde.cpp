@@ -83,6 +83,19 @@ static constexpr int64_t kLatentDim    = 1024;
 // dropouts. 12000 cuts this to 3 chunks x 2 = 6 ticks (~60ms).
 static constexpr size_t kMaxChunkAtoms = 12000;
 
+// flush_output() drains up to this many queued messages per 10ms tick
+// (see its comment) instead of exactly one -- diagnostic timing measured
+// this hop still costing ~40ms/block even at kMaxChunkAtoms=12000 (3
+// chunks x 2 messages = 6 ticks). Each individual message is still
+// capped at kMaxChunkAtoms, well under the crash threshold above; this
+// only changes how many of those already-safe messages go out per tick,
+// not the size of any one of them. Capped at 4 (not unlimited) as a
+// middle ground, since this is the exact code path a prior crash was
+// traced to (see ncs.rt.snac_44kh.vq's flush_output() comment for the
+// same fix applied where it was lower-risk -- small, never-chunked
+// messages).
+static constexpr int kMaxSendsPerTick = 4;
+
 // The model only works at 44kHz; the live host DSP rate is whatever
 // Max's signal chain is running at. Unlike the buffer module's one-shot
 // src_simple() call, this runs continuously block after block, so the
@@ -95,6 +108,24 @@ static constexpr double kModelSampleRate = 44100.0;
 // behavior doesn't change if the user changes their signal vector size.
 static constexpr size_t kHostFlushSamples = 256;
 
+// Real-time duration one block of NEW audio represents -- the divisor
+// for @monitor_rtf's real-time factor (see PerformanceMonitorScope in
+// shared_external_helpers.h): a block's total processing cost (Run() +
+// resampling) divided by this tells you whether this stage alone can
+// keep up with real-time.
+static constexpr double kBlockDurationMs = static_cast<double>(kBlockSize) / kModelSampleRate * 1000.0;
+
+// Carries a completed block from the audio thread to the worker thread.
+// resample_ms is the time spent in resampler_.process() (operator(),
+// audio thread) across every call that contributed to THIS block --
+// accumulated separately because it happens outside process() (worker
+// thread), but still has to count toward this block's total RTF/ms
+// figure, same as encode_audio_segment.onnx's own Run() time.
+struct EncodeJob {
+    std::vector<float> combined;
+    double resample_ms{0.0};
+};
+
 class NcsRtSnac_44khEncode : public object<NcsRtSnac_44khEncode>
     , public sample_operator<1, 0>
 {
@@ -104,6 +135,15 @@ public:
     MIN_AUTHOR          {"Behzad Haki"};
     inlet<> signal_in{ this, "(signal) audio input" };
     outlet<> data_out{ this, "(messageix/tensor) chunked embeddings block, channel-major [1024 x T], one block per messageix/tensor sequence" };
+    // Declarative thread-safe outlet (see min-api's GuideToThreading,
+    // "High-Level Outlet Threading Specification"): process() runs on
+    // worker_thread_, not the main thread, so this defers the send to
+    // the scheduler thread automatically.
+    outlet<thread_check::scheduler, thread_action::fifo> timing_out{
+        this, "(float) real-time factor or process time in ms, per @monitor_rtf, emitted on every block" };
+
+    attribute<bool> monitor_rtf{ this, "monitor_rtf", true,
+        description{"Always emits this module's per-block cost (Run() plus resampling) out the rightmost outlet. On (default): emitted as a real-time factor (elapsed/block-duration; >=1.0 means this stage alone can't keep up). Off: emitted as raw milliseconds."} };
 
     // =====================================================================
     // CONSTRUCTOR / DESTRUCTOR
@@ -117,8 +157,9 @@ public:
         // Auto-load the model shipped alongside this external -- the
         // SAME encode_audio_segment.onnx the buffer module uses. `load
         // <path>` still works afterwards to point at a different model.
-        load_queue_.enqueue(BundleResourceLoader::get_resource_path(
-            "models/snac_onnx_exports/44khz/encode_audio_segment.onnx"));
+        default_model_path_ = BundleResourceLoader::get_resource_path(
+            "models/snac_onnx_exports/44khz/encode_audio_segment.onnx");
+        load_queue_.enqueue(default_model_path_);
     }
 
     ~NcsRtSnac_44khEncode() {
@@ -147,13 +188,17 @@ public:
             raw_accum_.clear();
             model_pending_.clear();
             context_.assign(static_cast<size_t>(kContextSize), 0.0f);
+            block_resample_ms_ = 0.0;
             last_sr_seen_ = sr;
         }
 
         raw_accum_.push_back(static_cast<float>(in));
         if (raw_accum_.size() >= kHostFlushSamples) {
             double ratio = (sr > 0.0) ? (kModelSampleRate / sr) : 1.0;
+            auto resample_t0 = std::chrono::steady_clock::now();
             auto resampled = resampler_.process(raw_accum_, ratio);
+            block_resample_ms_ += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - resample_t0).count();
             raw_accum_.clear();
             model_pending_.insert(model_pending_.end(), resampled.begin(), resampled.end());
         }
@@ -171,7 +216,8 @@ public:
             // be dropped or collapsed (unlike buffer mode's bang-
             // supersedes-bang queues; see ncs.rt.snac_24kh.vq's
             // class-level comment).
-            input_queue_.enqueue(std::move(combined));
+            input_queue_.enqueue({std::move(combined), block_resample_ms_});
+            block_resample_ms_ = 0.0;
             context_ = std::move(new_block);
         }
         return 0.0;
@@ -209,7 +255,7 @@ private:
     std::atomic<bool> worker_running_{false};
     std::atomic<bool> stop_{false};
 
-    tsqueue<std::vector<float>> input_queue_;
+    tsqueue<EncodeJob> input_queue_;
     tsqueue<atoms> output_queue_; // one messageix or tensor message per entry
     tsqueue<std::string> load_queue_;
     tsqueue<std::pair<bool,std::string>> log_queue_;
@@ -222,12 +268,14 @@ private:
     std::vector<float> raw_accum_;      // host-rate samples awaiting resample
     std::vector<float> model_pending_;  // resampled (44kHz) samples awaiting a full block
     std::vector<float> context_;        // trailing kContextSize samples from the previous block
+    double block_resample_ms_{0.0};     // accumulated resampler_.process() time for the block in progress
     double last_sr_seen_{-1.0};
     std::atomic<bool> reset_requested_{false};
 
     timer<> output_timer_;
 
     bool model_loaded_{false};
+    std::string default_model_path_;
     std::unique_ptr<Ort::Session> session_;
     Ort::SessionOptions session_options_;
     Ort::AllocatorWithDefaultOptions allocator_;
@@ -261,7 +309,7 @@ private:
             std::string path;
             if (load_queue_.try_dequeue(path))
                 load_model(path);
-            std::vector<float> item;
+            EncodeJob item;
             if (!input_queue_.wait_dequeue(item, 100))
                 continue;
             process(item);
@@ -273,7 +321,10 @@ private:
     // kBlockFrames time-steps of the channel-major [1024 x T] output --
     // the frames whose receptive field is anchored in real (context)
     // audio rather than the model's own zero-init edge behavior.
-    void process(const std::vector<float>& combined) {
+    void process(const EncodeJob& job) {
+        const std::vector<float>& combined = job.combined;
+        PerformanceMonitorScope<decltype(timing_out)> perf_scope(bool(monitor_rtf), timing_out, kBlockDurationMs, job.resample_ms);
+
         if (!model_loaded_) {
             log_queue_.enqueue({true, "ncs.rt.snac_44kh.encode~: no model loaded"});
             return;
@@ -318,9 +369,8 @@ private:
 
     // Every crash seen so far in the buffer modules traced back to a call
     // to error() -- post() has been reliable throughout. Route everything
-    // through post() with an "ERROR:" prefix instead. Exactly ONE outlet
-    // per tick, same "never seen the exact trigger condition inside
-    // Max's outlet_cache" precaution the buffer modules use -- each
+    // through post() with an "ERROR:" prefix instead. Up to
+    // kMaxSendsPerTick outlet sends per tick (see its comment) -- each
     // chunk stream carries its own messageix/tensor header, so
     // interleaving across ticks doesn't affect correctness, only
     // latency.
@@ -331,7 +381,7 @@ private:
             else c74::max::post("%s", log_msg.second.c_str());
         }
         atoms out;
-        if (output_queue_.try_dequeue(out))
+        for (int i = 0; i < kMaxSendsPerTick && output_queue_.try_dequeue(out); ++i)
             data_out.send(out);
     }
 
@@ -357,20 +407,25 @@ private:
                 log_queue_.enqueue({true, "ncs.rt.snac_44kh.encode~: ONNX Runtime not available"});
                 return;
             }
-            // 4 intra-op threads, not 1: this Run() processes a much
-            // bigger window than snac_24kh (24576 samples of context+new
-            // through an attention-bearing network) inside a real-time
-            // budget of only kBlockSize/kModelSampleRate (~384ms @ 32k,
-            // ~279ms @ 44k -- 44k's is the tighter one, same compute for
-            // less wall-clock time) before decode~'s ring buffer starves
-            // and audio drops out. Single-threaded compute was a
-            // leftover from an earlier (later disproven) heap-corruption
-            // theory, not a real correctness requirement -- multi-
-            // threading the actual bottleneck (compute time vs. budget)
-            // directly targets the underrun/dropout problem, unlike the
-            // DisableCpuMemArena/DisableMemPattern calls below (kept
-            // regardless, still harmless).
-            session_options_.SetIntraOpNumThreads(4);
+            // Multiple intra-op threads, not 1: this Run() processes a
+            // much bigger window than snac_24kh (24576 samples of
+            // context+new through an attention-bearing network) inside a
+            // real-time budget of only kBlockSize/kModelSampleRate
+            // (~384ms @ 32k, ~279ms @ 44k -- 44k's is the tighter one,
+            // same compute for less wall-clock time) before decode~'s
+            // ring buffer starves and audio drops out. Single-threaded
+            // compute was a leftover from an earlier (later disproven)
+            // heap-corruption theory, not a real correctness requirement
+            // -- multi-threading the actual bottleneck (compute time vs.
+            // budget) directly targets the underrun/dropout problem,
+            // unlike the DisableCpuMemArena/DisableMemPattern calls below
+            // (kept regardless, still harmless). adaptive_intra_op_threads()
+            // (shared_external_helpers.h) scales this to the machine's
+            // core count (capped at 4, profiling never showed benefit
+            // beyond that) instead of a flat 4 -- a hardcoded 4 is
+            // oversubscription on a 1-2 core machine, exactly the
+            // weaker-hardware case where every bit of headroom matters.
+            session_options_.SetIntraOpNumThreads(adaptive_intra_op_threads());
             session_options_.SetGraphOptimizationLevel(
                 GraphOptimizationLevel::ORT_ENABLE_EXTENDED);
             // Every ncs.*/ncs.rt.* module shares one process-wide
@@ -402,9 +457,10 @@ private:
             output_dims_ = output_type.GetTensorTypeAndShapeInfo().GetShape();
 
             model_loaded_ = true;
-            log_queue_.enqueue({false, "ncs.rt.snac_44kh.encode~: loaded model (" + path + ")"});
         } catch (const std::exception& ex) {
-            log_queue_.enqueue({true, "ncs.rt.snac_44kh.encode~: failed to load model — " + std::string(ex.what())});
+            log_queue_.enqueue({true, "ncs.rt.snac_44kh.encode~: failed to load model (" + path + ") — "
+                                        + std::string(ex.what()) + ". Models are expected at "
+                                        + default_model_path_ + "."});
             model_loaded_ = false;
         }
     }

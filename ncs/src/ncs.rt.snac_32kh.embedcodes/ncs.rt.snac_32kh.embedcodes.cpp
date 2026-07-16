@@ -47,6 +47,13 @@ using namespace c74::min;
 // mid-stream Run() is never stale.
 static constexpr int kNumLevels = 4;
 
+// Real-time duration one block represents -- matches
+// ncs.rt.snac_32kh.encode_tilde.cpp's kBlockSize(12288)/kModelSampleRate(32000);
+// this module doesn't otherwise need those constants, only their ratio,
+// as the divisor for @monitor_rtf's real-time factor (see
+// PerformanceMonitorScope in shared_external_helpers.h).
+static constexpr double kBlockDurationMs = 12288.0 / 32000.0 * 1000.0;
+
 // Each output (sum + 4 per-level embeddings) is kLatentDim(1024) x T
 // floats -- for a T_block of 32 that's 32768 atoms, well past the
 // single-list-message crash threshold documented in
@@ -95,6 +102,15 @@ public:
     outlet<> level1_out{ this, "(messageix/tensor) level 1 embeddings chunk, unscaled, channel-major [1024 x T]" };
     outlet<> level2_out{ this, "(messageix/tensor) level 2 embeddings chunk, unscaled, channel-major [1024 x T]" };
     outlet<> level3_out{ this, "(messageix/tensor) level 3 embeddings chunk, unscaled, channel-major [1024 x T]" };
+    // Declarative thread-safe outlet (see min-api's GuideToThreading,
+    // "High-Level Outlet Threading Specification"): process() runs on
+    // worker_thread_, not the main thread, so this defers the send to
+    // the scheduler thread automatically.
+    outlet<thread_check::scheduler, thread_action::fifo> timing_out{
+        this, "(float) real-time factor or process time in ms, per @monitor_rtf, emitted on every block" };
+
+    attribute<bool> monitor_rtf{ this, "monitor_rtf", true,
+        description{"Always emits this module's process() wall-clock cost out the rightmost outlet. On (default): emitted as a real-time factor (elapsed/block-duration; >=1.0 means this stage alone can't keep up). Off: emitted as raw milliseconds."} };
 
     attribute<number> level0_scale{ this, "level0_scale", 1.0,
         description{"Gain applied to codebook level 0 (coarsest) before summing into the sum outlet. Does not affect the raw level0 outlet."} };
@@ -116,8 +132,9 @@ public:
         // Auto-load the model shipped alongside this external -- the
         // SAME decode_codes.onnx the buffer module uses. `load <path>`
         // still works afterwards to point at a different model.
-        load_queue_.enqueue(BundleResourceLoader::get_resource_path(
-            "models/snac_onnx_exports/32khz/decode_codes.onnx"));
+        default_model_path_ = BundleResourceLoader::get_resource_path(
+            "models/snac_onnx_exports/32khz/decode_codes.onnx");
+        load_queue_.enqueue(default_model_path_);
     }
 
     ~NcsRtSnac_32khEmbedcodes() {
@@ -205,6 +222,7 @@ private:
     timer<> output_timer_;
 
     bool model_loaded_{false};
+    std::string default_model_path_;
     std::unique_ptr<Ort::Session> session_;
     Ort::SessionOptions session_options_;
     Ort::AllocatorWithDefaultOptions allocator_;
@@ -264,6 +282,8 @@ private:
     }
 
     void process(const EmbedRequest& req) {
+        PerformanceMonitorScope<decltype(timing_out)> perf_scope(bool(monitor_rtf), timing_out, kBlockDurationMs);
+
         if (!model_loaded_) {
             log_queue_.enqueue({true, "ncs.rt.snac_32kh.embedcodes: no model loaded"});
             return;
@@ -323,7 +343,7 @@ private:
             // (see ncs.rt.snac_32kh.encode_tilde.cpp's comment) -- this
             // Run() itself is cheap (codebook lookup + Tile), so it's
             // not the bottleneck, but there's no reason to leave it at 1.
-            session_options_.SetIntraOpNumThreads(4);
+            session_options_.SetIntraOpNumThreads(adaptive_intra_op_threads());
             session_options_.SetGraphOptimizationLevel(
                 GraphOptimizationLevel::ORT_ENABLE_EXTENDED);
             // Every ncs.*/ncs.rt.* module shares one process-wide
@@ -364,9 +384,10 @@ private:
             }
 
             model_loaded_ = true;
-            log_queue_.enqueue({false, "ncs.rt.snac_32kh.embedcodes: loaded model (" + path + ")"});
         } catch (const std::exception& ex) {
-            log_queue_.enqueue({true, "ncs.rt.snac_32kh.embedcodes: failed to load model — " + std::string(ex.what())});
+            log_queue_.enqueue({true, "ncs.rt.snac_32kh.embedcodes: failed to load model (" + path + ") — "
+                                        + std::string(ex.what()) + ". Models are expected at "
+                                        + default_model_path_ + "."});
             model_loaded_ = false;
         }
     }
