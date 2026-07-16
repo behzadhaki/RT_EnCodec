@@ -50,7 +50,7 @@ inline std::vector<float> read_mono(c74::min::buffer_reference& ref, double* sr_
 
 // Same rationale as read_mono's sr_out -- queries the buffer~'s own
 // declared sample rate without reading/writing its sample data, so
-// ncs.snac_24kh.decode can pick its resample target before it has
+// ncs.snac24kh.decode can pick its resample target before it has
 // anything to write yet. Returns 0.0 if the buffer isn't set/valid.
 inline double get_samplerate(c74::min::buffer_reference& ref) {
     using namespace c74::min;

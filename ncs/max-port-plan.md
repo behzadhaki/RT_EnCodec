@@ -98,23 +98,23 @@ ncs.<model>_<variant>.<operation>        # buffer
 
 Actual built module names (note the `kh` suffix, and rt~ folders end in
 `_tilde`/`.vq`/`.embedcodes`/`.decode_tilde` but compile to externals
-named with the trailing `~`, e.g. `ncs.rt.snac_24kh.encode~`):
+named with the trailing `~`, e.g. `ncs.rt.snac24kh.encode~`):
 
 ```
-ncs.snac_24kh.encode             ncs.rt.snac_24kh.encode~
-ncs.snac_24kh.vq                 ncs.rt.snac_24kh.vq
-ncs.snac_24kh.embedcodes         ncs.rt.snac_24kh.embedcodes
-ncs.snac_24kh.decode             ncs.rt.snac_24kh.decode~
+ncs.snac24kh.encode             ncs.rt.snac24kh.encode~
+ncs.snac24kh.vq                 ncs.rt.snac24kh.vq
+ncs.snac24kh.embedcodes         ncs.rt.snac24kh.embedcodes
+ncs.snac24kh.decode             ncs.rt.snac24kh.decode~
 
-ncs.snac_32kh.encode             ncs.rt.snac_32kh.encode~
-ncs.snac_32kh.vq                 ncs.rt.snac_32kh.vq
-ncs.snac_32kh.embedcodes         ncs.rt.snac_32kh.embedcodes
-ncs.snac_32kh.decode             ncs.rt.snac_32kh.decode~
+ncs.snac32kh.encode             ncs.rt.snac32kh.encode~
+ncs.snac32kh.vq                 ncs.rt.snac32kh.vq
+ncs.snac32kh.embedcodes         ncs.rt.snac32kh.embedcodes
+ncs.snac32kh.decode             ncs.rt.snac32kh.decode~
 
-ncs.snac_44kh.encode             ncs.rt.snac_44kh.encode~
-ncs.snac_44kh.vq                 ncs.rt.snac_44kh.vq
-ncs.snac_44kh.embedcodes         ncs.rt.snac_44kh.embedcodes
-ncs.snac_44kh.decode             ncs.rt.snac_44kh.decode~
+ncs.snac44kh.encode             ncs.rt.snac44kh.encode~
+ncs.snac44kh.vq                 ncs.rt.snac44kh.vq
+ncs.snac44kh.embedcodes         ncs.rt.snac44kh.embedcodes
+ncs.snac44kh.decode             ncs.rt.snac44kh.decode~
 ```
 
 ### EnCodec 24 kHz -- 40 modules (4 buffer + 4 RT per bandwidth)
@@ -381,7 +381,7 @@ changing the exported ONNX graphs.
 
 ### Multi-scale structure
 
-SNAC codebooks operate at different temporal resolutions. For snac_32kh
+SNAC codebooks operate at different temporal resolutions. For snac32kh
 (base frame rate 83.33 Hz) with strides [8, 4, 2, 1]:
 
 | Level | Stride | Rate | Code per N base frames |

@@ -51,7 +51,7 @@ inline int adaptive_intra_op_threads() {
 // as the first line of process(). outlet must be a thread-safe
 // (thread_check::scheduler, thread_action::fifo) c74::min outlet, since
 // this runs on a worker thread, not the main thread -- see
-// ncs.rt.snac_44kh.decode_tilde.cpp's underrun_out for the same pattern.
+// ncs.rt.snac44kh.decode_tilde.cpp's underrun_out for the same pattern.
 template <typename Outlet>
 class PerformanceMonitorScope {
 public:
