@@ -68,6 +68,13 @@ public:
     MIN_AUTHOR          {"Behzad Haki"};
     inlet<> embeddings_in{ this, "(list/load/reset) quantized embeddings block from ncs.rt.snac_24kh.embedcodes, channel-major [768 x T], or model path" };
     outlet<> signal_out{ this, "(signal) audio output", "signal" };
+    // Declarative thread-safe outlet (see min-api's GuideToThreading,
+    // "High-Level Outlet Threading Specification"): calls made from the
+    // audio thread are automatically deferred to the scheduler thread and
+    // delivered in order, so operator() can call .send() directly with no
+    // manual timer/queue plumbing of its own.
+    outlet<thread_check::scheduler, thread_action::fifo> underrun_out{
+        this, "(bang) underrun state changed -- entering underrun (silence) or recovering from it" };
 
     // =====================================================================
     // CONSTRUCTOR / DESTRUCTOR
@@ -124,16 +131,15 @@ public:
         if (output_pos_ < output_chunk_.size()) {
             if (was_underrun_) {
                 was_underrun_ = false;
-                log_queue_.enqueue({false, "ncs.rt.snac_24kh.decode~: recovered from underrun"});
+                notify_underrun_transition();
             }
             return output_chunk_[output_pos_++];
         }
         // Underrun: nothing decoded yet -- output silence rather than
-        // block waiting on the worker. Logged once per episode (not
-        // every sample) to avoid flooding the console.
+        // block waiting on the worker.
         if (!was_underrun_) {
             was_underrun_ = true;
-            log_queue_.enqueue({true, "ncs.rt.snac_24kh.decode~: underrun — outputting silence (worker/model too slow, or nothing decoded yet)"});
+            notify_underrun_transition();
         }
         return 0.0;
     }
@@ -237,6 +243,7 @@ private:
     std::vector<float> output_chunk_;
     size_t output_pos_{0};
     bool was_underrun_{false};
+    std::chrono::steady_clock::time_point last_underrun_event_{};
     std::atomic<bool> playback_reset_pending_{false};
 
     // Worker-thread-only (touched only inside process(), which only ever
@@ -341,6 +348,26 @@ private:
         double ratio = (job.host_sr > 0.0) ? (job.host_sr / kModelSampleRate) : 1.0;
         auto resampled = decode_resampler_.process(finalized, ratio);
         output_queue_.enqueue(std::move(resampled));
+    }
+
+    // Bangs underrun_out on both the entering-underrun and the
+    // recovering-from-underrun transitions, in place of the console log
+    // this used to print -- much cleaner to patch against in Max than
+    // parsing console text. Rate-limited to at most one bang per second
+    // regardless of how many times the state actually flips within that
+    // window, since underrun_out's own fifo defer-to-scheduler queue has
+    // no bound on how many bangs it will accumulate before the next
+    // scheduler tick delivers them. Called from the audio thread (under
+    // audio_mutex_, like the rest of operator()); std::chrono is safe to
+    // use there, and underrun_out.send() itself never blocks -- it just
+    // pushes onto its own lock-free fifo (see the underrun_out
+    // declaration's comment).
+    void notify_underrun_transition() {
+        auto now = std::chrono::steady_clock::now();
+        if (now - last_underrun_event_ < std::chrono::milliseconds(1000))
+            return;
+        last_underrun_event_ = now;
+        underrun_out.send(k_sym_bang);
     }
 
     // Every crash seen so far in the buffer modules traced back to a call
