@@ -193,6 +193,30 @@ if(NOT EXISTS "${MAX_MODELS_DIR}")
     endif()
 endif()
 
+# Same symlink-once pattern as models/ above: help/ (per-object .maxhelp
+# patches) and patchers/ (shared bpatcher content those help patches
+# instantiate) are static content, not build products, so they're linked
+# straight from the source tree rather than copied per-build.
+set(MAX_HELP_DIR "${MAX_PACKAGE_DIR}/help")
+if(NOT EXISTS "${MAX_HELP_DIR}")
+    file(MAKE_DIRECTORY "${MAX_PACKAGE_DIR}")
+    if(PLATFORM_WINDOWS)
+        file(COPY "${CMAKE_SOURCE_DIR}/help/" DESTINATION "${MAX_HELP_DIR}")
+    else()
+        file(CREATE_LINK "${CMAKE_SOURCE_DIR}/help" "${MAX_HELP_DIR}" SYMBOLIC)
+    endif()
+endif()
+
+set(MAX_PATCHERS_DIR "${MAX_PACKAGE_DIR}/patchers")
+if(NOT EXISTS "${MAX_PATCHERS_DIR}")
+    file(MAKE_DIRECTORY "${MAX_PACKAGE_DIR}")
+    if(PLATFORM_WINDOWS)
+        file(COPY "${CMAKE_SOURCE_DIR}/patchers/" DESTINATION "${MAX_PATCHERS_DIR}")
+    else()
+        file(CREATE_LINK "${CMAKE_SOURCE_DIR}/patchers" "${MAX_PATCHERS_DIR}" SYMBOLIC)
+    endif()
+endif()
+
 function(create_simple_external T S)
     # The CMake target/filename convention is "..._tilde" (CMake- and
     # filesystem-safe); the compiled bundle Max actually discovers on disk
